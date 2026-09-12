@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "proposal_id", "created_at", "target_week", "week_start", "week_end", "source", "source_hashes", "seed", "assignment_changes", "directives", "exclusions"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "proposal_id": {"type": "string", "pattern": "^p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "target_week": {"type": "string", "format": "date"},
+    "week_start": {"type": "string", "format": "date-time"},
+    "week_end": {"type": "string", "format": "date-time"},
+    "source": {"enum": ["direct", "recommendation"]},
+    "source_hashes": {
+      "type": "object", "additionalProperties": false,
+      "required": ["configs", "database", "policy", "inventory", "wio_config", "wio_state"],
+      "properties": {
+        "configs": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
+        "database": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "policy": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "inventory": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "wio_config": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "wio_state": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "seed": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+    "assignment_changes": {"type": "array", "items": {"$ref": "#/$defs/assignment"}},
+    "directives": {"type": "array", "items": {"$ref": "#/$defs/directive"}},
+    "exclusions": {"type": "array", "items": {"type": "string", "pattern": "^[^/\\\\;`$]+$"}}
+  },
+  "$defs": {
+    "series": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\;`$]+$"},
+    "channel": {"type": "integer", "minimum": 1, "maximum": 8},
+    "assignment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["action", "series", "from_channel", "to_channel"],
+      "properties": {
+        "action": {"enum": ["assign", "move", "remove"]},
+        "series": {"$ref": "#/$defs/series"},
+        "from_channel": {"type": ["integer", "null"], "minimum": 1, "maximum": 8},
+        "to_channel": {"type": ["integer", "null"], "minimum": 1, "maximum": 8}
+      }
+    },
+    "directive": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "channel", "series"],
+      "properties": {
+        "type": {"enum": ["date_slot", "daypart", "seasonal", "theme", "marathon"]},
+        "channel": {"$ref": "#/$defs/channel"},
+        "series": {"$ref": "#/$defs/series"},
+        "date": {"type": "string", "format": "date"},
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+        "hours": {"type": "integer", "minimum": 1, "maximum": 24},
+        "daypart": {"enum": ["morning", "daytime", "prime", "late", "overnight"]},
+        "start_date": {"type": "string", "format": "date"},
+        "end_date": {"type": "string", "format": "date"},
+        "name": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\;`$]+$"}
+      }
+    }
+  }
+}

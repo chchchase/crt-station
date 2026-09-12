@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "inventory_excluded_roots": [
+    "StationAssets"
+  ],
+  "channels": [
+    {
+      "number": 1,
+      "name": "CRT Station Guide",
+      "description": "Station guide and schedule information only.",
+      "accepts_recommendations": false,
+      "has_schedule": false,
+      "keywords": []
+    },
+    {
+      "number": 2,
+      "name": "Action",
+      "description": "Action-forward animation, superheroes, martial arts, and adventure.",
+      "accepts_recommendations": true,
+      "keywords": ["batman", "superman", "spider-man", "samurai", "titan", "action", "adventure", "korra", "xiaolin"]
+    },
+    {
+      "number": 3,
+      "name": "After School",
+      "description": "Youth-oriented weekday cartoons with an after-school feel.",
+      "accepts_recommendations": true,
+      "keywords": ["school", "teenage", "danny phantom", "hey arnold", "digimon", "sonic", "monster rancher", "totally spies"]
+    },
+    {
+      "number": 4,
+      "name": "Anime",
+      "description": "Japanese anime series and closely related programming.",
+      "accepts_recommendations": true,
+      "keywords": ["anime", "dragon ball", "sailor moon", "yu yu", "cowboy bebop", "frieren", "academia", "flcl", "samurai champloo"]
+    },
+    {
+      "number": 5,
+      "name": "Cartoon Network",
+      "description": "Cartoon Network and adjacent creator-driven animation.",
+      "accepts_recommendations": true,
+      "keywords": ["adventure time", "regular show", "ben 10", "powerpuff", "dexter", "cartoon network", "steven universe"]
+    },
+    {
+      "number": 6,
+      "name": "Disney",
+      "description": "Disney television animation and Disney-associated series.",
+      "accepts_recommendations": true,
+      "keywords": ["disney", "kim possible", "recess", "owl house", "gravity falls", "gargoyles", "american dragon", "weekenders"]
+    },
+    {
+      "number": 7,
+      "name": "Late Night",
+      "description": "Adult animation, cult programming, and later-night comedy.",
+      "accepts_recommendations": true,
+      "keywords": ["adult", "futurama", "boondocks", "venture bros", "aqua teen", "late night"]
+    },
+    {
+      "number": 8,
+      "name": "Watch In Order",
+      "description": "Explicitly managed sequential viewing; enrollment requires a separate approved workflow.",
+      "accepts_recommendations": false,
+      "has_schedule": true,
+      "keywords": []
+    }
+  ]
+}

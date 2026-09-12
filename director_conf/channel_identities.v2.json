@@ -1,0 +1,28 @@
+{
+  "schema_version": 2,
+  "series_assignment_policy": {
+    "exclusive_across_active_channels": true,
+    "watch_in_order_included": true,
+    "require_transfer_report_before_change": true,
+    "normal_proposals_may_modify_watch_in_order": false
+  },
+  "inventory_excluded_roots": ["StationAssets"],
+  "watch_in_order_series": [
+    "Avatar The Last Airbender Book 1 Water",
+    "Avatar The Last Airbender Book 2 Earth",
+    "Avatar The Last Airbender Book 3 Fire",
+    "Gravity Falls",
+    "Infinity Train",
+    "Steven Universe"
+  ],
+  "channels": [
+    {"number": 1, "name": "CRT Station Guide", "accepts_recommendations": false, "has_schedule": false, "keywords": []},
+    {"number": 2, "name": "Action", "accepts_recommendations": true, "has_schedule": true, "keywords": ["batman", "superman", "spider-man", "samurai", "titan", "action", "adventure", "korra", "xiaolin"]},
+    {"number": 3, "name": "After School", "accepts_recommendations": true, "has_schedule": true, "keywords": ["school", "teenage", "danny phantom", "hey arnold", "digimon", "sonic", "monster rancher", "totally spies"]},
+    {"number": 4, "name": "Anime", "accepts_recommendations": true, "has_schedule": true, "keywords": ["anime", "dragon ball", "sailor moon", "yu yu", "cowboy bebop", "frieren", "academia", "flcl", "samurai champloo"]},
+    {"number": 5, "name": "Cartoon Network", "accepts_recommendations": true, "has_schedule": true, "keywords": ["adventure time", "regular show", "ben 10", "powerpuff", "dexter", "cartoon network", "steven universe"]},
+    {"number": 6, "name": "Disney", "accepts_recommendations": true, "has_schedule": true, "keywords": ["disney", "kim possible", "recess", "owl house", "gravity falls", "gargoyles", "american dragon", "weekenders"]},
+    {"number": 7, "name": "Late Night", "accepts_recommendations": true, "has_schedule": true, "keywords": ["adult", "futurama", "boondocks", "venture bros", "aqua teen", "late night"]},
+    {"number": 8, "name": "Watch In Order", "accepts_recommendations": false, "has_schedule": true, "keywords": []}
+  ]
+}
