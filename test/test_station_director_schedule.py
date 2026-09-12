@@ -479,13 +479,21 @@ class ExistingScheduleHelperTests(unittest.TestCase):
             self.assertTrue(report["channels"]["2"]["gaps"])
             self.assertTrue(report["channels"]["2"]["overlaps"])
 
-    def test_stale_hash_rejection_does_not_start_scheduler(self):
+    def test_rejected_context_precedes_stale_checks_and_staging(self):
         from station_director.validation import validate_proposal
 
-        with patch("station_director.validation.stale_sources", return_value=["database"]):
+        with patch(
+            "station_director.validation.check_invocation_context",
+            return_value=(False, "Codex detected"),
+        ), patch("station_director.validation.stale_sources") as stale, patch(
+            "station_director.validation.create_staging_directory"
+        ) as create_stage:
             report = validate_proposal(base_proposal(), Path("/does/not/matter"), load_policy())
         self.assertFalse(report["valid"])
-        self.assertIn("database", report["failures"][0])
+        self.assertEqual(report["failures"][0], "Phase 3 validation is not yet enabled")
+        self.assertIn("before staging", report["failures"][1])
+        stale.assert_not_called()
+        create_stage.assert_not_called()
 
     def test_archive_requires_exact_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:

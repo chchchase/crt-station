@@ -143,6 +143,25 @@ class IsolationTests(unittest.TestCase):
             self.assertTrue(wrong_name.exists())
             self.assertTrue(link.is_symlink())
 
+    def test_validation_staging_directories_are_unique_short_and_locked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            with patch.object(isolation, "STAGING_PARENT", parent):
+                first_token, first, first_lock = isolation.create_staging_directory()
+                second_token, second, second_lock = isolation.create_staging_directory()
+                try:
+                    self.assertNotEqual(first_token, second_token)
+                    self.assertRegex(first.name, r"^fs42-i-[0-9a-f]{12}$")
+                    self.assertRegex(second.name, r"^fs42-i-[0-9a-f]{12}$")
+                    self.assertEqual(first.stat().st_mode & 0o777, 0o700)
+                    self.assertTrue(isolation._staging_is_locked(first))
+                    self.assertTrue(isolation._staging_is_locked(second))
+                finally:
+                    first_lock.close()
+                    second_lock.close()
+                    isolation.cleanup_staging_directory(first)
+                    isolation.cleanup_staging_directory(second)
+
     def test_collected_unit_is_a_successful_cleanup(self):
         runner = FakeRunner()
         ok, detail = isolation.cleanup_unit("already-collected.service", runner=runner)
@@ -183,6 +202,22 @@ class IsolationTests(unittest.TestCase):
             PATH="/usr/local/bin",
         )
         self.assertFalse(isolation_probe.check_environment(environment)["passed"])
+
+    def test_preflight_and_validation_share_the_exact_probe_definition(self):
+        self.assertEqual(isolation.PROBE_RESULTS, isolation_probe.PROBE_RESULTS)
+        payload = isolation_probe.build_probe_payload
+        with patch.object(
+            isolation_probe,
+            "collect_probe_results",
+            return_value={
+                name: {"passed": True, "detail": name}
+                for name in isolation.PROBE_RESULTS
+            },
+        ):
+            built = payload("shared-run", environment={}, stage_root=Path("/stage"))
+        results, error = isolation.validate_probe_payload(built, "shared-run")
+        self.assertIsNone(error)
+        self.assertEqual(tuple(results), isolation.PROBE_RESULTS)
 
     def test_direct_shell_context_is_accepted(self):
         verified, detail = isolation.check_invocation_context(

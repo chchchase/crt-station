@@ -2,17 +2,25 @@ import copy
 import hashlib
 import json
 import os
-import random
-import shutil
 import sqlite3
-import subprocess
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from station_director.inventory import load_snapshots, validate_media_mount
+from station_director.isolation import (
+    IsolationLauncher,
+    LaunchResult,
+    check_invocation_context,
+    cleanup_staging_directory,
+    cleanup_stale_directories,
+    cleanup_unit,
+    create_staging_directory,
+    new_run_id,
+    sandbox_python,
+    validate_probe_payload,
+)
 from station_director.proposals import (
     ProposalError,
-    cleanup_staging,
     inventory_identifier_errors,
     stale_sources,
 )
@@ -20,6 +28,11 @@ from station_director.recommend import configured_tags
 
 
 DAYPARTS = {"morning": range(6, 10), "daytime": range(10, 18), "prime": range(18, 23), "late": [23, 0, 1, 2], "overnight": range(2, 6)}
+PHASE_3_DISABLED = "Phase 3 validation is not yet enabled"
+VALIDATION_REQUEST = "validation-request.json"
+VALIDATION_RESULT = "validation-result.json"
+VALIDATION_TIMEOUT_SECONDS = 120
+MAX_WORKER_RESULT_BYTES = 2 * 1024 * 1024
 
 
 def _channel_maps(policy):
@@ -383,81 +396,197 @@ def clone_database(source, target):
         src.backup(dst)
 
 
-def validate_proposal(proposal, root, policy):
-    root = Path(root)
+def _static_validation_checks(proposal, root, policy):
     failures, warnings = [], []
     stale = stale_sources(proposal, root)
     if stale:
-        return {"proposal_id": proposal["proposal_id"], "valid": False, "failures": [f"Stale source hashes: {', '.join(stale)}"], "warnings": [], "comparison": None}
+        failures.append(f"Stale source hashes: {', '.join(stale)}")
     validate_media_mount("/mnt/t7/CRT-Media")
     snapshots = load_snapshots(root / "runtime/director/inventory")
     inventory = snapshots[-1][1]
     configs = {}
     for path in sorted((root / "confs").glob("*.json")):
-        if path.name == "main_config.json": continue
-        data = json.loads(path.read_text()); configs[data["station_conf"]["network_name"]] = data
-    static_failures, static_warnings = semantic_checks(proposal, policy, inventory, configs)
-    failures.extend(static_failures); warnings.extend(static_warnings)
+        if path.name == "main_config.json":
+            continue
+        data = json.loads(path.read_text(encoding="utf-8"))
+        configs[data["station_conf"]["network_name"]] = data
+    static_failures, static_warnings = semantic_checks(
+        proposal, policy, inventory, configs
+    )
+    failures.extend(static_failures)
+    warnings.extend(static_warnings)
     try:
         import jsonschema
         from fs42.config_processor import ConfigProcessor
         from fs42.slot_reader import SlotReader
-        station_schema = json.loads((root / "fs42/station_config_schema.json").read_text())
-        for name, data in configs.items():
-            jsonschema.validate(data, station_schema)
-            processed = ConfigProcessor.preprocess(copy.deepcopy(data["station_conf"]))
-            if processed.get("network_type", "standard") == "standard": SlotReader.smooth_tags(processed)
-    except Exception as exc:
-        failures.append(f"FieldStation42 configuration processing failed: {exc}")
-    if failures:
-        return {"proposal_id": proposal["proposal_id"], "valid": False, "failures": failures, "warnings": warnings, "comparison": None}
-    stage = root / "runtime/director/staging" / proposal["proposal_id"]
-    try:
-        (stage / "confs").mkdir(parents=True, exist_ok=False); (stage / "runtime").mkdir(); (stage / "catalog").mkdir(); (stage / "fs42").mkdir()
-        os.symlink("/mnt/t7/CRT-Media", stage / "catalog/crt_media", target_is_directory=True)
-        shutil.copy2(root / "fs42/station_config_schema.json", stage / "fs42/station_config_schema.json")
-        staged_configs = copy.deepcopy(configs)
-        affected = apply_assignment_changes(staged_configs, proposal, policy)
-        affected.update(apply_directives(staged_configs, proposal, policy))
-        staged_assignments, assignment_errors = configured_tags_from_data(staged_configs)
-        failures.extend(assignment_errors)
-        active_names = {channel["name"] for channel in policy["channels"]}
-        for series, owners in staged_assignments.items():
-            active = sorted(name for name in owners if name in active_names)
-            if len(active) > 1:
-                failures.append(f"Exclusive ownership violation for {series}: {', '.join(active)}")
-        if failures:
-            return {"proposal_id": proposal["proposal_id"], "valid": False, "failures": sorted(set(failures)), "warnings": warnings, "comparison": None}
-        for name, data in staged_configs.items():
+
+        station_schema = json.loads(
+            (root / "fs42/station_config_schema.json").read_text(encoding="utf-8")
+        )
+        for data in configs.values():
             jsonschema.validate(data, station_schema)
             processed = ConfigProcessor.preprocess(copy.deepcopy(data["station_conf"]))
             if processed.get("network_type", "standard") == "standard":
                 SlotReader.smooth_tags(processed)
-            filename = next(p.name for p in (root / "confs").glob("*.json") if json.loads(p.read_text()).get("station_conf",{}).get("network_name") == name)
-            (stage / "confs" / filename).write_text(json.dumps(data, indent=2) + "\n")
-        main = json.loads((root / "confs/main_config.json").read_text()) if (root / "confs/main_config.json").exists() else {}
-        main["db_path"] = "runtime/fs42_fluid.db"; (stage / "confs/main_config.json").write_text(json.dumps(main, indent=2)+"\n")
-        clone_database(root / "runtime/fs42_fluid.db", stage / "runtime/fs42_fluid.db")
-        before = analyze_database(root / "runtime/fs42_fluid.db", proposal, policy)
-        if affected:
-            instructions = {"seed": proposal["seed"], "affected": sorted(affected), "week_end": _db_time(proposal["week_end"]).replace(" ", "T")}
-            (stage / "instructions.json").write_text(json.dumps(instructions))
-            run = subprocess.run([str(root / "env/bin/python3"), str(root / "station_director/stage_runner.py"), str(stage / "instructions.json")], cwd=stage, capture_output=True, text=True, timeout=1800)
-            if run.returncode: failures.append("Staged scheduler failed: " + (run.stderr.strip()[-2000:] or run.stdout.strip()[-2000:]))
-        after = analyze_database(stage / "runtime/fs42_fluid.db", proposal, policy)
-        for number, channel in after["channels"].items():
-            if channel["gaps"]: failures.append(f"Channel {number} has {len(channel['gaps'])} coverage gap(s)")
-            if channel["overlaps"]: failures.append(f"Channel {number} has {len(channel['overlaps'])} overlap(s)")
-        if after["integrity"] != "ok": failures.append("Staged SQLite integrity check failed")
-        if after["invalid_catalog_durations"]: failures.append("Catalog contains non-positive durations")
-        if after["media_errors"]: failures.append(f"Staged catalog has {len(after['media_errors'])} missing or unreadable media path(s)")
-        comparison = {}
-        for number, data in after["channels"].items():
-            current = before["channels"].get(number, {})
-            current_series = current.get("series_blocks", {}); proposed_series = data["series_blocks"]
-            series_delta = {series: proposed_series.get(series, 0)-current_series.get(series, 0) for series in sorted(set(current_series)|set(proposed_series)) if proposed_series.get(series, 0) != current_series.get(series, 0)}
-            comparison[number] = {"name": data["name"], "current_blocks": current.get("block_count", 0), "proposed_blocks": data["block_count"], "block_delta": data["block_count"] - current.get("block_count", 0), "added_series": sorted(set(proposed_series)-set(current_series)), "removed_series": sorted(set(current_series)-set(proposed_series)), "series_block_delta": series_delta}
-        staged_summary = copy.deepcopy(after)
-        return {"proposal_id": proposal["proposal_id"], "valid": not failures, "failures": failures, "warnings": warnings, "week_start": proposal["week_start"], "week_end": proposal["week_end"], "seed": proposal["seed"], "schedule_digest": after["schedule_digest"], "staged": staged_summary, "comparison": comparison}
+    except Exception as exc:
+        failures.append(f"FieldStation42 configuration processing failed: {exc}")
+    return sorted(set(failures)), warnings
+
+
+def _disabled_report(proposal, failures=None, warnings=None, isolation=None, path_validation=None):
+    return {
+        "proposal_id": proposal.get("proposal_id"),
+        "valid": False,
+        "failures": [PHASE_3_DISABLED, *(failures or [])],
+        "warnings": warnings or [],
+        "comparison": None,
+        "isolation": isolation,
+        "path_validation": path_validation,
+    }
+
+
+def _write_request(path, run_id, proposal, policy):
+    payload = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "proposal": proposal,
+        "policy": policy,
+    }
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def _load_worker_result(path, run_id, proposal_id):
+    path = Path(path)
+    if path.stat().st_size > MAX_WORKER_RESULT_BYTES:
+        raise ValueError("validation worker result exceeds the size limit")
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    expected = {
+        "schema_version",
+        "run_id",
+        "proposal_id",
+        "status",
+        "failure",
+        "scheduler_invoked",
+        "probe_attestation",
+        "path_validation",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected:
+        raise ValueError("validation worker result fields are incomplete or unexpected")
+    if raw["schema_version"] != 1 or raw["run_id"] != run_id or raw["proposal_id"] != proposal_id:
+        raise ValueError("validation worker result identity or schema mismatch")
+    if raw["scheduler_invoked"] is not False:
+        raise ValueError("B1 worker reported scheduling behavior")
+    probe_results, probe_error = validate_probe_payload(raw["probe_attestation"], run_id)
+    if probe_error or not all(item["passed"] for item in probe_results.values()):
+        raise ValueError(f"validation worker probe attestation failed: {probe_error or 'probe failure'}")
+    if raw["status"] != "disabled" or raw["failure"] != PHASE_3_DISABLED:
+        raise ValueError("validation worker did not return the required disabled status")
+    path_validation = raw["path_validation"]
+    if not isinstance(path_validation, dict) or path_validation.get("passed") is not True:
+        raise ValueError("validation worker path confinement failed")
+    return raw, probe_results
+
+
+def validate_proposal(proposal, root, policy):
+    """Run B1 isolation/path checks, then fail closed before any scheduler behavior."""
+    root = Path(root).resolve()
+    outside_codex, context_detail = check_invocation_context()
+    if not outside_codex:
+        return _disabled_report(
+            proposal,
+            [f"Invocation context rejected before staging: {context_detail}"],
+            isolation={"verified_outside_codex": False, "detail": context_detail},
+        )
+
+    failures, warnings = [], []
+    try:
+        static_failures, static_warnings = _static_validation_checks(
+            proposal, root, policy
+        )
+        failures.extend(static_failures)
+        warnings.extend(static_warnings)
+    except (OSError, UnicodeError, ValueError, KeyError, IndexError, json.JSONDecodeError) as exc:
+        failures.append(f"Pre-launch validation checks failed: {exc}")
+
+    stale_ok, stale_failures = cleanup_stale_directories()
+    if not stale_ok:
+        failures.extend(f"Stale staging cleanup failed: {item}" for item in stale_failures)
+        return _disabled_report(
+            proposal,
+            failures,
+            warnings,
+            isolation={"verified_outside_codex": True, "detail": context_detail},
+        )
+
+    stage = None
+    stage_lock = None
+    unit_name = None
+    launch = LaunchResult("", 127, "", "validation launcher did not run")
+    worker = None
+    probe_results = None
+    stage_cleanup = (True, "not created")
+    unit_cleanup = (True, "not created")
+    try:
+        token, stage, stage_lock = create_staging_directory()
+        run_id = new_run_id()
+        unit_name = f"fs42-validation-{token}.service"
+        _write_request(stage / VALIDATION_REQUEST, run_id, proposal, policy)
+        launcher = IsolationLauncher(root)
+        launch = launcher.run(
+            stage,
+            [
+                sandbox_python(root),
+                "/project/station_director/stage_runner.py",
+                f"/stage/{VALIDATION_REQUEST}",
+                f"/stage/{VALIDATION_RESULT}",
+            ],
+            unit_name,
+            timeout=VALIDATION_TIMEOUT_SECONDS,
+        )
+        if launch.returncode != 0 or launch.timed_out:
+            failures.append(
+                "IsolationLauncher failed: "
+                + (launch.stderr.strip()[-2000:] or f"exit status {launch.returncode}")
+            )
+        try:
+            worker, probe_results = _load_worker_result(
+                stage / VALIDATION_RESULT, run_id, proposal.get("proposal_id")
+            )
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            failures.append(f"Validation worker result rejected: {exc}")
+    except (OSError, ValueError, RuntimeError) as exc:
+        failures.append(f"Isolation validation setup failed: {exc}")
     finally:
-        if stage.exists(): cleanup_staging(stage)
+        if unit_name is not None:
+            unit_cleanup = cleanup_unit(unit_name)
+        if stage_lock is not None:
+            stage_lock.close()
+        if stage is not None and os.path.lexists(stage):
+            stage_cleanup = cleanup_staging_directory(stage)
+
+    if not unit_cleanup[0]:
+        failures.append(f"Transient unit cleanup failed: {unit_cleanup[1]}")
+    if not stage_cleanup[0]:
+        failures.append(f"Staging cleanup failed: {stage_cleanup[1]}")
+    isolation_summary = {
+        "verified_outside_codex": True,
+        "detail": context_detail,
+        "launcher": "IsolationLauncher",
+        "unit_name": unit_name,
+        "exit_status": launch.returncode,
+        "timed_out": launch.timed_out,
+        "probe_results": probe_results,
+        "staging_cleanup": {"passed": stage_cleanup[0], "detail": stage_cleanup[1]},
+        "unit_cleanup": {"passed": unit_cleanup[0], "detail": unit_cleanup[1]},
+    }
+    return _disabled_report(
+        proposal,
+        failures,
+        warnings,
+        isolation=isolation_summary,
+        path_validation=worker.get("path_validation") if worker else None,
+    )

@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from station_director.isolation_probe import PROBE_RESULTS, PROBE_SCHEMA_VERSION
+
 
 MEDIA_ROOT = Path("/mnt/t7/CRT-Media")
 STAGING_PARENT = Path("/tmp")
@@ -20,29 +22,6 @@ STAGING_MAX_AGE_SECONDS = 6 * 60 * 60
 UNIT_TIMEOUT_SECONDS = 30
 CLEANUP_TIMEOUT_SECONDS = 10
 PROBE_OUTPUT = "preflight-probe.json"
-PROBE_RESULTS = (
-    "environment_sanitized",
-    "host_home_not_exposed",
-    "host_run_not_exposed",
-    "user_bus_not_exposed",
-    "proc_private",
-    "dev_private",
-    "tmp_private",
-    "project_mount_read_only",
-    "media_mount_read_only",
-    "staging_mount_writable",
-    "ipv4_blocked",
-    "ipv6_blocked",
-    "loopback_4242_blocked",
-    "af_unix_path_safe",
-    "af_unix_round_trip",
-    "staging_create",
-    "staging_read",
-    "staging_rename",
-    "staging_delete",
-)
-
-
 class IsolationError(RuntimeError):
     pass
 
@@ -62,6 +41,10 @@ def _utc_now():
 
 def _new_run_id():
     return f"{_utc_now().strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+
+
+def new_run_id():
+    return _new_run_id()
 
 
 def _process_ancestry(proc_root=Path("/proc"), start_pid=None):
@@ -246,6 +229,10 @@ def _sandbox_python(project_root):
     raise IsolationError(f"Python executable is outside mounted runtime paths: {executable}")
 
 
+def sandbox_python(project_root):
+    return _sandbox_python(project_root)
+
+
 def build_bwrap_command(project_root, staging_path, sandbox_argv):
     project_root = Path(project_root).resolve()
     staging_path = Path(staging_path).resolve()
@@ -330,12 +317,8 @@ def _failed_probe_results(detail):
     return {name: {"passed": False, "detail": detail} for name in PROBE_RESULTS}
 
 
-def _load_probe_output(path, run_id):
-    try:
-        raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        return _failed_probe_results(f"missing or malformed probe output: {exc}"), str(exc)
-    if not isinstance(raw, dict) or raw.get("schema_version") != 1 or raw.get("run_id") != run_id:
+def validate_probe_payload(raw, run_id):
+    if not isinstance(raw, dict) or raw.get("schema_version") != PROBE_SCHEMA_VERSION or raw.get("run_id") != run_id:
         return _failed_probe_results("probe identity or schema mismatch"), "probe identity or schema mismatch"
     results = raw.get("results")
     if not isinstance(results, dict) or set(results) != set(PROBE_RESULTS):
@@ -352,6 +335,14 @@ def _load_probe_output(path, run_id):
     if raw.get("overall_pass") is not actual_pass:
         return _failed_probe_results("contradictory overall probe result"), "contradictory overall probe result"
     return normalized, None
+
+
+def _load_probe_output(path, run_id):
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return _failed_probe_results(f"missing or malformed probe output: {exc}"), str(exc)
+    return validate_probe_payload(raw, run_id)
 
 
 def _render_text(report):
@@ -389,7 +380,7 @@ def _unique_report_directory(project_root, run_id):
     return target
 
 
-def _create_staging_directory():
+def create_staging_directory():
     for unused in range(20):
         token = uuid.uuid4().hex[:12]
         stage = STAGING_PARENT / _staging_name(token)
@@ -405,6 +396,10 @@ def _create_staging_directory():
                 shutil.rmtree(stage)
             raise
     raise IsolationError("could not allocate a unique staging directory")
+
+
+def _create_staging_directory():
+    return create_staging_directory()
 
 
 def _write_reports(report_dir, report):

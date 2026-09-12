@@ -20,6 +20,28 @@ EXPECTED_ENVIRONMENT = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONPATH": "/project",
 }
+PROBE_SCHEMA_VERSION = 1
+PROBE_RESULTS = (
+    "environment_sanitized",
+    "host_home_not_exposed",
+    "host_run_not_exposed",
+    "user_bus_not_exposed",
+    "proc_private",
+    "dev_private",
+    "tmp_private",
+    "project_mount_read_only",
+    "media_mount_read_only",
+    "staging_mount_writable",
+    "ipv4_blocked",
+    "ipv6_blocked",
+    "loopback_4242_blocked",
+    "af_unix_path_safe",
+    "af_unix_round_trip",
+    "staging_create",
+    "staging_read",
+    "staging_rename",
+    "staging_delete",
+)
 
 
 def result(passed, detail):
@@ -96,8 +118,8 @@ def check_loopback_blocked():
             sock.close()
 
 
-def check_unix_socket():
-    path = Path("/stage/u.sock")
+def check_unix_socket(stage_root=Path("/stage")):
+    path = Path(stage_root) / "u.sock"
     encoded_length = len(os.fsencode(path))
     path_result = result(encoded_length < 100, f"socket path is {encoded_length} bytes")
     server = client = accepted = None
@@ -129,14 +151,15 @@ def check_unix_socket():
     return path_result, socket_result
 
 
-def staging_operations():
-    created = Path("/stage/create.txt")
-    renamed = Path("/stage/renamed.txt")
+def staging_operations(stage_root=Path("/stage")):
+    stage_root = Path(stage_root)
+    created = stage_root / "create.txt"
+    renamed = stage_root / "renamed.txt"
     results = {}
     try:
         with created.open("x", encoding="utf-8") as handle:
             handle.write("isolation-preflight\n")
-        results["staging_create"] = result(True, "created /stage/create.txt")
+        results["staging_create"] = result(True, f"created {created}")
     except Exception as exc:
         results["staging_create"] = result(False, exc)
     try:
@@ -162,17 +185,14 @@ def staging_operations():
     return results
 
 
-def main(argv=None):
-    argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 2:
-        return 2
-    run_id, output_name = argv
-    output = Path(output_name)
+def collect_probe_results(environment=None, stage_root=Path("/stage")):
+    """Run the probe suite shared by preflight and schedule validation."""
     results = {}
-    results["environment_sanitized"] = check_environment()
+    results["environment_sanitized"] = check_environment(environment)
     results["host_home_not_exposed"] = result(not Path("/home").exists(), "/home is absent")
     results["host_run_not_exposed"] = result(not Path("/run").exists(), "/run is absent")
-    bus_exposed = "DBUS_SESSION_BUS_ADDRESS" in os.environ or Path(f"/run/user/{os.getuid()}/bus").exists()
+    environment = os.environ if environment is None else environment
+    bus_exposed = "DBUS_SESSION_BUS_ADDRESS" in environment or Path(f"/run/user/{os.getuid()}/bus").exists()
     results["user_bus_not_exposed"] = result(not bus_exposed, "host user bus is absent")
     results["proc_private"] = check_mount("/proc", "rw", "proc")
     results["dev_private"] = check_mount("/dev", "rw", "tmpfs")
@@ -183,15 +203,33 @@ def main(argv=None):
     results["ipv4_blocked"] = check_family_blocked(socket.AF_INET)
     results["ipv6_blocked"] = check_family_blocked(socket.AF_INET6)
     results["loopback_4242_blocked"] = check_loopback_blocked()
-    results["af_unix_path_safe"], results["af_unix_round_trip"] = check_unix_socket()
-    results.update(staging_operations())
-    payload = {
-        "schema_version": 1,
+    results["af_unix_path_safe"], results["af_unix_round_trip"] = check_unix_socket(stage_root)
+    results.update(staging_operations(stage_root))
+    if tuple(results) != PROBE_RESULTS:
+        raise RuntimeError("probe implementation does not match the required probe set")
+    return results
+
+
+def build_probe_payload(run_id, environment=None, stage_root=Path("/stage")):
+    results = collect_probe_results(environment=environment, stage_root=stage_root)
+    return {
+        "schema_version": PROBE_SCHEMA_VERSION,
         "run_id": run_id,
         "overall_pass": all(item["passed"] for item in results.values()),
         "results": results,
     }
-    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 2:
+        return 2
+    run_id, output_name = argv
+    output = Path(output_name)
+    payload = build_probe_payload(run_id)
+    temporary = output.with_name(output.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, output)
     return 0 if payload["overall_pass"] else 1
 
 
