@@ -62,9 +62,11 @@ def build_parser():
     plan.add_argument("--remove", action="append", metavar="SERIES", default=[])
     plan.add_argument("--date-slot", nargs=4, action="append", metavar=("CHANNEL", "DATE", "HOUR", "SERIES"), default=[])
     plan.add_argument("--daypart", nargs=3, action="append", metavar=("CHANNEL", "DAYPART", "SERIES"), default=[])
-    plan.add_argument("--season", nargs=4, action="append", metavar=("CHANNEL", "START", "END", "SERIES"), default=[])
-    plan.add_argument("--theme", nargs=3, action="append", metavar=("NAME", "CHANNEL", "SERIES"), default=[])
-    plan.add_argument("--marathon", nargs=5, action="append", metavar=("CHANNEL", "DATE", "HOUR", "HOURS", "SERIES"), default=[])
+    plan.add_argument("--season", nargs=5, action="append", metavar=("CHANNEL", "START", "END", "HOURS", "SERIES"), default=[])
+    plan.add_argument("--season-all-day", nargs=4, action="append", metavar=("CHANNEL", "START", "END", "SERIES"), default=[])
+    plan.add_argument("--theme", nargs=6, action="append", metavar=("NAME", "CHANNEL", "START", "END", "HOURS", "SERIES"), default=[])
+    plan.add_argument("--theme-all-day", nargs=5, action="append", metavar=("NAME", "CHANNEL", "START", "END", "SERIES"), default=[])
+    plan.add_argument("--marathon", nargs=5, action="append", metavar=("CHANNEL", "DATE", "HOUR", "COUNT", "SERIES"), default=[])
     plan.add_argument("--exclude", action="append", default=[])
     schedule_commands.add_parser("list", help="List saved proposals")
     show = schedule_commands.add_parser("show", help="Display a proposal"); show.add_argument("proposal_id")
@@ -78,6 +80,20 @@ def _owner_map(policy):
     tags, unused = configured_tags(ROOT / "confs")
     numbers = {c["name"]: c["number"] for c in policy["channels"]}
     return {tag: sorted(numbers[name] for name in names if name in numbers) for tag, names in tags.items()}
+
+
+def _parse_hours(value):
+    try:
+        hours = [int(item) for item in value.split(",")]
+    except ValueError as exc:
+        raise ValueError("HOURS must be a comma-separated list of integers from 0 through 23") from exc
+    if not hours or any(hour < 0 or hour > 23 for hour in hours):
+        raise ValueError("HOURS must contain integers from 0 through 23")
+    if len(hours) != len(set(hours)):
+        raise ValueError("HOURS must not contain duplicates")
+    if len(hours) == 24:
+        raise ValueError("Use the all-day option instead of listing all 24 hours")
+    return sorted(hours)
 
 
 def _plan_data(args, policy):
@@ -94,9 +110,11 @@ def _plan_data(args, policy):
     directives = []
     for channel, value, hour, series in args.date_slot: directives.append({"type":"date_slot","channel":int(channel),"date":value,"hour":int(hour),"series":series})
     for channel, part, series in args.daypart: directives.append({"type":"daypart","channel":int(channel),"daypart":part,"series":series})
-    for channel, start, end, series in args.season: directives.append({"type":"seasonal","channel":int(channel),"start_date":start,"end_date":end,"series":series})
-    for name, channel, series in args.theme: directives.append({"type":"theme","channel":int(channel),"name":name,"series":series})
-    for channel, value, hour, hours, series in args.marathon: directives.append({"type":"marathon","channel":int(channel),"date":value,"hour":int(hour),"hours":int(hours),"series":series})
+    for channel, start, end, hours, series in args.season: directives.append({"type":"seasonal","channel":int(channel),"start_date":start,"end_date":end,"hours":_parse_hours(hours),"series":series})
+    for channel, start, end, series in args.season_all_day: directives.append({"type":"seasonal","channel":int(channel),"start_date":start,"end_date":end,"all_day":True,"series":series})
+    for name, channel, start, end, hours, series in args.theme: directives.append({"type":"theme","channel":int(channel),"name":name,"start_date":start,"end_date":end,"hours":_parse_hours(hours),"series":series})
+    for name, channel, start, end, series in args.theme_all_day: directives.append({"type":"theme","channel":int(channel),"name":name,"start_date":start,"end_date":end,"all_day":True,"series":series})
+    for channel, value, hour, count, series in args.marathon: directives.append({"type":"marathon","channel":int(channel),"date":value,"hour":int(hour),"count":int(count),"series":series})
     return assignments, directives
 
 

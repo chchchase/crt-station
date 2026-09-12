@@ -1,0 +1,184 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "proposal_id", "created_at", "target_week", "week_start", "week_end", "source", "source_hashes", "seed", "assignment_changes", "directives", "exclusions"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "proposal_id": {"type": "string", "pattern": "^p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "target_week": {"type": "string", "format": "date"},
+    "week_start": {"type": "string", "format": "date-time"},
+    "week_end": {"type": "string", "format": "date-time"},
+    "source": {"enum": ["direct", "recommendation"]},
+    "source_hashes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configs", "database", "policy", "inventory", "wio_config", "wio_state"],
+      "properties": {
+        "configs": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}},
+        "database": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "policy": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "inventory": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "wio_config": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "wio_state": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "seed": {"type": "integer", "minimum": 0, "maximum": 2147483647},
+    "assignment_changes": {"type": "array", "items": {"$ref": "#/$defs/assignment"}},
+    "directives": {"type": "array", "items": {"$ref": "#/$defs/directive"}},
+    "exclusions": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/series"}}
+  },
+  "$defs": {
+    "series": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\;`$]+$"},
+    "channel": {"type": "integer", "enum": [2, 3, 4, 5, 6, 7]},
+    "hours": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 23,
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 0, "maximum": 23}
+    },
+    "assign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "series", "from_channel", "to_channel"],
+      "properties": {
+        "action": {"const": "assign"},
+        "series": {"$ref": "#/$defs/series"},
+        "from_channel": {"type": "null"},
+        "to_channel": {"$ref": "#/$defs/channel"}
+      }
+    },
+    "move": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "series", "from_channel", "to_channel"],
+      "properties": {
+        "action": {"const": "move"},
+        "series": {"$ref": "#/$defs/series"},
+        "from_channel": {"$ref": "#/$defs/channel"},
+        "to_channel": {"$ref": "#/$defs/channel"}
+      }
+    },
+    "remove": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "series", "from_channel", "to_channel"],
+      "properties": {
+        "action": {"const": "remove"},
+        "series": {"$ref": "#/$defs/series"},
+        "from_channel": {"$ref": "#/$defs/channel"},
+        "to_channel": {"type": "null"}
+      }
+    },
+    "assignment": {
+      "oneOf": [
+        {"$ref": "#/$defs/assign"},
+        {"$ref": "#/$defs/move"},
+        {"$ref": "#/$defs/remove"}
+      ]
+    },
+    "date_slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "channel", "date", "hour", "series"],
+      "properties": {
+        "type": {"const": "date_slot"},
+        "channel": {"$ref": "#/$defs/channel"},
+        "date": {"type": "string", "format": "date"},
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+        "series": {"$ref": "#/$defs/series"}
+      }
+    },
+    "daypart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "channel", "daypart", "series"],
+      "properties": {
+        "type": {"const": "daypart"},
+        "channel": {"$ref": "#/$defs/channel"},
+        "daypart": {"enum": ["morning", "daytime", "prime", "late", "overnight"]},
+        "series": {"$ref": "#/$defs/series"}
+      }
+    },
+    "marathon": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "channel", "date", "hour", "count", "series"],
+      "properties": {
+        "type": {"const": "marathon"},
+        "channel": {"$ref": "#/$defs/channel"},
+        "date": {"type": "string", "format": "date"},
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+        "count": {"type": "integer", "minimum": 1},
+        "series": {"$ref": "#/$defs/series"}
+      }
+    },
+    "seasonal_hours": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "channel", "start_date", "end_date", "hours", "series"],
+      "properties": {
+        "type": {"const": "seasonal"},
+        "channel": {"$ref": "#/$defs/channel"},
+        "start_date": {"type": "string", "format": "date"},
+        "end_date": {"type": "string", "format": "date"},
+        "hours": {"$ref": "#/$defs/hours"},
+        "series": {"$ref": "#/$defs/series"}
+      }
+    },
+    "seasonal_all_day": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "channel", "start_date", "end_date", "all_day", "series"],
+      "properties": {
+        "type": {"const": "seasonal"},
+        "channel": {"$ref": "#/$defs/channel"},
+        "start_date": {"type": "string", "format": "date"},
+        "end_date": {"type": "string", "format": "date"},
+        "all_day": {"const": true},
+        "series": {"$ref": "#/$defs/series"}
+      }
+    },
+    "theme_hours": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "name", "channel", "start_date", "end_date", "hours", "series"],
+      "properties": {
+        "type": {"const": "theme"},
+        "name": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\;`$]+$"},
+        "channel": {"$ref": "#/$defs/channel"},
+        "start_date": {"type": "string", "format": "date"},
+        "end_date": {"type": "string", "format": "date"},
+        "hours": {"$ref": "#/$defs/hours"},
+        "series": {"$ref": "#/$defs/series"}
+      }
+    },
+    "theme_all_day": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "name", "channel", "start_date", "end_date", "all_day", "series"],
+      "properties": {
+        "type": {"const": "theme"},
+        "name": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\;`$]+$"},
+        "channel": {"$ref": "#/$defs/channel"},
+        "start_date": {"type": "string", "format": "date"},
+        "end_date": {"type": "string", "format": "date"},
+        "all_day": {"const": true},
+        "series": {"$ref": "#/$defs/series"}
+      }
+    },
+    "directive": {
+      "oneOf": [
+        {"$ref": "#/$defs/date_slot"},
+        {"$ref": "#/$defs/daypart"},
+        {"$ref": "#/$defs/marathon"},
+        {"$ref": "#/$defs/seasonal_hours"},
+        {"$ref": "#/$defs/seasonal_all_day"},
+        {"$ref": "#/$defs/theme_hours"},
+        {"$ref": "#/$defs/theme_all_day"}
+      ]
+    }
+  }
+}

@@ -10,7 +10,12 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from station_director.inventory import load_snapshots, validate_media_mount
-from station_director.proposals import ProposalError, cleanup_staging, stale_sources
+from station_director.proposals import (
+    ProposalError,
+    cleanup_staging,
+    inventory_identifier_errors,
+    stale_sources,
+)
 from station_director.recommend import configured_tags
 
 
@@ -66,6 +71,31 @@ def apply_assignment_changes(configs, proposal, policy):
     return affected
 
 
+def apply_exclusions(configs, proposal, policy):
+    """Remove excluded inventory series from ordinary channels in the projection."""
+    by_number, unused = _channel_maps(policy)
+    affected = set()
+    for series in proposal["exclusions"]:
+        for number in range(2, 8):
+            name = by_number[number]
+            if name not in configs:
+                continue
+            before = json.dumps(configs[name]["station_conf"], sort_keys=True)
+            _remove_series(configs[name]["station_conf"], series)
+            after = json.dumps(configs[name]["station_conf"], sort_keys=True)
+            if before != after:
+                affected.add(name)
+    return affected
+
+
+def _put_slot(container, hour, slot, description):
+    key = str(hour)
+    existing = container.get(key)
+    if existing is not None and existing != slot:
+        raise ProposalError(f"Directive conflicts with existing programming at {description}")
+    container[key] = slot
+
+
 def apply_directives(configs, proposal, policy):
     by_number, unused = _channel_maps(policy)
     affected = set()
@@ -82,30 +112,114 @@ def apply_directives(configs, proposal, policy):
             key = _date_key(directive["date"])
             slot = {"tags": series}
             if dtype == "marathon":
-                slot["marathon"] = {"count": directive["hours"], "chance": 1.0}
-            conf.setdefault("date_overrides", {}).setdefault(key, {})[str(directive["hour"])] = slot
+                slot["marathon"] = {"count": directive["count"], "chance": 1.0}
+            slots = conf.setdefault("date_overrides", {}).setdefault(key, {})
+            if not isinstance(slots, dict):
+                raise ProposalError(f"Cannot merge directive into template override {key} on {name}")
+            _put_slot(slots, directive["hour"], slot, f"{name} {directive['date']} hour {directive['hour']}")
         elif dtype == "daypart":
             start = datetime.fromisoformat(proposal["week_start"])
             for offset in range(7):
-                key = _date_key((start + timedelta(days=offset)).date().isoformat())
+                value = (start + timedelta(days=offset)).date().isoformat()
+                key = _date_key(value)
                 slots = conf.setdefault("date_overrides", {}).setdefault(key, {})
+                if not isinstance(slots, dict):
+                    raise ProposalError(f"Cannot merge directive into template override {key} on {name}")
                 for hour in DAYPARTS[directive["daypart"]]:
-                    slots[str(hour)] = {"tags": series}
+                    _put_slot(slots, hour, {"tags": series}, f"{name} {value} hour {hour}")
         else:
-            start = directive.get("start_date", proposal["target_week"])
-            end = directive.get("end_date", (datetime.fromisoformat(proposal["week_end"]) - timedelta(days=1)).date().isoformat())
-            key = f"{_date_key(start)} - {_date_key(end)}"
-            week = conf.setdefault("week_overrides", {}).setdefault(key, {})
-            for day_name in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"):
-                week[day_name] = {str(hour): {"tags": series} for hour in list(range(6, 24)) + list(range(0, 6))}
+            start = date.fromisoformat(directive["start_date"])
+            end = date.fromisoformat(directive["end_date"])
+            hours = range(24) if directive.get("all_day") is True else directive["hours"]
+            current = start
+            while current <= end:
+                value = current.isoformat()
+                key = _date_key(value)
+                slots = conf.setdefault("date_overrides", {}).setdefault(key, {})
+                if not isinstance(slots, dict):
+                    raise ProposalError(f"Cannot merge directive into template override {key} on {name}")
+                for hour in hours:
+                    _put_slot(slots, hour, {"tags": series}, f"{name} {value} hour {hour}")
+                current += timedelta(days=1)
     return affected
+
+
+def project_configuration(configs, proposal, policy):
+    """Apply all declarative proposal effects to an isolated in-memory model."""
+    projected = copy.deepcopy(configs)
+    source_channels = apply_assignment_changes(projected, proposal, policy)
+    source_channels.update(apply_exclusions(projected, proposal, policy))
+    affected = set(source_channels)
+    affected.update(apply_directives(projected, proposal, policy))
+    return projected, affected, source_channels
+
+
+def _slot_has_tags(slot):
+    if not isinstance(slot, dict):
+        return False
+    tags = slot.get("tags")
+    if isinstance(tags, str):
+        return bool(tags)
+    if isinstance(tags, list):
+        return bool(tags) and all(isinstance(tag, str) and tag for tag in tags)
+    return False
+
+
+def _resolved_week_slots(configs, channel_names, proposal):
+    from fs42.config_processor import ConfigProcessor
+    from fs42.slot_reader import SlotReader
+
+    start = datetime.fromisoformat(proposal["week_start"])
+    resolved = {}
+    errors = []
+    for name in sorted(channel_names):
+        data = configs.get(name)
+        if not data:
+            errors.append(f"Cannot resolve source slots for missing channel configuration: {name}")
+            continue
+        try:
+            conf = ConfigProcessor.preprocess(copy.deepcopy(data["station_conf"]))
+            conf = SlotReader.smooth_tags(conf)
+            states = {}
+            for offset in range(7):
+                current_date = (start + timedelta(days=offset)).date()
+                for hour in range(24):
+                    when = datetime.combine(current_date, datetime.min.time()).replace(hour=hour)
+                    slot, unused_slot_number = SlotReader.get_slot(conf, when)
+                    states[f"{current_date.isoformat()}T{hour:02d}:00"] = _slot_has_tags(slot)
+            resolved[name] = states
+        except Exception as exc:
+            errors.append(f"Could not resolve projected slots for {name}: {exc}")
+    return resolved, errors
+
+
+def _newly_unresolved_source_slots(original, projected, source_channels, proposal):
+    if not source_channels:
+        return [], []
+    before, before_errors = _resolved_week_slots(original, source_channels, proposal)
+    after, after_errors = _resolved_week_slots(projected, source_channels, proposal)
+    failures = []
+    for name in sorted(source_channels):
+        lost = [
+            timestamp
+            for timestamp, was_tagged in before.get(name, {}).items()
+            if was_tagged and not after.get(name, {}).get(timestamp, False)
+        ]
+        if lost:
+            sample = ", ".join(lost[:8])
+            remainder = f" and {len(lost) - 8} more" if len(lost) > 8 else ""
+            failures.append(
+                f"{name} has {len(lost)} newly unresolved or tagless source slot(s): "
+                f"{sample}{remainder}"
+            )
+    return failures, before_errors + after_errors
 
 
 def semantic_checks(proposal, policy, inventory, configs):
     failures, warnings = [], []
     by_number, by_name = _channel_maps(policy)
-    shows = set(inventory.get("shows", {}))
-    wio = set(policy.get("watch_in_order_series", []))
+    failures.extend(inventory_identifier_errors(proposal, inventory))
+    wio = {series.casefold() for series in policy.get("watch_in_order_series", [])}
     assignments, config_errors = configured_tags_from_data(configs)
     failures.extend(config_errors)
     for channel in policy["channels"]:
@@ -121,13 +235,16 @@ def semantic_checks(proposal, policy, inventory, configs):
     directives_by_series = {}
     for directive in proposal["directives"]:
         directives_by_series.setdefault(directive["series"].casefold(), set()).add(directive["channel"])
+    seen_changes = set()
     for change in proposal["assignment_changes"]:
         series = change["series"]
-        if series not in shows:
-            failures.append(f"Unknown inventory series: {series}")
-        if series in wio or change.get("from_channel") == 8 or change.get("to_channel") == 8:
+        series_key = series.casefold()
+        if series_key in seen_changes:
+            failures.append(f"Multiple assignment changes target the same series: {series}")
+        seen_changes.add(series_key)
+        if series_key in wio or change.get("from_channel") == 8 or change.get("to_channel") == 8:
             failures.append(f"Watch In Order conflict for {series}; use a future dedicated WIO operation")
-        current = sorted(by_name.get(name) for name in assignments.get(series.casefold(), set()) if name in by_name)
+        current = sorted(by_name.get(name) for name in assignments.get(series_key, set()) if name in by_name)
         expected_from = change.get("from_channel")
         if expected_from and expected_from not in current:
             failures.append(f"{series} is not currently assigned to Channel {expected_from}")
@@ -136,27 +253,66 @@ def semantic_checks(proposal, policy, inventory, configs):
         if change["action"] == "assign" and current:
             failures.append(f"{series} already belongs to Channel(s) {current}; use a move proposal")
         destination = change.get("to_channel")
-        if destination is not None and destination not in directives_by_series.get(series.casefold(), set()):
+        if destination is not None and destination not in directives_by_series.get(series_key, set()):
             failures.append(f"{series} assignment to Channel {destination} requires a scheduling directive on that channel")
-        intended[series.casefold()] = change.get("to_channel")
+        if change["action"] == "remove" and series_key in directives_by_series:
+            failures.append(f"Removed series is also scheduled by a directive: {series}")
+        intended[series_key] = destination
         warnings.append(f"Transfer report: {series}: lose {expected_from or 'none'}, gain {change.get('to_channel') or 'none'}")
     for directive in proposal["directives"]:
-        if directive["series"] not in shows:
-            failures.append(f"Unknown inventory series: {directive['series']}")
-        if directive["channel"] in (1, 8) or directive["series"] in wio:
+        series = directive["series"]
+        series_key = series.casefold()
+        if directive["channel"] in (1, 8) or series_key in wio:
             failures.append(f"Protected Watch In Order/guide programming conflict: {directive['series']}")
-        current = sorted(by_name.get(name) for name in assignments.get(directive["series"].casefold(), set()) if name in by_name)
-        permitted = intended.get(directive["series"].casefold(), current[0] if len(current) == 1 else None)
+        current = sorted(by_name.get(name) for name in assignments.get(series_key, set()) if name in by_name)
+        permitted = intended.get(series_key, current[0] if len(current) == 1 else None)
+        if series_key not in intended and not current:
+            failures.append(f"Unassigned series requires an assign action before scheduling: {series}")
         if permitted is not None and directive["channel"] != permitted:
             failures.append(f"Exclusive ownership conflict: {directive['series']} belongs to Channel {permitted}, not Channel {directive['channel']}")
-        for required in {"date_slot": ("date", "hour"), "daypart": ("daypart",), "seasonal": ("start_date", "end_date"), "theme": ("name",), "marathon": ("date", "hour", "hours")}[directive["type"]]:
-            if required not in directive:
-                failures.append(f"{directive['type']} directive is missing {required}")
-    excluded = {series.casefold() for series in proposal["exclusions"]}
+    excluded = set()
+    for series in proposal["exclusions"]:
+        series_key = series.casefold()
+        if series_key in excluded:
+            failures.append(f"Duplicate exclusion differs only by case: {series}")
+        if series_key in wio:
+            failures.append(f"Watch In Order series cannot be excluded: {series}")
+        excluded.add(series_key)
     used = {change["series"].casefold() for change in proposal["assignment_changes"]}
     used.update(directive["series"].casefold() for directive in proposal["directives"])
     for conflict in sorted(excluded & used):
         failures.append(f"Excluded series is also scheduled or assigned: {conflict}")
+
+    try:
+        projected, unused_affected, source_channels = project_configuration(
+            configs, proposal, policy
+        )
+        projected_assignments, projected_errors = configured_tags_from_data(projected)
+        failures.extend(projected_errors)
+        for series, owners in projected_assignments.items():
+            active = sorted(owner for owner in owners if owner in active_names)
+            if len(active) > 1:
+                failures.append(
+                    f"Projected exclusive ownership violation for {series}: {', '.join(active)}"
+                )
+        for series in excluded:
+            ordinary_owners = sorted(
+                owner
+                for owner in projected_assignments.get(series, set())
+                if by_name.get(owner) in range(2, 8)
+            )
+            if ordinary_owners:
+                failures.append(
+                    f"Excluded series remains in projected configuration: {series} "
+                    f"on {', '.join(ordinary_owners)}"
+                )
+        unresolved, resolution_errors = _newly_unresolved_source_slots(
+            configs, projected, source_channels, proposal
+        )
+        failures.extend(unresolved)
+        failures.extend(resolution_errors)
+    except (KeyError, TypeError, ValueError, ProposalError) as exc:
+        failures.append(f"Could not build projected configuration: {exc}")
     return sorted(set(failures)), warnings
 
 
