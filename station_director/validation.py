@@ -19,6 +19,17 @@ from station_director.isolation import (
     sandbox_python,
     validate_probe_payload,
 )
+from station_director.preservation import (
+    PreservationError,
+    capture_media_manifest,
+    compare_database_fingerprints,
+    compare_json_fingerprints,
+    compare_media_manifests,
+    fingerprint_and_clone_database,
+    fingerprint_database,
+    fingerprint_json_files,
+    protected_json_paths,
+)
 from station_director.proposals import (
     ProposalError,
     inventory_identifier_errors,
@@ -33,6 +44,8 @@ VALIDATION_REQUEST = "validation-request.json"
 VALIDATION_RESULT = "validation-result.json"
 VALIDATION_TIMEOUT_SECONDS = 120
 MAX_WORKER_RESULT_BYTES = 2 * 1024 * 1024
+LIVE_DATABASE = "runtime/fs42_fluid.db"
+LIVE_MEDIA_ROOT = "/mnt/t7/CRT-Media"
 
 
 def _channel_maps(policy):
@@ -392,8 +405,7 @@ def analyze_database(db_path, proposal, policy):
 
 
 def clone_database(source, target):
-    with sqlite3.connect(f"file:{Path(source).resolve()}?mode=ro", uri=True) as src, sqlite3.connect(target) as dst:
-        src.backup(dst)
+    return fingerprint_and_clone_database(source, target)
 
 
 def _static_validation_checks(proposal, root, policy):
@@ -433,7 +445,15 @@ def _static_validation_checks(proposal, root, policy):
     return sorted(set(failures)), warnings
 
 
-def _disabled_report(proposal, failures=None, warnings=None, isolation=None, path_validation=None):
+def _disabled_report(
+    proposal,
+    failures=None,
+    warnings=None,
+    isolation=None,
+    path_validation=None,
+    preservation=None,
+    schedule_preparation=None,
+):
     return {
         "proposal_id": proposal.get("proposal_id"),
         "valid": False,
@@ -442,6 +462,8 @@ def _disabled_report(proposal, failures=None, warnings=None, isolation=None, pat
         "comparison": None,
         "isolation": isolation,
         "path_validation": path_validation,
+        "preservation": preservation,
+        "schedule_preparation": schedule_preparation,
     }
 
 
@@ -473,6 +495,7 @@ def _load_worker_result(path, run_id, proposal_id):
         "scheduler_invoked",
         "probe_attestation",
         "path_validation",
+        "b2_preparation",
     }
     if not isinstance(raw, dict) or set(raw) != expected:
         raise ValueError("validation worker result fields are incomplete or unexpected")
@@ -488,11 +511,37 @@ def _load_worker_result(path, run_id, proposal_id):
     path_validation = raw["path_validation"]
     if not isinstance(path_validation, dict) or path_validation.get("passed") is not True:
         raise ValueError("validation worker path confinement failed")
+    preparation = raw["b2_preparation"]
+    expected_preparation = {"schema_tables", "channels", "scheduler_gate"}
+    if not isinstance(preparation, dict) or set(preparation) != expected_preparation:
+        raise ValueError("validation worker B2 preparation is malformed")
+    if preparation["scheduler_gate"] != "disabled":
+        raise ValueError("validation worker scheduler gate is not disabled")
+    if not isinstance(preparation["schema_tables"], list) or not isinstance(
+        preparation["channels"], list
+    ):
+        raise ValueError("validation worker B2 preparation lists are malformed")
+    expected_channel = {
+        "channel",
+        "original_horizon",
+        "proposal_boundary",
+        "proposal_end",
+        "effective_horizon",
+        "regeneration_start",
+        "retained_row_count",
+        "protected_catalog_count",
+        "boundary_crossing_ids",
+    }
+    if any(
+        not isinstance(item, dict) or set(item) != expected_channel
+        for item in preparation["channels"]
+    ):
+        raise ValueError("validation worker channel history summary is malformed")
     return raw, probe_results
 
 
 def validate_proposal(proposal, root, policy):
-    """Run B1 isolation/path checks, then fail closed before any scheduler behavior."""
+    """Run B1/B2 safety checks, then fail closed before any scheduler behavior."""
     root = Path(root).resolve()
     outside_codex, context_detail = check_invocation_context()
     if not outside_codex:
@@ -528,12 +577,25 @@ def validate_proposal(proposal, root, policy):
     launch = LaunchResult("", 127, "", "validation launcher did not run")
     worker = None
     probe_results = None
+    pre_json = None
+    pre_database = None
+    pre_media = None
+    post_media = None
+    preservation_summary = None
     stage_cleanup = (True, "not created")
     unit_cleanup = (True, "not created")
     try:
         token, stage, stage_lock = create_staging_directory()
         run_id = new_run_id()
         unit_name = f"fs42-validation-{token}.service"
+        pre_json = fingerprint_json_files(protected_json_paths(root))
+        pre_database = fingerprint_and_clone_database(
+            root / LIVE_DATABASE,
+            stage / "runtime/fs42_fluid.db",
+        )
+        pre_media = capture_media_manifest(
+            LIVE_MEDIA_ROOT, spool_directory=stage
+        )
         _write_request(stage / VALIDATION_REQUEST, run_id, proposal, policy)
         launcher = IsolationLauncher(root)
         launch = launcher.run(
@@ -558,9 +620,42 @@ def validate_proposal(proposal, root, policy):
             )
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             failures.append(f"Validation worker result rejected: {exc}")
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, PreservationError) as exc:
         failures.append(f"Isolation validation setup failed: {exc}")
     finally:
+        if pre_json is not None and pre_database is not None and pre_media is not None:
+            try:
+                post_json = fingerprint_json_files(protected_json_paths(root))
+                post_database = fingerprint_database(root / LIVE_DATABASE)
+                post_media = capture_media_manifest(
+                    LIVE_MEDIA_ROOT, spool_directory=stage
+                )
+                json_comparison = compare_json_fingerprints(pre_json, post_json)
+                database_comparison = compare_database_fingerprints(
+                    pre_database, post_database
+                )
+                media_comparison = compare_media_manifests(pre_media, post_media)
+                preservation_summary = {
+                    "preserved": all(
+                        item["preserved"]
+                        for item in (
+                            json_comparison,
+                            database_comparison,
+                            media_comparison,
+                        )
+                    ),
+                    "json": json_comparison,
+                    "database": database_comparison,
+                    "media": media_comparison,
+                }
+                if not preservation_summary["preserved"]:
+                    failures.append("Live preservation fingerprint changed during validation")
+            except (OSError, ValueError, RuntimeError, PreservationError) as exc:
+                failures.append(f"Post-validation preservation check failed: {exc}")
+        if pre_media is not None:
+            pre_media.close()
+        if post_media is not None:
+            post_media.close()
         if unit_name is not None:
             unit_cleanup = cleanup_unit(unit_name)
         if stage_lock is not None:
@@ -589,4 +684,6 @@ def validate_proposal(proposal, root, policy):
         warnings,
         isolation=isolation_summary,
         path_validation=worker.get("path_validation") if worker else None,
+        preservation=preservation_summary,
+        schedule_preparation=worker.get("b2_preparation") if worker else None,
     )

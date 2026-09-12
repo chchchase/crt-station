@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -172,18 +173,30 @@ class WorkerTests(unittest.TestCase):
             request_path = stage / "request.json"
             result_path = stage / "result.json"
             request_path.write_text(json.dumps(request))
-            payload = run_worker(
-                request_path,
-                result_path,
-                project_root=project,
-                stage_root=stage,
-                media_root=media,
-                probe_builder=passing_probes,
-            )
+            (stage / "runtime").mkdir()
+            sqlite3.connect(stage / "runtime/fs42_fluid.db").close()
+            history = Mock()
+            history.summary.return_value = {"channel": "Action"}
+            with patch(
+                "station_director.stage_runner.inspect_required_schema",
+                return_value={"tables": {"liquid_blocks": []}},
+            ), patch(
+                "station_director.stage_runner.capture_channel_history",
+                return_value=history,
+            ):
+                payload = run_worker(
+                    request_path,
+                    result_path,
+                    project_root=project,
+                    stage_root=stage,
+                    media_root=media,
+                    probe_builder=passing_probes,
+                )
             self.assertEqual(payload["status"], "disabled")
             self.assertEqual(payload["failure"], DISABLED_MESSAGE)
             self.assertFalse(payload["scheduler_invoked"])
             self.assertTrue(payload["path_validation"]["passed"])
+            self.assertEqual(payload["b2_preparation"]["scheduler_gate"], "disabled")
             self.assertEqual(json.loads(result_path.read_text()), payload)
 
     def test_failed_probe_stops_before_configuration_access(self):
@@ -267,17 +280,45 @@ class CoordinatorTests(unittest.TestCase):
                             "mappings": [],
                             "affected_channels": [],
                         },
+                        "b2_preparation": {
+                            "schema_tables": [],
+                            "channels": [],
+                            "scheduler_gate": "disabled",
+                        },
                     }
                     (Path(stage) / validation.VALIDATION_RESULT).write_text(json.dumps(result))
                     return LaunchResult(unit_name, 0, "", "")
 
+            media_manifest = Mock()
             with patch.object(isolation, "STAGING_PARENT", parent), patch.object(
                 validation, "check_invocation_context", return_value=(True, "verified SSH")
             ), patch.object(validation, "_static_validation_checks", return_value=(["static failure"], [])), patch.object(
                 validation, "cleanup_stale_directories", return_value=(True, [])
             ), patch.object(validation, "IsolationLauncher", FakeLauncher), patch.object(
                 validation, "sandbox_python", return_value="/project/env/bin/python3"
-            ), patch.object(validation, "cleanup_unit", return_value=(True, "removed")):
+            ), patch.object(validation, "cleanup_unit", return_value=(True, "removed")), patch.object(
+                validation, "protected_json_paths", return_value={}
+            ), patch.object(
+                validation,
+                "fingerprint_json_files",
+                return_value={"digest": "same", "files": {}, "file_count": 0},
+            ), patch.object(
+                validation,
+                "fingerprint_and_clone_database",
+                return_value={"logical": {"digest": "same"}, "raw_metadata": {}},
+            ), patch.object(
+                validation,
+                "fingerprint_database",
+                return_value={"logical": {"digest": "same"}, "raw_metadata": {}},
+            ), patch.object(
+                validation, "capture_media_manifest", return_value=media_manifest
+            ), patch.object(
+                validation, "compare_json_fingerprints", return_value={"preserved": True}
+            ), patch.object(
+                validation, "compare_database_fingerprints", return_value={"preserved": True}
+            ), patch.object(
+                validation, "compare_media_manifests", return_value={"preserved": True}
+            ):
                 report = validation.validate_proposal(proposal(), parent, {})
 
             self.assertEqual(len(launches), 1)
@@ -291,6 +332,10 @@ class CoordinatorTests(unittest.TestCase):
             self.assertIn("static failure", report["failures"])
             self.assertEqual(report["isolation"]["launcher"], "IsolationLauncher")
             self.assertTrue(report["path_validation"]["passed"])
+            self.assertTrue(report["preservation"]["preserved"])
+            self.assertEqual(
+                report["schedule_preparation"]["scheduler_gate"], "disabled"
+            )
 
     def test_validation_module_has_no_direct_subprocess_runner(self):
         source = (Path(__file__).parents[1] / "station_director/validation.py").read_text()

@@ -88,6 +88,28 @@ def _logical_relative_path(value, description):
         ) from exc
 
 
+def canonical_media_mapping(value, description="media path", *, allow_sandbox=False):
+    """Return stable live/sandbox identities without claiming /media is live-safe."""
+    raw = _path_text(value, description)
+    source = PurePosixPath(raw)
+    _reject_ambiguous_parts(source, description)
+    if allow_sandbox and source.is_absolute():
+        try:
+            relative = source.relative_to(SANDBOX_MEDIA_ROOT)
+        except ValueError:
+            relative = _logical_relative_path(raw, description)
+    else:
+        relative = _logical_relative_path(raw, description)
+    suffix = "" if relative.as_posix() == "." else relative.as_posix()
+    parts = () if not suffix else relative.parts
+    return MediaPathMapping(
+        "crt-media:/" + suffix,
+        str(Path(str(LIVE_MEDIA_ROOT)).joinpath(*parts)),
+        str(Path("/media").joinpath(*parts)),
+        True,
+    )
+
+
 def _resolved_within(candidate, root, description):
     try:
         resolved_root = Path(root).resolve(strict=True)
@@ -115,12 +137,13 @@ def map_media_path(value, description, *, sandbox_media_root=Path("/media"), exp
         raise PathSafetyError(f"{description} is not a regular file")
     if expected == "file" and not os.access(resolved, os.R_OK):
         raise PathSafetyError(f"{description} is not readable")
-    relative_text = relative.as_posix()
-    suffix = "" if relative_text == "." else relative_text
-    logical = "crt-media:/" + suffix
-    host = str(Path(str(LIVE_MEDIA_ROOT)).joinpath(*(() if suffix == "" else relative.parts)))
-    sandbox = str(sandbox_root.joinpath(*(() if suffix == "" else relative.parts)))
-    return MediaPathMapping(logical, host, sandbox, True)
+    identity = canonical_media_mapping(value, description)
+    return MediaPathMapping(
+        identity.logical_identity,
+        identity.canonical_host_path,
+        str(sandbox_candidate),
+        True,
+    )
 
 
 def validate_scheduled_media(value, *, sandbox_media_root=Path("/media")):
@@ -139,13 +162,7 @@ def validate_scheduled_media(value, *, sandbox_media_root=Path("/media")):
         raise PathSafetyError("scheduled media path is not a regular file")
     if not os.access(resolved, os.R_OK):
         raise PathSafetyError("scheduled media path is not readable")
-    relative_text = relative.as_posix()
-    return MediaPathMapping(
-        "crt-media:/" + relative_text,
-        str(Path(str(LIVE_MEDIA_ROOT)).joinpath(*relative.parts)),
-        str(Path("/media").joinpath(*relative.parts)),
-        True,
-    )
+    return canonical_media_mapping(raw, description, allow_sandbox=True)
 
 
 def _map_relative_media(value, base_mapping, description, sandbox_media_root, expected):

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -9,7 +10,12 @@ sys.path.insert(0, str(ROOT))
 
 from station_director.isolation_probe import build_probe_payload
 from station_director.path_safety import PathSafetyError, map_station_config
-from station_director.validation import project_configuration
+from station_director.staged_schedule import (
+    StagedScheduleError,
+    capture_channel_history,
+    inspect_required_schema,
+)
+from station_director.validation import _db_time, project_configuration
 
 
 REQUEST_SCHEMA_VERSION = 1
@@ -74,6 +80,7 @@ def run_worker(
         "scheduler_invoked": False,
         "probe_attestation": None,
         "path_validation": {"passed": False, "mapping_count": 0, "mappings": []},
+        "b2_preparation": None,
     }
     try:
         probes = probe_builder(run_id, stage_root=stage_root)
@@ -104,10 +111,45 @@ def run_worker(
             "mappings": mapping_rows,
             "affected_channels": sorted(affected),
         }
+        database = Path(stage_root) / "runtime/fs42_fluid.db"
+        connection = sqlite3.connect(database.as_uri() + "?mode=rw", uri=True)
+        try:
+            connection.execute("PRAGMA query_only=ON")
+            if connection.execute("PRAGMA query_only").fetchone()[0] != 1:
+                raise StagedScheduleError("staged SQLite query_only could not be established")
+            connection.execute("BEGIN")
+            schema = inspect_required_schema(connection)
+            histories = [
+                capture_channel_history(
+                    connection,
+                    name,
+                    _db_time(proposal["week_start"]),
+                    _db_time(proposal["week_end"]),
+                )
+                for name in sorted(affected)
+            ]
+            payload["b2_preparation"] = {
+                "schema_tables": sorted(schema["tables"]),
+                "channels": [history.summary() for history in histories],
+                "scheduler_gate": "disabled",
+            }
+            connection.rollback()
+        finally:
+            connection.close()
         payload["status"] = "disabled"
         return payload
-    except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError, PathSafetyError) as exc:
-        payload["failure"] = f"B1 worker failed closed: {exc}; {DISABLED_MESSAGE}"
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        TypeError,
+        KeyError,
+        sqlite3.Error,
+        json.JSONDecodeError,
+        PathSafetyError,
+        StagedScheduleError,
+    ) as exc:
+        payload["failure"] = f"Validation worker failed closed: {exc}; {DISABLED_MESSAGE}"
         return payload
     finally:
         _write_result(result_path, payload)
