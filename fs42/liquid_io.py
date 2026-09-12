@@ -9,6 +9,7 @@ from fs42.liquid_blocks import LiquidBlock, LiquidLoopBlock, LiquidClipBlock, Li
 from fs42.block_plan import BlockPlanEntry
 from fs42.catalog_api import CatalogAPI
 from fs42.title_parser import TitleParser
+from fs42.scheduling_context import in_validation_mode
 
 
 class LiquidIO:
@@ -71,7 +72,11 @@ class LiquidIO:
         """
         with self._get_connection() as connection:
             cursor = connection.cursor()
-            cursor.execute("SELECT * FROM liquid_blocks WHERE station = ? ORDER BY start_time", (station_name,))
+            order = "start_time, end_time, id" if in_validation_mode() else "start_time"
+            cursor.execute(
+                f"SELECT * FROM liquid_blocks WHERE station = ? ORDER BY {order}",
+                (station_name,),
+            )
             rows = cursor.fetchall()
             cursor.close()
 
@@ -99,8 +104,9 @@ class LiquidIO:
     def query_liquid_blocks(self, station_name: str, start: str, end: str) -> list[LiquidBlock]:
         with self._get_connection() as connection:
             cursor = connection.cursor()
+            order = "start_time, end_time, id" if in_validation_mode() else "start_time"
             cursor.execute(
-                "SELECT * FROM liquid_blocks WHERE station = ? AND start_time < ? AND end_time > ? ORDER BY start_time",
+                f"SELECT * FROM liquid_blocks WHERE station = ? AND start_time < ? AND end_time > ? ORDER BY {order}",
                 (station_name, end, start),
             )
             rows = cursor.fetchall()
@@ -131,8 +137,13 @@ class LiquidIO:
 
         with self._get_connection() as connection:
             cursor = connection.cursor()
+            order = (
+                "station, start_time, end_time, id"
+                if in_validation_mode()
+                else "station, start_time"
+            )
             cursor.execute(
-                "SELECT * FROM liquid_blocks WHERE start_time < ? AND end_time > ? ORDER BY station, start_time",
+                f"SELECT * FROM liquid_blocks WHERE start_time < ? AND end_time > ? ORDER BY {order}",
                 (end, start),
             )
             rows = cursor.fetchall()

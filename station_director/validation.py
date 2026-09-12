@@ -36,6 +36,13 @@ from station_director.proposals import (
     stale_sources,
 )
 from station_director.recommend import configured_tags
+from station_director.validation_context import (
+    canonical_seed_inputs,
+    derive_validation_context,
+    logical_media_manifest_fingerprint,
+    logical_protected_configuration_fingerprint,
+    proposal_boundary_to_db,
+)
 
 
 DAYPARTS = {"morning": range(6, 10), "daytime": range(10, 18), "prime": range(18, 23), "late": [23, 0, 1, 2], "overnight": range(2, 6)}
@@ -59,7 +66,7 @@ def _date_key(value):
 
 def _db_time(value):
     """Convert an RFC 3339 proposal boundary to FieldStation's naive local form."""
-    return datetime.fromisoformat(value).replace(tzinfo=None).isoformat(sep=" ")
+    return proposal_boundary_to_db(value)
 
 
 def _remove_series(value, series):
@@ -453,6 +460,7 @@ def _disabled_report(
     path_validation=None,
     preservation=None,
     schedule_preparation=None,
+    validation_context=None,
 ):
     return {
         "proposal_id": proposal.get("proposal_id"),
@@ -464,15 +472,18 @@ def _disabled_report(
         "path_validation": path_validation,
         "preservation": preservation,
         "schedule_preparation": schedule_preparation,
+        "validation_context": validation_context,
     }
 
 
-def _write_request(path, run_id, proposal, policy):
+def _write_request(path, run_id, proposal, policy, seed_inputs, validation_context):
     payload = {
         "schema_version": 1,
         "run_id": run_id,
         "proposal": proposal,
         "policy": policy,
+        "seed_inputs": seed_inputs,
+        "validation_context": validation_context,
     }
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(
@@ -481,7 +492,7 @@ def _write_request(path, run_id, proposal, policy):
     os.replace(temporary, path)
 
 
-def _load_worker_result(path, run_id, proposal_id):
+def _load_worker_result(path, run_id, proposal_id, validation_context):
     path = Path(path)
     if path.stat().st_size > MAX_WORKER_RESULT_BYTES:
         raise ValueError("validation worker result exceeds the size limit")
@@ -496,6 +507,7 @@ def _load_worker_result(path, run_id, proposal_id):
         "probe_attestation",
         "path_validation",
         "b2_preparation",
+        "validation_context",
     }
     if not isinstance(raw, dict) or set(raw) != expected:
         raise ValueError("validation worker result fields are incomplete or unexpected")
@@ -503,6 +515,8 @@ def _load_worker_result(path, run_id, proposal_id):
         raise ValueError("validation worker result identity or schema mismatch")
     if raw["scheduler_invoked"] is not False:
         raise ValueError("B1 worker reported scheduling behavior")
+    if raw["validation_context"] != validation_context:
+        raise ValueError("validation worker context does not match its request")
     probe_results, probe_error = validate_probe_payload(raw["probe_attestation"], run_id)
     if probe_error or not all(item["passed"] for item in probe_results.values()):
         raise ValueError(f"validation worker probe attestation failed: {probe_error or 'probe failure'}")
@@ -582,13 +596,16 @@ def validate_proposal(proposal, root, policy):
     pre_media = None
     post_media = None
     preservation_summary = None
+    validation_context = None
     stage_cleanup = (True, "not created")
     unit_cleanup = (True, "not created")
     try:
         token, stage, stage_lock = create_staging_directory()
         run_id = new_run_id()
         unit_name = f"fs42-validation-{token}.service"
-        pre_json = fingerprint_json_files(protected_json_paths(root))
+        protected_paths = protected_json_paths(root)
+        pre_json = fingerprint_json_files(protected_paths)
+        logical_config = logical_protected_configuration_fingerprint(protected_paths)
         pre_database = fingerprint_and_clone_database(
             root / LIVE_DATABASE,
             stage / "runtime/fs42_fluid.db",
@@ -596,7 +613,21 @@ def validate_proposal(proposal, root, policy):
         pre_media = capture_media_manifest(
             LIVE_MEDIA_ROOT, spool_directory=stage
         )
-        _write_request(stage / VALIDATION_REQUEST, run_id, proposal, policy)
+        logical_media = logical_media_manifest_fingerprint(pre_media)
+        seed_inputs = canonical_seed_inputs(
+            logical_config["digest"],
+            pre_database["logical"]["digest"],
+            logical_media["digest"],
+        )
+        validation_context = derive_validation_context(proposal, policy, seed_inputs)
+        _write_request(
+            stage / VALIDATION_REQUEST,
+            run_id,
+            proposal,
+            policy,
+            seed_inputs,
+            validation_context,
+        )
         launcher = IsolationLauncher(root)
         launch = launcher.run(
             stage,
@@ -616,7 +647,10 @@ def validate_proposal(proposal, root, policy):
             )
         try:
             worker, probe_results = _load_worker_result(
-                stage / VALIDATION_RESULT, run_id, proposal.get("proposal_id")
+                stage / VALIDATION_RESULT,
+                run_id,
+                proposal.get("proposal_id"),
+                validation_context,
             )
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             failures.append(f"Validation worker result rejected: {exc}")
@@ -686,4 +720,7 @@ def validate_proposal(proposal, root, policy):
         path_validation=worker.get("path_validation") if worker else None,
         preservation=preservation_summary,
         schedule_preparation=worker.get("b2_preparation") if worker else None,
+        validation_context=(
+            worker.get("validation_context") if worker else validation_context
+        ),
     )

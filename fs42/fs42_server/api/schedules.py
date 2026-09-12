@@ -123,9 +123,14 @@ def _listing_projection(blocks, include_meta):
 
 
 # NOTE: must stay above /{network_name}, or that route captures "all".
+def build_all_schedules_payload(start, end, by_station, include_meta=False):
+    """Transform already-loaded schedule data into the guide payload."""
+    schedules = {name: _listing_projection(blocks, include_meta) for name, blocks in by_station.items()}
+    return {"start": start, "end": end, "schedules": schedules}
+
+
 @router.get("/all")
 def get_all_schedules(start: str = None, end: str = None, include_meta: bool = False):
-
     if not start or not end:
         return {"error": "start and end are both required."}
 
@@ -136,12 +141,9 @@ def get_all_schedules(start: str = None, end: str = None, include_meta: bool = F
         return {"error": "Invalid date format. Use ISO format (YYYY-MM-DDTHH:MM:SS) for start and end."}
 
     by_station = LiquidAPI.get_all_blocks(sdt, edt)
-
     if include_meta:
         _attach_meta_batch(by_station)
-
-    schedules = {name: _listing_projection(blocks, include_meta) for name, blocks in by_station.items()}
-    return {"start": start, "end": end, "schedules": schedules}
+    return build_all_schedules_payload(start, end, by_station, include_meta)
 
 
 @router.get("/{network_name}")

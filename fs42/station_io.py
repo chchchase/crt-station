@@ -10,6 +10,7 @@ from pathlib import Path
 from fs42.config_processor import ConfigProcessor
 from fs42 import schedule_hint
 from fs42 import timings
+from fs42.scheduling_context import scheduling_now, validation_order
 
 
 class StationIO:
@@ -73,7 +74,7 @@ class StationIO:
 
     def load_all_station_configs(self):
 
-        cfiles = glob.glob(f"{self.confs_dir}*.json")
+        cfiles = validation_order(glob.glob(f"{self.confs_dir}*.json"))
         station_configs = []
 
         for fname in cfiles:
@@ -111,7 +112,7 @@ class StationIO:
 
     def list_raw_station_configs(self):
 
-        cfiles = glob.glob(f"{self.confs_dir}*.json")
+        cfiles = validation_order(glob.glob(f"{self.confs_dir}*.json"))
         raw_configs = []
 
         for fname in cfiles:
@@ -187,7 +188,7 @@ class StationIO:
 
     def find_config_by_network_name(self, network_name):
 
-        for conf_file in glob.glob(f"{self.confs_dir}*.json"):
+        for conf_file in validation_order(glob.glob(f"{self.confs_dir}*.json")):
             if os.path.normpath(conf_file) != os.path.normpath(self.main_config_path):
                 try:
                     with open(conf_file) as f:
@@ -216,7 +217,7 @@ class StationIO:
                 parses = schedule_hint.RangeHint.test_pattern(active_rules["date_range"])
                 if parses:
                     hint = schedule_hint.RangeHint(active_rules["date_range"])
-                    if not hint.hint(datetime.datetime.now()):
+                    if not hint.hint(scheduling_now()):
                         # then, the active rule doesn't match, so this station isn't active
                         self._l.info(f"Skipping {filename} since marked inactive")
                         return None

@@ -4,6 +4,8 @@ import glob
 import json
 import sys
 
+from fs42.scheduling_context import validation_order
+
 # Validate ffmpeg-python package
 try:
     import ffmpeg
@@ -262,7 +264,7 @@ class MediaProcessor:
 
         file_list = []
         for ext in formats_to_scan:
-            this_format = glob.glob(f"{path}/*.{ext}")
+            this_format = validation_order(glob.glob(f"{path}/*.{ext}"))
             file_list += this_format
             logging.getLogger("MEDIA").debug(
                 f"--Found {len(this_format)} files with {ext} extension - {len(file_list)} total found in {path} so far"
@@ -310,6 +312,8 @@ class MediaProcessor:
             # glob skipped dotfiles - keep doing that so hidden dirs and
             # macos appledouble sidecars (._foo.mp4) don't get picked up as media
             dirs[:] = [d for d in dirs if not d.startswith(".")]
+            dirs[:] = validation_order(dirs)
+            files = validation_order(files)
 
             for file in files:
 
@@ -358,7 +362,10 @@ class MediaProcessor:
         clips = []
 
         # Process each directory group
-        for media_dir, file_list in files_by_dir.items():
+        directory_items = validation_order(
+            files_by_dir.items(), key=lambda item: item[0]
+        )
+        for media_dir, file_list in directory_items:
             # Collect hints from all path components
             hints = []
             rel_path = os.path.relpath(media_dir, dir_path)

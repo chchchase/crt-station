@@ -121,6 +121,9 @@ def _plan_data(args, policy):
 def _print_validation(report):
     print(f"Proposal: {report['proposal_id']}")
     print(f"Result: {'PASS' if report['valid'] else 'FAIL'}")
+    if report.get("validation_context"):
+        print(f"Requested seed: {report['validation_context']['requested_seed']}")
+        print(f"Effective seed: {report['validation_context']['effective_seed']}")
     for failure in report.get("failures", []): print(f"FAIL: {failure}")
     for warning in report.get("warnings", []): print(f"WARN: {warning}")
     for number, item in (report.get("comparison") or {}).items():

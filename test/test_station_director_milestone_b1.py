@@ -15,6 +15,7 @@ from station_director.path_safety import (
     validate_scheduled_media,
 )
 from station_director.stage_runner import DISABLED_MESSAGE, run_worker
+from station_director.validation_context import derive_validation_context
 
 
 def passing_probes(run_id, **unused):
@@ -42,6 +43,20 @@ def proposal():
         "exclusions": [],
         "source_hashes": {},
     }
+
+
+def seed_inputs():
+    return {
+        "logical_protected_configuration_fingerprint": "configs",
+        "logical_database_fingerprint": "database",
+        "logical_media_manifest_fingerprint": "media",
+    }
+
+
+def validation_context(proposal_value=None, policy=None):
+    return derive_validation_context(
+        proposal_value or proposal(), policy or {}, seed_inputs()
+    )
 
 
 class PathConfinementTests(unittest.TestCase):
@@ -164,11 +179,14 @@ class WorkerTests(unittest.TestCase):
                 }
             }
             (project / "confs/action.json").write_text(json.dumps(config))
+            policy = {"channels": [{"number": 2, "name": "Action"}]}
             request = {
                 "schema_version": 1,
                 "run_id": "run-b1",
                 "proposal": proposal(),
-                "policy": {"channels": [{"number": 2, "name": "Action"}]},
+                "policy": policy,
+                "seed_inputs": seed_inputs(),
+                "validation_context": validation_context(policy=policy),
             }
             request_path = stage / "request.json"
             result_path = stage / "result.json"
@@ -177,7 +195,10 @@ class WorkerTests(unittest.TestCase):
             sqlite3.connect(stage / "runtime/fs42_fluid.db").close()
             history = Mock()
             history.summary.return_value = {"channel": "Action"}
-            with patch(
+            with patch.dict(
+                os.environ,
+                {"TZ": "America/Los_Angeles", "PYTHONHASHSEED": "0"},
+            ), patch(
                 "station_director.stage_runner.inspect_required_schema",
                 return_value={"tables": {"liquid_blocks": []}},
             ), patch(
@@ -217,6 +238,8 @@ class WorkerTests(unittest.TestCase):
                         "run_id": "run-b1",
                         "proposal": proposal(),
                         "policy": {},
+                        "seed_inputs": seed_inputs(),
+                        "validation_context": validation_context(),
                     }
                 )
             )
@@ -285,11 +308,13 @@ class CoordinatorTests(unittest.TestCase):
                             "channels": [],
                             "scheduler_gate": "disabled",
                         },
+                        "validation_context": request["validation_context"],
                     }
                     (Path(stage) / validation.VALIDATION_RESULT).write_text(json.dumps(result))
                     return LaunchResult(unit_name, 0, "", "")
 
             media_manifest = Mock()
+            media_manifest.summary = {"digest": "same"}
             with patch.object(isolation, "STAGING_PARENT", parent), patch.object(
                 validation, "check_invocation_context", return_value=(True, "verified SSH")
             ), patch.object(validation, "_static_validation_checks", return_value=(["static failure"], [])), patch.object(
@@ -312,6 +337,10 @@ class CoordinatorTests(unittest.TestCase):
                 return_value={"logical": {"digest": "same"}, "raw_metadata": {}},
             ), patch.object(
                 validation, "capture_media_manifest", return_value=media_manifest
+            ), patch.object(
+                validation,
+                "logical_media_manifest_fingerprint",
+                return_value={"digest": "same", "entry_count": 0},
             ), patch.object(
                 validation, "compare_json_fingerprints", return_value={"preserved": True}
             ), patch.object(

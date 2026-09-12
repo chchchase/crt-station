@@ -1,12 +1,12 @@
 import datetime
 import os.path
-import random
 
 from fs42 import timings
 from fs42.reel_cutter import ReelCutter
 from fs42.block_plan import BlockPlanEntry
 from fs42.fluid_builder import FluidBuilder
 from fs42.media_processor import MediaProcessor
+from fs42.scheduling_context import scheduling_random
 
 
 class LiquidBlock:
@@ -326,7 +326,7 @@ class LiquidLoopBlock(LiquidBlock):
                 if current_index >= len(self.content):
                     current_index = 0
                     if self.shuffle:
-                        random.shuffle(self.content)
+                        scheduling_random().shuffle(self.content)
 
             else:
                 keep_going = False

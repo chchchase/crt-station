@@ -5,6 +5,7 @@ import os
 import json
 from fs42.media_processor import MediaProcessor
 from fs42.fluid_objects import FileRepoEntry
+from fs42.scheduling_context import scheduling_now
 
 
 class FluidStatements:
@@ -71,7 +72,7 @@ class FluidStatements:
             cursor = connection.cursor()
             cursor.execute(
                 "UPDATE file_meta SET meta=?, last_checked=? WHERE path=?",
-                (new_meta, datetime.datetime.now(), repo_entry.path),
+                (new_meta, scheduling_now(), repo_entry.path),
             )
             cursor.close()
             connection.commit()
@@ -104,7 +105,7 @@ class FluidStatements:
     def update_file_entry(connection: sqlite3.Connection, entry: FileRepoEntry):
         """An old entry has changed, get the new stats and update it."""
         cursor = connection.cursor()
-        now = datetime.datetime.now()
+        now = scheduling_now()
 
         processed = MediaProcessor.process_one(entry.path, "processing", [])
         if not processed:
@@ -130,7 +131,7 @@ class FluidStatements:
     def add_file_entry(connection: sqlite3.Connection, entry: FileRepoEntry):
         """This file isn't in the cache - add it."""
         cursor = connection.cursor()
-        now = datetime.datetime.now()
+        now = scheduling_now()
 
         entry.first_added = now
         entry.last_checked = now
@@ -158,7 +159,7 @@ class FluidStatements:
     def add_break_points(connection: sqlite3.Connection, path: str, points: dict):
         """Add or update the break points for this file"""
         cursor = connection.cursor()
-        now = datetime.datetime.now()
+        now = scheduling_now()
         json_points = json.dumps(points)
         cursor.execute("REPLACE INTO break_points VALUES(?, ?, ?)", (path, json_points, now))
         cursor.close()
@@ -187,7 +188,7 @@ class FluidStatements:
     def add_chapter_points(connection: sqlite3.Connection, path: str, points: dict):
         """Add or update the chapter points for this file"""
         cursor = connection.cursor()
-        now = datetime.datetime.now()
+        now = scheduling_now()
         json_points = json.dumps(points)
         cursor.execute("REPLACE INTO chapter_points VALUES(?, ?, ?)", (path, json_points, now))
         cursor.close()

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 
 from fs42.station_manager import StationManager
 from fs42.catalog_entry import CatalogEntry
+from fs42.scheduling_context import in_validation_mode, scheduling_now
 
 
 class CatalogIO:
@@ -156,11 +157,7 @@ class CatalogIO:
 
                     # Use INSERT OR REPLACE to overwrite existing entries
 
-                    cursor.execute(
-                        """INSERT OR REPLACE INTO catalog_entries
-                                    (station, path, realpath, title, duration, tag, count, hints, content_type, media_type, updated_at)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-                        (
+                    values = (
                             station_name,
                             entry.path,
                             entry.realpath,
@@ -171,8 +168,22 @@ class CatalogIO:
                             hints_json,
                             entry.content_type,
                             entry.media_type,
-                        ),
-                    )
+                        )
+                    if in_validation_mode():
+                        timestamp = scheduling_now()
+                        cursor.execute(
+                            """INSERT OR REPLACE INTO catalog_entries
+                                      (station, path, realpath, title, duration, tag, count, hints, content_type, media_type, created_at, updated_at)
+                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            values + (timestamp, timestamp),
+                        )
+                    else:
+                        cursor.execute(
+                            """INSERT OR REPLACE INTO catalog_entries
+                                      (station, path, realpath, title, duration, tag, count, hints, content_type, media_type, updated_at)
+                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                            values,
+                        )
 
                 else:
                     print(f"Warning: Entry {entry} is not a CatalogEntry instance. Skipping.")
@@ -184,11 +195,12 @@ class CatalogIO:
         with self._get_connection() as connection:
             cursor = connection.cursor()
 
+            order = "tag, title, path, id" if in_validation_mode() else "tag, title"
             cursor.execute(
-                """SELECT * 
-                    FROM catalog_entries 
+                f"""SELECT *
+                    FROM catalog_entries
                     WHERE station = ?
-                    ORDER BY tag, title""",
+                    ORDER BY {order}""",
                 (station_name,),
             )
 
@@ -206,10 +218,11 @@ class CatalogIO:
     def search_catalog_entries(self, station_name: str, query: str):
         with self._get_connection() as connection:
             cursor = connection.cursor()
+            order = "tag, title, path, id" if in_validation_mode() else "tag, title"
             cursor.execute(
-                """SELECT * FROM catalog_entries 
+                f"""SELECT * FROM catalog_entries
                               WHERE station = ? AND (title LIKE ? OR tag LIKE ? OR path LIKE ?)
-                              ORDER BY tag, title""",
+                              ORDER BY {order}""",
                 (station_name, f"%{query}%", f"%{query}%", f"%{query}%"),
             )
             rows = cursor.fetchall()
@@ -248,9 +261,10 @@ class CatalogIO:
     def get_by_tag(self, station_name: str, tag: str):
         with self._get_connection() as connection:
             cursor = connection.cursor()
+            order = " ORDER BY path, id" if in_validation_mode() else ""
             cursor.execute(
-                """SELECT * FROM catalog_entries 
-                              WHERE station = ? AND tag = ?""",
+                f"""SELECT * FROM catalog_entries
+                              WHERE station = ? AND tag = ?{order}""",
                 (station_name, tag),
             )
             rows = cursor.fetchall()
@@ -265,12 +279,19 @@ class CatalogIO:
     def update_entry_count(self, station_name: str, path: str, new_count: int):
         with self._get_connection() as connection:
             cursor = connection.cursor()
-            cursor.execute(
-                """UPDATE catalog_entries 
-                              SET count = ?, updated_at = CURRENT_TIMESTAMP 
+            if in_validation_mode():
+                cursor.execute(
+                    """UPDATE catalog_entries SET count = ?, updated_at = ?
                               WHERE station = ? AND path = ?""",
-                (new_count, station_name, path),
-            )
+                    (new_count, scheduling_now(), station_name, path),
+                )
+            else:
+                cursor.execute(
+                    """UPDATE catalog_entries
+                              SET count = ?, updated_at = CURRENT_TIMESTAMP
+                              WHERE station = ? AND path = ?""",
+                    (new_count, station_name, path),
+                )
             connection.commit()
             cursor.close()
 
@@ -280,12 +301,20 @@ class CatalogIO:
             cursor = connection.cursor()
             for entry in entries:
                 if isinstance(entry, CatalogEntry):
-                    cursor.execute(
-                        """UPDATE catalog_entries 
-                                      SET count = count + 1, updated_at = CURRENT_TIMESTAMP 
+                    if in_validation_mode():
+                        cursor.execute(
+                            """UPDATE catalog_entries
+                                      SET count = count + 1, updated_at = ?
                                       WHERE station = ? AND path = ?""",
-                        (station_name, entry.path),
-                    )
+                            (scheduling_now(), station_name, entry.path),
+                        )
+                    else:
+                        cursor.execute(
+                            """UPDATE catalog_entries
+                                      SET count = count + 1, updated_at = CURRENT_TIMESTAMP
+                                      WHERE station = ? AND path = ?""",
+                            (station_name, entry.path),
+                        )
                 else:
                     print(f"Warning: Entry {entry} is not a CatalogEntry instance. Skipping.")
             connection.commit()
@@ -294,10 +323,15 @@ class CatalogIO:
     def find_best_candidates(self, station_name: str, tag: str, max_duration: float):
         with self._get_connection() as connection:
             cursor = connection.cursor()
+            order = (
+                "count ASC, title ASC, path ASC, id ASC"
+                if in_validation_mode()
+                else "count ASC, title ASC"
+            )
             cursor.execute(
-                """SELECT * FROM catalog_entries 
+                f"""SELECT * FROM catalog_entries
                    WHERE station = ? AND tag = ? AND duration <= ? AND duration >= 1
-                   ORDER BY count ASC, title ASC""",
+                   ORDER BY {order}""",
                 (station_name, tag, max_duration),
             )
             rows = cursor.fetchall()

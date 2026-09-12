@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import json
+import importlib
 import os
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +17,7 @@ from station_director.staged_schedule import (
     capture_channel_history,
     inspect_required_schema,
 )
+from station_director.validation_context import verify_validation_context
 from station_director.validation import _db_time, project_configuration
 
 
@@ -32,16 +35,59 @@ def _write_result(path, payload):
 
 def _load_request(path):
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    expected = {"schema_version", "run_id", "proposal", "policy"}
+    expected = {
+        "schema_version", "run_id", "proposal", "policy", "seed_inputs",
+        "validation_context"
+    }
     if not isinstance(raw, dict) or set(raw) != expected:
         raise ValueError("validation request fields are incomplete or unexpected")
     if raw["schema_version"] != REQUEST_SCHEMA_VERSION:
         raise ValueError("validation request schema mismatch")
     if not isinstance(raw["run_id"], str) or not raw["run_id"]:
         raise ValueError("validation request run ID is invalid")
-    if not isinstance(raw["proposal"], dict) or not isinstance(raw["policy"], dict):
+    if (
+        not isinstance(raw["proposal"], dict)
+        or not isinstance(raw["policy"], dict)
+        or not isinstance(raw["seed_inputs"], dict)
+        or not isinstance(raw["validation_context"], dict)
+    ):
         raise ValueError("validation request proposal or policy is invalid")
     return raw
+
+
+def _load_native_validation_context(raw):
+    """Import native validation support only after probes have passed."""
+    module = importlib.import_module("fs42.scheduling_context")
+    expected = {
+        "input_fingerprint",
+        "requested_seed",
+        "effective_seed",
+        "reference_clock",
+        "start_time",
+        "end_time",
+        "timezone",
+        "python_hash_seed",
+        "validation_mode",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected:
+        raise ValueError("validation scheduling context is malformed")
+    if raw["python_hash_seed"] != "0":
+        raise ValueError("validation Python hash seed is not fixed at zero")
+    if raw["timezone"] != "America/Los_Angeles" or raw["validation_mode"] is not True:
+        raise ValueError("validation scheduling environment is invalid")
+    if os.environ.get("PYTHONHASHSEED") != raw["python_hash_seed"]:
+        raise ValueError("worker Python hash seed does not match the attested context")
+    if os.environ.get("TZ") != raw["timezone"]:
+        raise ValueError("worker timezone does not match the attested context")
+    context = module.ValidationSchedulingContext(
+        reference_clock=datetime.fromisoformat(raw["reference_clock"]),
+        start_time=datetime.fromisoformat(raw["start_time"]),
+        end_time=datetime.fromisoformat(raw["end_time"]),
+        seed=raw["effective_seed"],
+        timezone=raw["timezone"],
+        validation_mode=raw["validation_mode"],
+    )
+    return context
 
 
 def _load_configurations(config_root):
@@ -81,6 +127,7 @@ def run_worker(
         "probe_attestation": None,
         "path_validation": {"passed": False, "mapping_count": 0, "mappings": []},
         "b2_preparation": None,
+        "validation_context": request["validation_context"],
     }
     try:
         probes = probe_builder(run_id, stage_root=stage_root)
@@ -88,6 +135,17 @@ def run_worker(
         if not probes.get("overall_pass"):
             payload["failure"] = "Isolation probe attestation failed; " + DISABLED_MESSAGE
             return payload
+
+        verify_validation_context(
+            proposal,
+            request["policy"],
+            request["seed_inputs"],
+            request["validation_context"],
+        )
+
+        # This is intentionally the first native FieldStation42 import. The
+        # context remains unused while the Phase 3 scheduler gate is active.
+        _load_native_validation_context(request["validation_context"])
 
         configs, filenames = _load_configurations(Path(project_root) / "confs")
         projected, affected, unused_sources = project_configuration(

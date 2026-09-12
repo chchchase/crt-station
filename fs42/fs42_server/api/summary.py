@@ -25,8 +25,8 @@ async def get_summary():
         summaries.append(summary)
     return {"summary_data": summaries}
 
-@router.get("/channels")
-def get_channels():
+def build_channels_payload(stations):
+    """Transform already-loaded station data into the guide channel payload."""
     # Minimal station listing for the guide
     channels = [
         {
@@ -36,9 +36,14 @@ def get_channels():
             "hidden": station.get("hidden", False),
             "has_schedule": station.get("_has_schedule", False),
         }
-        for station in StationManager().stations
+        for station in stations
     ]
     return {"channels": channels}
+
+
+@router.get("/channels")
+def get_channels():
+    return build_channels_payload(StationManager().stations)
 
 @router.get("/stations")
 async def get_stations():

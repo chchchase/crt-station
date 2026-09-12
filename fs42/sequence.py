@@ -1,6 +1,7 @@
 import math
-import random
 import logging
+
+from fs42.scheduling_context import scheduling_random
 
 class SequenceEntry:
     def __init__(self, fpath):
@@ -54,7 +55,7 @@ class NamedSequence:
         if self.start_perc < 0 and not self.initialized:
             self.start_index = 0
             try:
-                self.current_index = random.randrange(self.start_index,self.end_index)
+                self.current_index = scheduling_random().randrange(self.start_index,self.end_index)
             except Exception as e:
                 self._l.error("Error populating sequence - please check that you have the correct configuration")
                 self._l.error("Current configuration for this sequence below:")

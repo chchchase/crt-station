@@ -262,6 +262,8 @@ def build_bwrap_command(project_root, staging_path, sandbox_argv):
             "--setenv", "TMPDIR", "/tmp",
             "--setenv", "LANG", "C.UTF-8",
             "--setenv", "LC_ALL", "C.UTF-8",
+            "--setenv", "TZ", "America/Los_Angeles",
+            "--setenv", "PYTHONHASHSEED", "0",
             "--setenv", "PYTHONDONTWRITEBYTECODE", "1",
             "--setenv", "PYTHONPATH", "/project",
             "--",

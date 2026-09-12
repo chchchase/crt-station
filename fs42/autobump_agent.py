@@ -1,10 +1,10 @@
-import random
 import sys
 import os
 import subprocess
 
 sys.path.append(os.getcwd())
 from fs42.catalog_entry import CatalogEntry
+from fs42.scheduling_context import scheduling_random
 import urllib.parse
 
 
@@ -19,7 +19,7 @@ class AutoBumpAgent:
             return False
         if "fill_break" not in station_config["autobump"]:
             return False
-        if random.random() < station_config["autobump"]["fill_break"]:
+        if scheduling_random().random() < station_config["autobump"]["fill_break"]:
             return True
         return False
 

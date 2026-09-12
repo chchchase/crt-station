@@ -17,6 +17,8 @@ EXPECTED_ENVIRONMENT = {
     "TMPDIR": "/tmp",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
+    "TZ": "America/Los_Angeles",
+    "PYTHONHASHSEED": "0",
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONPATH": "/project",
 }

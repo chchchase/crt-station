@@ -19,6 +19,12 @@ from fs42.path_query import PathQuery
 from fs42.station_manager import StationManager
 from fs42.liquid_io import LiquidIO
 from fs42.autobump_agent import AutoBumpAgent
+from fs42.scheduling_context import (
+    ValidationSchedulingContext,
+    activate_validation_context,
+    in_validation_mode,
+    scheduling_now,
+)
 
 # logging.basicConfig(format="%(asctime)s %(levelname)s:%(name)s:%(message)s", level=logging.INFO)
 
@@ -110,6 +116,8 @@ class LiquidSchedule:
                 )
             except MatchingContentNotFound:
                 if exclusion_index:
+                    if in_validation_mode():
+                        raise
                     # Exclusion may have blocked everything - retry without it.
                     # If this also fails it is a genuine content shortage.
                     try:
@@ -336,6 +344,8 @@ class LiquidSchedule:
                 f"{len(exclusion_index)} unique title(s)"
             )
         except (sqlite3.Error, OSError) as e:
+            if in_validation_mode():
+                raise
             self._l.warning(
                 f"Could not build exclusion index - sibling overlap protection disabled: {e}",
                 exc_info=True,
@@ -364,6 +374,8 @@ class LiquidSchedule:
         current_mark = start_time
 
         if current_mark is None:
+            if in_validation_mode():
+                raise ValueError("validation scheduling requires an explicit start time")
             current_mark = datetime.datetime.now()
 
         forward_buffer = []
@@ -492,7 +504,7 @@ class LiquidSchedule:
             start_building = current_end
         else:
             # then there is no schedule, so start with today (but at midnight)
-            now = datetime.datetime.now()
+            now = scheduling_now()
             start_building = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
         if "schedule_offset" in self.conf:
@@ -529,6 +541,36 @@ class LiquidSchedule:
 
     def add_amount(self, amount):
         self._increment(amount)
+
+    def generate_validation_range(self, start_time, end_time, context):
+        """Generate an explicit range under an opt-in validation context.
+
+        This entry point deliberately bypasses _increment so an empty schedule
+        can never select datetime.now(). Normal scheduling callers continue to
+        use the existing add_* methods unchanged.
+        """
+        if start_time is None or end_time is None or context is None:
+            raise ValueError("validation scheduling requires start, end, and context")
+        if not isinstance(context, ValidationSchedulingContext):
+            raise TypeError("validation scheduling requires ValidationSchedulingContext")
+        if start_time != context.start_time or end_time != context.end_time:
+            raise ValueError("validation range must exactly match its context")
+        with activate_validation_context(context):
+            match self.conf["network_type"]:
+                case "standard":
+                    return self._fluid(start_time, end_time)
+                case "loop":
+                    return self._flood(start_time, end_time)
+                case "guide":
+                    raise NotImplementedError(
+                        "Guide channels are not supported for schedule generation"
+                    )
+                case "streaming":
+                    return None
+                case _:
+                    raise ValueError(
+                        f"Unsupported network type: {self.conf['network_type']}"
+                    )
 
     def print_schedule(self):
         for block in self._blocks:

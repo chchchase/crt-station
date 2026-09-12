@@ -3,6 +3,7 @@ from contextlib import contextmanager
 
 from fs42.station_manager import StationManager
 from fs42.sequence import NamedSequence
+from fs42.scheduling_context import in_validation_mode
 
 
 class SequenceIO:
@@ -189,10 +190,11 @@ class SequenceIO:
     def get_all_sequences_for_station(self, station_name: str) -> list[NamedSequence]:
         with self._get_connection() as connection:
             cursor = connection.cursor()
+            order = " ORDER BY sequence_name, tag_path, id" if in_validation_mode() else ""
             cursor.execute(
-                """SELECT id, sequence_name, tag_path, start_perc, end_perc, current_index, initialized
+                f"""SELECT id, sequence_name, tag_path, start_perc, end_perc, current_index, initialized
                               FROM named_sequence
-                              WHERE station = ?""",
+                              WHERE station = ?{order}""",
                 (station_name,),
             )
             rows = cursor.fetchall()
@@ -445,10 +447,12 @@ class SequenceIO:
         with self._get_connection() as connection:
             cursor = connection.cursor()
 
-            cursor.execute("""
+            order = " ORDER BY active_tag_path" if in_validation_mode() else ""
+            cursor.execute(f"""
                 SELECT active_tag_path
                 FROM sequence_group_state
                 WHERE station = ?
+                {order}
             """, (
                 station_name,
             ))
@@ -467,12 +471,14 @@ class SequenceIO:
         with self._get_connection() as connection:
             cursor = connection.cursor()
 
-            cursor.execute("""
+            order = " ORDER BY tag_path, id" if in_validation_mode() else ""
+            cursor.execute(f"""
                 SELECT tag_path
                 FROM named_sequence
                 WHERE station = ?
                   AND sequence_name = ?
                   AND tag_path LIKE ?
+                  {order}
             """, (
                 station_name,
                 sequence_name,

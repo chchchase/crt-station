@@ -1,12 +1,12 @@
 import hashlib
 import logging
 import os
-import random
 import re
 from fs42.timings import DAYS
 from fs42.sequence_io import SequenceIO
 from fs42.media_processor import MediaProcessor
 from fs42.sequence import NamedSequence, SequenceEntry
+from fs42.scheduling_context import scheduling_random, validation_order
 
 SEASON_RE = re.compile(
     r"^(season\s*\d+|s\d+)$",
@@ -354,7 +354,7 @@ class SequenceAPI:
                             station_config["network_name"],
                             seq_name,
                             child_tag,
-                            list(disk_files),
+                            list(validation_order(disk_files)),
                             current_file,
                             existing_child.current_index
                         )
@@ -373,7 +373,7 @@ class SequenceAPI:
                 - seen_child_tags
             )
 
-            for child_tag in deleted_children:
+            for child_tag in validation_order(deleted_children):
 
                 _l.info(
                     f"Removing stale child sequence "
@@ -415,7 +415,7 @@ class SequenceAPI:
                     _l.debug(f"Sequence {seq_name}: current_index={existing.current_index} is out of bounds for {len(existing.episodes)} stored episodes")
                 sio.update_sequence_entries(
                     station_config["network_name"], seq_name, seq_tag,
-                    list(disk_files), current_file, existing.current_index
+                    list(validation_order(disk_files)), current_file, existing.current_index
                 )
                 
     @staticmethod
@@ -467,7 +467,7 @@ class SequenceAPI:
         if not available:
             available = children
 
-        return random.choice(available)
+        return scheduling_random().choice(available)
         
     @staticmethod
     def _get_active_child_sequence(
@@ -496,7 +496,7 @@ class SequenceAPI:
             not active_child
             or active_child not in children
         ):
-            active_child = random.choice(children)
+            active_child = scheduling_random().choice(children)
 
             sio.set_active_sequence(
                 station_config["network_name"],
@@ -528,6 +528,8 @@ class SequenceAPI:
         for root, dirs, files in os.walk(base_dir, followlinks=True):
             # follow symlinks and skip dotfiles to stay in sync with _rfind_media
             dirs[:] = [d for d in dirs if not d.startswith(".")]
+            dirs[:] = validation_order(dirs)
+            files = validation_order(files)
 
             has_media = any(
                 not f.startswith(".")

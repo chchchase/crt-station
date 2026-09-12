@@ -2,7 +2,6 @@ import datetime
 import logging
 import os.path
 import sys
-import random
 from pathlib import Path
 
 from fs42.catalog_entry import CatalogEntry, MatchingContentNotFound, NoFillerContentFound
@@ -14,6 +13,7 @@ from fs42.media_processor import MediaProcessor
 from fs42.sequence_api import SequenceAPI
 from fs42.autobump_agent import AutoBumpAgent
 from fs42.slot_reader import SlotReader
+from fs42.scheduling_context import scheduling_random, validation_order
 
 
 
@@ -296,7 +296,7 @@ class ShowCatalog:
         next_dir = f"{self.config['content_dir']}/next"
         if os.path.isdir(next_dir):
             media_filter = self.config.get("media_filter", "video")
-            for subfolder in os.listdir(next_dir):
+            for subfolder in validation_order(os.listdir(next_dir)):
                 subfolder_path = f"{next_dir}/{subfolder}"
                 if os.path.isdir(subfolder_path):
                     tag_key = f"next/{subfolder}"
@@ -479,7 +479,7 @@ class ShowCatalog:
                     candidates.append(bump)
 
         if len(candidates):
-            winner = random.choice(candidates)
+            winner = scheduling_random().choice(candidates)
             return {"path": winner.path, "duration": winner.duration}
         else:
             return None
@@ -498,7 +498,7 @@ class ShowCatalog:
             elif candidate.count == min_count:
                 lowest_matches.append(candidate)
 
-        return random.choice(lowest_matches)
+        return scheduling_random().choice(lowest_matches)
 
     def get_all_by_tag(self, tag):
         if tag in self.clip_index and len(self.clip_index[tag]):

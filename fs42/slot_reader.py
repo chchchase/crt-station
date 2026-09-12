@@ -1,9 +1,9 @@
 from datetime import datetime
 import copy
-import random
 import math
 
 from fs42 import timings
+from fs42.scheduling_context import scheduling_random
 
 
 class SlotReader:
@@ -22,7 +22,7 @@ class SlotReader:
 
             if type(tags) is list:
                 if is_random:
-                    tag_index = random.randrange(len(tags))
+                    tag_index = scheduling_random().randrange(len(tags))
                     response = tags[tag_index]
                 else:
                     # first, figure out what our segments are

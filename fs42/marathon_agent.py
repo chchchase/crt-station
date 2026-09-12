@@ -1,6 +1,6 @@
 import logging
-import random
 from fs42.schedule_hint import hint_klass_matcher
+from fs42.scheduling_context import scheduling_random
 
 class MarathonAgent:
     _l = logging.getLogger("MARATHONAGENT")
@@ -28,7 +28,7 @@ class MarathonAgent:
                         "and will be ignored - this marathon is unrestricted"
                     )
 
-            if random.random() < marathon["chance"]:
+            if scheduling_random().random() < marathon["chance"]:
                 return True
 
 
