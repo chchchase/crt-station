@@ -1,0 +1,1349 @@
+import json
+import math
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+from pathlib import PurePosixPath
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from station_director.dual_run import (
+    DualRunError,
+    _assert_inputs_stable,
+    _capture_shared_inputs,
+    _space_requirement,
+    _validate_result_semantics,
+    run_dual_comparison,
+)
+from station_director.isolation import LaunchResult
+from station_director.isolation_probe import PROBE_RESULTS
+from station_director.isolation_probe import PROBE_RESULTS
+from station_director.policy import load_policy
+from station_director.preservation import (
+    MAX_FOREIGN_KEY_FINDINGS,
+    MAX_PROTECTED_JSON_FILE_BYTES,
+    fingerprint_and_clone_database_targets,
+    fingerprint_database,
+    fingerprint_json_files,
+    logical_database_fingerprint,
+)
+from station_director.schedule_normalization import (
+    MAX_DIFFERENCES,
+    NormalizationError,
+    _create_artifacts,
+    _canonical,
+    compare_normalized_runs,
+    normalize_completed_run,
+)
+from test.test_station_director_schedule import base_proposal
+from test.test_station_director_milestone_b2 import (
+    catalog_row,
+    create_database,
+    insert_block,
+)
+
+
+def insert_catalog(connection, catalog_id, path, **changes):
+    row = catalog_row("Action", path, "Show", "show")
+    row.update(changes)
+    columns = ["id", *row]
+    connection.execute(
+        f"INSERT INTO catalog_entries ({','.join(columns)}) VALUES ({','.join('?' for unused in columns)})",
+        [catalog_id, *row.values()],
+    )
+
+
+ROOT = Path(__file__).parents[1]
+
+
+def response(run_id, *, warning=None, timing=1, name="Action"):
+    warnings = [] if warning is None else [{
+        "phase": "native", "channel": None, "code": "native_warning",
+        "type": "WARNING", "message": warning,
+    }]
+    return {
+        "schema_version": 1,
+        "operation": "native_single_run",
+        "run_id": run_id,
+        "proposal_id": "proposal",
+        "status": "success",
+        "phase_reached": "complete",
+        "scheduler_invoked": True,
+        "validation_context": {
+            "input_fingerprint": "1" * 64,
+            "requested_seed": 42,
+            "effective_seed": 7,
+        },
+        "affected_channels": [{"number": 2, "name": name}],
+        "channels": [{
+            "name": name, "number": 2, "channel_seed": 9,
+            "regeneration_start": "2026-09-14 00:00:00",
+            "effective_horizon": "2026-09-21 00:00:00",
+            "retained_blocks": 0, "generated_blocks": 1, "final_blocks": 1,
+            "catalog_reused": 0, "catalog_new": 1, "catalog_protected": 0,
+            "new_catalog_ids": "provisional",
+            "coverage": {
+                "channel": name, "proposal_boundary_crossing_ids": [],
+                "proposal_end_crossing_ids": [], "effective_horizon_crossing_ids": [1],
+                "gaps": [], "overlaps": [], "final_end": "2026-09-21 00:00:00",
+            },
+        }],
+        "verification": {
+            "original_snapshot": "pass", "deterministic_projection": "pass",
+            "projected_configuration": "pass", "working_database": "pass",
+            "logical_media": "pass", "physical_transition": "pass",
+            "fingerprints": {
+                "original_logical_configuration_fingerprint": "2" * 64,
+                "original_logical_database_fingerprint": "3" * 64,
+                "logical_media_manifest_fingerprint": "4" * 64,
+                "live_physical_configuration_fingerprint": "5" * 64,
+                "staged_source_physical_configuration_fingerprint": run_id[0] * 64,
+                "projected_configuration_fingerprint": "6" * 64,
+                "working_database_fingerprint": "7" * 64,
+            },
+        },
+        "preservation": {
+            "retained_history": "pass", "protected_channels": "pass",
+            "sequence_tables_restored": "pass", "foreign_key_baseline": "pass",
+        },
+        "path_validation": {
+            "passed": True, "mapping_count": 1, "scheduled_path_checks": 1,
+        },
+        "warnings": warnings,
+        "failure": None,
+        "timings_ms": {
+            "prepare": timing, "catalog": timing, "scheduler": timing,
+            "preservation": timing, "total": timing,
+        },
+        "diagnostics": {"messages": [], "truncated": False},
+    }
+
+
+def complete_worker_child_main(stage_text, media_text, project_text):
+    """Test-only transport endpoint around the genuine C1 worker lifecycle."""
+    import station_director.path_safety as path_safety
+    import station_director.single_run_worker as worker
+    import station_director.worker_bootstrap as bootstrap
+
+    stage = Path(stage_text)
+    media = Path(media_text)
+    project = Path(project_text)
+    request_path = stage / "native-single-run.request.json"
+    response_path = stage / "native-single-run.response.json"
+    request_value = json.loads(request_path.read_text(encoding="utf-8"))
+    normalized_probes = {
+        name: {"passed": True, "detail": "synthetic isolated transport"}
+        for name in PROBE_RESULTS
+    }
+    # Only the unavailable external isolation transport/probe result is
+    # replaced. Bootstrap, native imports, scheduler/catalog, and writes remain real.
+    worker.STAGE_ROOT = stage
+    worker.MEDIA_ROOT = media
+    worker.PROJECT_ROOT = project
+    canonical_media_mapping = path_safety.canonical_media_mapping
+
+    def mounted_media_mapping(value, *args, **kwargs):
+        text = str(value)
+        try:
+            relative = Path(text).relative_to(media)
+        except ValueError:
+            pass
+        else:
+            value = str(Path("/media") / relative)
+        return canonical_media_mapping(value, *args, **kwargs)
+
+    path_safety.canonical_media_mapping = mounted_media_mapping
+    import station_director.staged_schedule as staged_schedule
+    staged_schedule.canonical_media_mapping = mounted_media_mapping
+    native_import = worker.importlib.import_module
+
+    def mapped_import(name):
+        module = native_import(name)
+        if name == "station_director.native_single_run":
+            module.STAGE_ROOT = stage
+            module.MEDIA_ROOT = media
+            module.PROJECT_ROOT = project
+        return module
+
+    with patch.object(bootstrap, "build_probe_payload", return_value={}), patch.object(
+        bootstrap, "validate_probe_payload", return_value=(normalized_probes, None)
+    ), patch.object(
+        worker.importlib, "import_module", side_effect=mapped_import
+    ):
+        result = worker.run_worker(request_path, response_path)
+    from fs42.catalog import ShowCatalog
+    database_path = stage / "work/runtime/fs42_fluid.db"
+    catalog_paths = []
+    if database_path.exists():
+        connection = sqlite3.connect(database_path)
+        try:
+            catalog_paths = connection.execute(
+                "SELECT path,realpath FROM catalog_entries LIMIT 4"
+            ).fetchall()
+        finally:
+            connection.close()
+    info = {
+        "pid": os.getpid(), "stage": str(stage),
+        "database": str(stage / "work/runtime/fs42_fluid.db"),
+        "request": str(request_path), "response": str(response_path),
+        "fs42_loaded": any(name == "fs42" or name.startswith("fs42.") for name in sys.modules),
+        "cache_size": len(ShowCatalog._fluid_cache_scanned),
+        "status": result["status"], "failure": result["failure"],
+        "catalog_paths": catalog_paths,
+    }
+    info_path = stage / "native-info.json"
+    info_path.write_text(json.dumps(info), encoding="utf-8")
+    os.chmod(info_path, 0o600)
+
+
+def synthetic_project(root, media):
+    project = root / "project"
+    (project / "confs").mkdir(parents=True)
+    (project / "runtime").mkdir()
+    (project / "confs/main_config.json").write_text("{}\n", encoding="utf-8")
+    station_conf = {
+        "network_name": "Action", "channel_number": 2,
+        "network_type": "standard", "schedule_increment": 60,
+        "break_strategy": "end", "clip_shows": [],
+        "content_dir": "/mnt/t7/CRT-Media/synthetic",
+        "commercial_free": True, "shuffle_loop": False,
+    }
+    slots = {str(hour): {"tags": "Synthetic"} for hour in range(24)}
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"):
+        station_conf[day] = slots
+    (project / "confs/action.json").write_text(
+        json.dumps({"station_conf": station_conf}) + "\n", encoding="utf-8"
+    )
+    (project / "runtime/watch_in_order_state.json").write_text("{}\n", encoding="utf-8")
+    create_database(project / "runtime/fs42_fluid.db").close()
+    (project / "fs42").mkdir()
+    shutil.copy(
+        ROOT / "fs42/station_config_schema.json",
+        project / "fs42/station_config_schema.json",
+    )
+    return project
+
+
+def make_run(root, name, catalog_id, media="a.mp4", **catalog_changes):
+    stage = root / name
+    (stage / "work/runtime").mkdir(parents=True)
+    database = stage / "work/runtime/fs42_fluid.db"
+    connection = create_database(database)
+    insert_catalog(connection, catalog_id, f"/media/{media}", **catalog_changes)
+    insert_block(
+        connection, "Action", "2026-09-14 00:00:00",
+        "2026-09-14 01:00:00", catalog_id, f"/media/{media}",
+    )
+    # Tests that isolate provisional-ID normalization hold allocation history
+    # constant. Dedicated sqlite_sequence tests below vary it explicitly.
+    connection.execute(
+        "UPDATE sqlite_sequence SET seq=100 WHERE name IN ('catalog_entries','liquid_blocks')"
+    )
+    connection.commit()
+    connection.close()
+    return stage, database
+
+
+def make_capture_fixture(root):
+    source = root / "source"
+    (source / "confs").mkdir(parents=True)
+    (source / "runtime").mkdir()
+    (source / "confs/main_config.json").write_text("{}\n", encoding="utf-8")
+    (source / "confs/action.json").write_text(
+        json.dumps({"station_conf": {"network_name": "Action"}}) + "\n",
+        encoding="utf-8",
+    )
+    (source / "runtime/watch_in_order_state.json").write_text("{}\n", encoding="utf-8")
+    create_database(source / "runtime/fs42_fluid.db").close()
+    media = root / "media"
+    media.mkdir()
+    (media / "clip.mp4").write_bytes(b"synthetic")
+    stages = [root / "stage-one", root / "stage-two"]
+    for stage in stages:
+        stage.mkdir(mode=0o700)
+    with patch("station_director.dual_run._require_space"):
+        capture = _capture_shared_inputs(source, media, stages)
+    return source, media, capture
+
+
+class CanonicalEncodingTests(unittest.TestCase):
+    def test_real_encoding_is_ieee_and_preserves_negative_zero(self):
+        self.assertNotEqual(_canonical(0.0), _canonical(-0.0))
+        self.assertEqual(_canonical(1.5), _canonical(1.5))
+
+    def test_nonfinite_values_are_rejected(self):
+        for value in (math.inf, -math.inf, math.nan):
+            with self.subTest(value=value), self.assertRaises(NormalizationError):
+                _canonical(value)
+
+    def test_text_and_blob_are_distinct_and_text_is_not_normalized(self):
+        self.assertNotEqual(_canonical("é"), _canonical("e\u0301"))
+        self.assertNotEqual(_canonical("abc"), _canonical(b"abc"))
+
+
+class SharedSnapshotTests(unittest.TestCase):
+    def test_two_backups_are_verified_from_one_pinned_view(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.db"
+            connection = create_database(source)
+            connection.execute(
+                "INSERT INTO sequence_group_state VALUES ('Action','s','p','a')"
+            )
+            connection.commit()
+            connection.close()
+            result = fingerprint_and_clone_database_targets(
+                source, [root / "one.db", root / "two.db"]
+            )
+            connection = sqlite3.connect(source)
+            connection.execute(
+                "UPDATE sequence_group_state SET active_tag_path='changed'"
+            )
+            connection.commit()
+            connection.close()
+            self.assertEqual(len(result["backups"]), 2)
+            self.assertEqual(
+                result["backups"][0]["logical"]["digest"],
+                result["backups"][1]["logical"]["digest"],
+            )
+            self.assertNotEqual(
+                (root / "one.db").stat().st_ino,
+                (root / "two.db").stat().st_ino,
+            )
+            self.assertNotEqual(
+                fingerprint_database(source)["logical"]["digest"],
+                result["logical"]["digest"],
+            )
+
+    def test_space_requirement_has_quarantine_margin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "db"
+            database.write_bytes(b"x" * 4096)
+            self.assertGreaterEqual(_space_requirement(database, 100, 100), 512 * 1024 * 1024)
+
+    def test_stability_check_classifies_source_categories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            (source / "confs").mkdir(parents=True)
+            (source / "runtime").mkdir()
+            (source / "confs/main_config.json").write_text("{}\n")
+            (source / "confs/action.json").write_text(
+                json.dumps({"station_conf": {"network_name": "Action"}}) + "\n"
+            )
+            (source / "runtime/watch_in_order_state.json").write_text("{}\n")
+            connection = create_database(source / "runtime/fs42_fluid.db")
+            connection.commit()
+            connection.close()
+            media = root / "media"
+            media.mkdir()
+            (media / "clip.mp4").write_bytes(b"one")
+            stages = [root / "stage-one", root / "stage-two"]
+            for stage in stages:
+                stage.mkdir(mode=0o700)
+            with patch("station_director.dual_run._require_space"):
+                capture = _capture_shared_inputs(source, media, stages)
+            try:
+                (source / "confs/action.json").write_text(
+                    json.dumps({"station_conf": {"network_name": "Changed"}}) + "\n"
+                )
+                connection = sqlite3.connect(source / "runtime/fs42_fluid.db")
+                connection.execute(
+                    "INSERT INTO sequence_group_state VALUES ('Action','s','p','a')"
+                )
+                connection.commit()
+                connection.close()
+                (media / "clip.mp4").write_bytes(b"different-size")
+                with self.assertRaises(DualRunError) as raised:
+                    _assert_inputs_stable(source, media, capture, "between_runs")
+                self.assertEqual(raised.exception.code, "input_changed")
+                self.assertEqual(set(raised.exception.category), {
+                    "physical_configuration", "logical_configuration",
+                    "logical_database", "physical_media_metadata", "logical_media",
+                })
+            finally:
+                capture.close()
+
+    def test_each_recheck_fingerprint_exception_is_input_changed(self):
+        capture = SimpleNamespace(
+            configuration_physical={"digest": "p"}, configuration_digest="c",
+            database_digest="d", media_manifest=object(), media_logical_digest="m",
+            spool_directory=Path("/tmp"),
+        )
+        cases = (
+            ("fingerprint_json_files", "physical_configuration"),
+            ("logical_protected_configuration_fingerprint", "logical_configuration"),
+            ("fingerprint_database", "logical_database"),
+            ("capture_media_manifest", "physical_media_metadata"),
+            ("logical_media_manifest_fingerprint", "logical_media"),
+        )
+        physical = {"digest": "p"}
+        logical = {"digest": "c"}
+        database = {"logical": {"digest": "d"}}
+        manifest = SimpleNamespace(close=lambda: None)
+        comparison = {"preserved": True}
+        for target, category in cases:
+            mocks = {
+                "fingerprint_json_files": Mock(return_value=physical),
+                "logical_protected_configuration_fingerprint": Mock(return_value=logical),
+                "fingerprint_database": Mock(return_value=database),
+                "capture_media_manifest": Mock(return_value=manifest),
+                "compare_media_manifests": Mock(return_value=comparison),
+                "logical_media_manifest_fingerprint": Mock(return_value={"digest": "m"}),
+            }
+            mocks[target].side_effect = OSError("synthetic fingerprint failure")
+            with self.subTest(category=category), patch.multiple(
+                "station_director.dual_run", **mocks
+            ):
+                with self.assertRaises(DualRunError) as raised:
+                    _assert_inputs_stable(Path("/source"), Path("/media"), capture, "between_runs")
+                self.assertEqual(raised.exception.code, "input_changed")
+                self.assertEqual(raised.exception.category, [category])
+
+    def test_deleted_unreadable_malformed_and_symlinked_inputs_are_input_changed(self):
+        mutations = ("deleted", "unreadable", "malformed_json", "symlink", "malformed_database")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, media, capture = make_capture_fixture(root)
+                target = source / "confs/action.json"
+                try:
+                    if mutation == "deleted":
+                        target.unlink()
+                    elif mutation == "unreadable":
+                        target.chmod(0)
+                    elif mutation == "malformed_json":
+                        target.write_text("{", encoding="utf-8")
+                    elif mutation == "symlink":
+                        target.unlink()
+                        target.symlink_to(source / "confs/main_config.json")
+                    else:
+                        (source / "runtime/fs42_fluid.db").write_bytes(b"not sqlite")
+                    with self.assertRaises(DualRunError) as raised:
+                        _assert_inputs_stable(source, media, capture, "between_runs")
+                    self.assertEqual(raised.exception.code, "input_changed")
+                    if mutation == "deleted":
+                        self.assertEqual(
+                            raised.exception.category,
+                            ["physical_configuration", "logical_configuration"],
+                        )
+                    else:
+                        expected = (
+                            "logical_database" if mutation == "malformed_database"
+                            else "logical_configuration" if mutation == "malformed_json"
+                            else "physical_configuration"
+                        )
+                        self.assertEqual(raised.exception.category, [expected])
+                finally:
+                    capture.close()
+
+    def test_protected_configuration_and_schema_limits_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            oversized = root / "oversized.json"
+            oversized.write_bytes(b" " * (MAX_PROTECTED_JSON_FILE_BYTES + 1))
+            with self.assertRaisesRegex(Exception, "size limit"):
+                fingerprint_json_files({"confs/oversized.json": oversized})
+
+            database = root / "bounded.db"
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE one(value)")
+            connection.execute("CREATE TABLE two(value)")
+            connection.commit()
+            try:
+                with patch("station_director.preservation.MAX_DATABASE_TABLES", 1), \
+                        self.assertRaisesRegex(Exception, "table limit"):
+                    logical_database_fingerprint(connection)
+            finally:
+                connection.close()
+
+    def test_foreign_key_findings_are_iterated_and_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = sqlite3.connect(Path(directory) / "foreign.db")
+            connection.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+            connection.execute("CREATE TABLE child(parent_id INTEGER REFERENCES parent(id))")
+            connection.executemany("INSERT INTO child VALUES (?)", [(1,), (2,)])
+            connection.commit()
+            try:
+                with patch("station_director.preservation.MAX_FOREIGN_KEY_FINDINGS", 1), \
+                        self.assertRaisesRegex(Exception, "foreign-key finding limit"):
+                    logical_database_fingerprint(connection)
+            finally:
+                connection.close()
+
+
+class NormalizationTests(unittest.TestCase):
+    def test_sqlite_sequence_is_exact_and_exposes_allocation_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            left_stage, left_db = make_run(root, "left", 10)
+            right_stage, right_db = make_run(root, "right", 20)
+
+            identical_left = normalize_completed_run(
+                left_stage, baseline, response("left"), "2026-09-14 00:00:00"
+            )
+            identical_right = normalize_completed_run(
+                right_stage, baseline, response("right"), "2026-09-14 00:00:00"
+            )
+            self.assertTrue(compare_normalized_runs(identical_left, identical_right)["passed"])
+
+            advanced_stage, advanced_db = make_run(root, "right-advanced", 10)
+            connection = sqlite3.connect(advanced_db)
+            connection.execute(
+                "UPDATE sqlite_sequence SET seq=101 WHERE name='catalog_entries'"
+            )
+            connection.commit()
+            connection.close()
+            advanced = normalize_completed_run(
+                advanced_stage,
+                baseline, response("right"), "2026-09-14 00:00:00"
+            )
+            self.assertFalse(compare_normalized_runs(identical_left, advanced)["passed"])
+
+    def test_allocated_then_deleted_catalog_id_is_not_normalized_away(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            left_stage, unused = make_run(root, "left", 10)
+            right_stage, right_db = make_run(root, "right", 20)
+            connection = sqlite3.connect(right_db)
+            insert_catalog(connection, 101, "/media/deleted.mp4")
+            connection.execute("DELETE FROM catalog_entries WHERE id=101")
+            connection.commit()
+            connection.close()
+            left = normalize_completed_run(left_stage, baseline, response("left"), "2026-09-14 00:00:00")
+            right = normalize_completed_run(right_stage, baseline, response("right"), "2026-09-14 00:00:00")
+            self.assertFalse(compare_normalized_runs(left, right)["passed"])
+
+    def test_sqlite_sequence_regression_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            stage, database = make_run(root, "stage", 10)
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE sqlite_sequence SET seq=9 WHERE name='catalog_entries'"
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(NormalizationError, "regressed"):
+                normalize_completed_run(stage, baseline, response("run"), "2026-09-14 00:00:00")
+
+    def test_reference_ledger_detects_a_second_pass_omission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            stage, unused = make_run(root, "stage", 10)
+            calls = iter(((10,), ()))
+            with patch(
+                "station_director.schedule_normalization.parse_catalog_references",
+                side_effect=lambda unused: next(calls),
+            ), self.assertRaisesRegex(NormalizationError, "reference integrity"):
+                normalize_completed_run(stage, baseline, response("run"), "2026-09-14 00:00:00")
+
+    def test_partial_artifacts_are_removed_when_lookup_creation_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "stage"
+            stage.mkdir()
+            before_fds = len(tuple(Path("/proc/self/fd").iterdir()))
+            with patch(
+                "station_director.schedule_normalization.sqlite3.connect",
+                side_effect=sqlite3.OperationalError("synthetic"),
+            ), self.assertRaises(sqlite3.OperationalError):
+                from station_director.schedule_normalization import _create_artifacts
+                _create_artifacts(stage)
+            self.assertFalse((stage / "normalization").exists())
+            self.assertEqual(len(tuple(Path("/proc/self/fd").iterdir())), before_fds)
+
+    def test_partial_artifacts_close_after_each_acquisition_failure(self):
+        real_open = os.open
+        for failed_open in (1, 2):
+            with self.subTest(failed_open=failed_open), tempfile.TemporaryDirectory() as directory:
+                stage = Path(directory) / "stage"
+                stage.mkdir()
+                calls = 0
+
+                def controlled_open(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == failed_open:
+                        raise OSError("synthetic open failure")
+                    return real_open(*args, **kwargs)
+
+                before = len(tuple(Path("/proc/self/fd").iterdir()))
+                with patch("station_director.schedule_normalization.os.open", side_effect=controlled_open), \
+                        self.assertRaises(OSError):
+                    _create_artifacts(stage)
+            self.assertFalse((stage / "normalization").exists())
+            self.assertEqual(len(tuple(Path("/proc/self/fd").iterdir())), before)
+
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            existing = stage / "normalization"
+            existing.mkdir(parents=True)
+            sentinel = existing / "canonical.records"
+            sentinel.write_text("preexisting", encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                _create_artifacts(stage)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preexisting")
+
+        class SchemaFailureProxy:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, *args, **kwargs):
+                return self.connection.execute(*args, **kwargs)
+
+            def executescript(self, unused):
+                raise sqlite3.OperationalError("synthetic schema failure")
+
+            def close(self):
+                self.connection.close()
+
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            stage.mkdir()
+            real_connect = sqlite3.connect
+            before = len(tuple(Path("/proc/self/fd").iterdir()))
+            with patch(
+                "station_director.schedule_normalization.sqlite3.connect",
+                side_effect=lambda path: SchemaFailureProxy(real_connect(path)),
+            ), self.assertRaises(sqlite3.OperationalError):
+                _create_artifacts(stage)
+            self.assertFalse((stage / "normalization").exists())
+            self.assertEqual(len(tuple(Path("/proc/self/fd").iterdir())), before)
+
+    def test_preexisting_normalization_directory_is_not_modified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            existing = stage / "normalization"
+            existing.mkdir(parents=True)
+            marker = existing / "canonical.records"
+            marker.write_text("belongs to another operation", encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                _create_artifacts(stage)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "belongs to another operation")
+    def test_equivalent_provisional_ids_compare_equal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            left_stage, unused = make_run(root, "left", 10)
+            right_stage, unused = make_run(root, "right", 20)
+            left = normalize_completed_run(
+                left_stage, baseline, response("a-run", timing=1), "2026-09-14 00:00:00"
+            )
+            right = normalize_completed_run(
+                right_stage, baseline, response("b-run", timing=999), "2026-09-14 00:00:00"
+            )
+            comparison = compare_normalized_runs(left, right)
+            self.assertTrue(comparison["passed"], comparison["differences"][:2])
+            self.assertEqual(left.provisional_count, 1)
+
+    def test_selected_media_and_playback_plan_difference_is_detected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            left_stage, unused = make_run(root, "left", 10, "a.mp4")
+            right_stage, unused = make_run(root, "right", 20, "b.mp4")
+            left = normalize_completed_run(left_stage, baseline, response("a"), "2026-09-14 00:00:00")
+            right = normalize_completed_run(right_stage, baseline, response("b"), "2026-09-14 00:00:00")
+            comparison = compare_normalized_runs(left, right)
+            self.assertFalse(comparison["passed"])
+            self.assertGreater(
+                comparison["changed_records"] + comparison["added_records"] + comparison["removed_records"], 0
+            )
+
+    def test_catalog_timestamp_count_and_storage_class_remain_equality_inputs(self):
+        variants = [
+            {"count": 2},
+            {"updated_at": "2026-09-02 00:00:00"},
+            {"duration": 3601.0},
+            {"count": "not-an-integer"},
+        ]
+        for changes in variants:
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                baseline = root / "baseline.db"
+                create_database(baseline).close()
+                left_stage, unused = make_run(root, "left", 10)
+                right_stage, unused = make_run(root, "right", 20, **changes)
+                left = normalize_completed_run(left_stage, baseline, response("a"), "2026-09-14 00:00:00")
+                right = normalize_completed_run(right_stage, baseline, response("b"), "2026-09-14 00:00:00")
+                self.assertFalse(compare_normalized_runs(left, right)["passed"])
+
+    def test_channel_seed_schedule_time_and_playback_fields_remain_equality_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            left_stage, unused = make_run(root, "left", 10)
+            right_stage, right_db = make_run(root, "right", 20)
+            changed_response = response("right")
+            changed_response["channels"][0]["channel_seed"] = 10
+            left = normalize_completed_run(
+                left_stage, baseline, response("left"), "2026-09-14 00:00:00"
+            )
+            right = normalize_completed_run(
+                right_stage, baseline, changed_response, "2026-09-14 00:00:00"
+            )
+            self.assertFalse(compare_normalized_runs(left, right)["passed"])
+
+            third_stage, third_db = make_run(root, "third", 30)
+            connection = sqlite3.connect(third_db)
+            plan = json.loads(connection.execute(
+                "SELECT plan_json FROM liquid_blocks LIMIT 1"
+            ).fetchone()[0])
+            plan[0]["skip"] = 1
+            connection.execute(
+                "UPDATE liquid_blocks SET start_time=?, plan_json=?",
+                ("2026-09-14 00:00:01", json.dumps(plan)),
+            )
+            connection.commit()
+            connection.close()
+            third = normalize_completed_run(
+                third_stage, baseline, response("third"), "2026-09-14 00:00:00"
+            )
+            self.assertFalse(compare_normalized_runs(left, third)["passed"])
+
+    def test_warnings_and_counters_compare_but_run_id_timing_and_stage_physical_do_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            left_stage, unused = make_run(root, "left", 10)
+            right_stage, unused = make_run(root, "right", 20)
+            left = normalize_completed_run(left_stage, baseline, response("a", timing=1), "2026-09-14 00:00:00")
+            right = normalize_completed_run(right_stage, baseline, response("b", timing=900), "2026-09-14 00:00:00")
+            self.assertTrue(compare_normalized_runs(left, right)["passed"])
+            changed_stage, unused = make_run(root, "changed", 30)
+            changed = normalize_completed_run(
+                changed_stage, baseline, response("c", warning="warning changed"),
+                "2026-09-14 00:00:00",
+            )
+            self.assertFalse(compare_normalized_runs(left, changed)["passed"])
+
+    def test_hidden_reference_fails_but_unrelated_integer_does_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            safe_stage, safe_db = make_run(root, "safe", 10)
+            connection = sqlite3.connect(safe_db)
+            connection.execute(
+                "UPDATE liquid_blocks SET break_info=?", (json.dumps({"episode_number": 10}),)
+            )
+            connection.commit()
+            connection.close()
+            normalize_completed_run(safe_stage, baseline, response("safe"), "2026-09-14 00:00:00")
+            bad_stage, bad_db = make_run(root, "bad", 20)
+            connection = sqlite3.connect(bad_db)
+            connection.execute(
+                "UPDATE liquid_blocks SET break_info=?", (json.dumps({"nested": {"catalog_id": 20}}),)
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(NormalizationError, "nested reference"):
+                normalize_completed_run(bad_stage, baseline, response("bad"), "2026-09-14 00:00:00")
+
+            camel_stage, camel_db = make_run(root, "camel", 30)
+            connection = sqlite3.connect(camel_db)
+            connection.execute(
+                "UPDATE liquid_blocks SET break_info=?",
+                (json.dumps({"hidden": {"catalogReferenceId": 30}}),),
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(NormalizationError, "nested reference"):
+                normalize_completed_run(
+                    camel_stage, baseline, response("camel"),
+                    "2026-09-14 00:00:00",
+                )
+
+    def test_unknown_table_without_primary_key_has_typed_deterministic_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            left_stage, left_db = make_run(root, "left", 10)
+            right_stage, right_db = make_run(root, "right", 20)
+            for database, values in ((left_db, [(2, "b"), (1, "a")]), (right_db, [(1, "a"), (2, "b")])):
+                connection = sqlite3.connect(database)
+                connection.execute("CREATE TABLE extra(value, label TEXT)")
+                connection.executemany("INSERT INTO extra VALUES (?,?)", values)
+                connection.commit()
+                connection.close()
+            left = normalize_completed_run(left_stage, baseline, response("a"), "2026-09-14 00:00:00")
+            right = normalize_completed_run(right_stage, baseline, response("b"), "2026-09-14 00:00:00")
+            self.assertTrue(compare_normalized_runs(left, right)["passed"])
+
+    def test_artifacts_are_private_and_working_database_is_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            stage, database = make_run(root, "stage", 10)
+            before = fingerprint_database(database)["logical"]["digest"]
+            normalized = normalize_completed_run(stage, baseline, response("a"), "2026-09-14 00:00:00")
+            after = fingerprint_database(database)["logical"]["digest"]
+            self.assertEqual(before, after)
+            for path in normalized.artifact_directory.iterdir():
+                self.assertTrue(path.is_file())
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_canonical_stream_replacement_or_modification_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            left_stage, unused = make_run(root, "left", 10)
+            right_stage, unused = make_run(root, "right", 20)
+            left = normalize_completed_run(
+                left_stage, baseline, response("left"), "2026-09-14 00:00:00"
+            )
+            right = normalize_completed_run(
+                right_stage, baseline, response("right"), "2026-09-14 00:00:00"
+            )
+            left.stream_path.write_bytes(left.stream_path.read_bytes() + b"x")
+            with self.assertRaisesRegex(NormalizationError, "identity changed"):
+                compare_normalized_runs(left, right)
+
+    def test_protected_historical_catalog_change_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            connection = create_database(baseline)
+            insert_catalog(connection, 1, "/media/a.mp4")
+            insert_block(connection, "Action", "2026-09-13 00:00:00", "2026-09-13 01:00:00", 1, "/media/a.mp4")
+            connection.commit()
+            connection.close()
+            stage = root / "stage"
+            (stage / "work/runtime").mkdir(parents=True)
+            fingerprint_and_clone_database_targets(baseline, [stage / "work/runtime/fs42_fluid.db"])
+            connection = sqlite3.connect(stage / "work/runtime/fs42_fluid.db")
+            connection.execute("UPDATE catalog_entries SET count=99 WHERE id=1")
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(NormalizationError, "protected catalog"):
+                normalize_completed_run(stage, baseline, response("a"), "2026-09-14 00:00:00")
+
+    def test_ambiguous_provisional_semantics_and_unresolved_reference_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            stage, database = make_run(root, "stage", 10)
+            connection = sqlite3.connect(database)
+            duplicate = catalog_row(
+                "Action", "/mnt/t7/CRT-Media/a.mp4", "Show", "show"
+            )
+            connection.execute(
+                "INSERT INTO catalog_entries "
+                "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (11, *[duplicate[key] for key in duplicate]),
+            )
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(NormalizationError, "ambiguous duplicate"):
+                normalize_completed_run(stage, baseline, response("a"), "2026-09-14 00:00:00")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            stage, database = make_run(root, "stage", 10)
+            connection = sqlite3.connect(database)
+            connection.execute("UPDATE liquid_blocks SET content_json='999'")
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(NormalizationError, "unresolved catalog reference"):
+                normalize_completed_run(stage, baseline, response("a"), "2026-09-14 00:00:00")
+
+    def test_unclassified_reference_column_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            stage, database = make_run(root, "stage", 10)
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE extra(label TEXT, catalog_id INTEGER)")
+            connection.execute("INSERT INTO extra VALUES ('not trusted',10)")
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(NormalizationError, "unclassified possible ID"):
+                normalize_completed_run(stage, baseline, response("a"), "2026-09-14 00:00:00")
+
+    def test_schema_index_and_trigger_definitions_are_compared(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            left_stage, left_db = make_run(root, "left", 10)
+            right_stage, right_db = make_run(root, "right", 20)
+            left = sqlite3.connect(left_db)
+            left.execute("CREATE INDEX extra_index ON liquid_blocks(title)")
+            left.commit()
+            left.close()
+            right = sqlite3.connect(right_db)
+            right.execute(
+                "CREATE TRIGGER extra_trigger AFTER INSERT ON liquid_blocks BEGIN SELECT 1; END"
+            )
+            right.commit()
+            right.close()
+            one = normalize_completed_run(left_stage, baseline, response("a"), "2026-09-14 00:00:00")
+            two = normalize_completed_run(right_stage, baseline, response("b"), "2026-09-14 00:00:00")
+            self.assertFalse(compare_normalized_runs(one, two)["passed"])
+
+    def test_comparison_diagnostics_are_bounded_but_streams_are_consumed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline = root / "baseline.db"
+            create_database(baseline).close()
+            left_stage, left_db = make_run(root, "left", 10)
+            right_stage, right_db = make_run(root, "right", 20)
+            for database, prefix in ((left_db, "left"), (right_db, "right")):
+                connection = sqlite3.connect(database)
+                connection.execute("CREATE TABLE extra(value TEXT)")
+                connection.executemany(
+                    "INSERT INTO extra VALUES (?)",
+                    [(f"{prefix}-{index}-" + "x" * 1000,) for index in range(80)],
+                )
+                connection.commit()
+                connection.close()
+            one = normalize_completed_run(left_stage, baseline, response("a"), "2026-09-14 00:00:00")
+            two = normalize_completed_run(right_stage, baseline, response("b"), "2026-09-14 00:00:00")
+            comparison = compare_normalized_runs(one, two)
+            self.assertFalse(comparison["passed"])
+            self.assertLessEqual(len(comparison["differences"]), MAX_DIFFERENCES)
+            self.assertTrue(comparison["differences_truncated"])
+            self.assertEqual(comparison["run_1_record_count"], one.record_count)
+            self.assertEqual(comparison["run_2_record_count"], two.record_count)
+
+
+class DualRunLifecycleTests(unittest.TestCase):
+    def _scope(self, root, events, *, cleanup_failure=False):
+        context = {
+            "input_fingerprint": "1" * 64,
+            "requested_seed": 42,
+            "effective_seed": 7,
+        }
+        affected = [{"number": 2, "name": "Action"}]
+        lifecycles = []
+        for index in (1, 2):
+            lifecycle = SimpleNamespace(
+                stage=root / f"stage-{index}",
+                run_id=f"comparison.run-{index}",
+                request={"validation_context": context, "affected_channels": affected},
+            )
+            lifecycle.settle_unit = lambda index=index: events.append(f"settle-{index}")
+            lifecycles.append(lifecycle)
+
+        class Scope:
+            capture = object()
+            cleanup_results = []
+
+            def cleanup_stages(self):
+                self.cleanup_results = [
+                    {"run": 2, "passed": not cleanup_failure, "detail": "run 2"},
+                    {"run": 1, "passed": True, "detail": "run 1"},
+                ]
+                events.append("cleanup")
+                if cleanup_failure:
+                    raise DualRunError("cleanup", "cleanup_failed", "cleanup failed")
+
+            def close_capture(self):
+                events.append("close-capture")
+
+        scope = Scope()
+        scope.lifecycles = lifecycles
+        return scope
+
+    def test_sequential_independent_success_and_reverse_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = []
+            scope = self._scope(root, events)
+            normalized = [
+                SimpleNamespace(digest="a" * 64, record_count=4, provisional_count=1),
+                SimpleNamespace(digest="a" * 64, record_count=4, provisional_count=1),
+            ]
+            comparison = {
+                "passed": True, "run_1_digest": "a" * 64,
+                "run_2_digest": "a" * 64, "run_1_record_count": 4,
+                "run_2_record_count": 4, "changed_records": 0,
+                "added_records": 0, "removed_records": 0,
+                "differences": [], "differences_truncated": False,
+            }
+
+            def launch(lifecycle, timeout):
+                events.append(f"launch-{lifecycle.run_id[-1]}")
+
+            def inspect(lifecycle):
+                events.append(f"inspect-{lifecycle.run_id[-1]}")
+                return response(lifecycle.run_id)
+
+            def stable(unused_source, unused_media, unused_capture, checkpoint):
+                events.append(checkpoint)
+                return {"checkpoint": checkpoint, "passed": True, "changed_categories": []}
+
+            with patch("station_director.dual_run._prepare_scope", return_value=scope), \
+                    patch("station_director.dual_run.launch_single_run", side_effect=launch), \
+                    patch("station_director.dual_run.inspect_single_run", side_effect=inspect), \
+                    patch("station_director.dual_run._assert_inputs_stable", side_effect=stable), \
+                    patch("station_director.dual_run.normalize_completed_run", side_effect=normalized), \
+                    patch("station_director.dual_run.compare_normalized_runs", return_value=comparison):
+                result = run_dual_comparison(root, root, root, {
+                    "week_start": "2026-09-14T00:00:00-07:00"
+                }, {}, "comparison")
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["scheduler_invoked"], {"run_1": True, "run_2": True})
+            self.assertLess(events.index("settle-1"), events.index("launch-2"))
+            self.assertEqual(result["cleanup"], [
+                {"run": 2, "passed": True, "detail": "run 2"},
+                {"run": 1, "passed": True, "detail": "run 1"},
+            ])
+
+    def test_input_change_between_runs_is_not_nondeterminism(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = []
+            scope = self._scope(root, events)
+            with patch("station_director.dual_run._prepare_scope", return_value=scope), \
+                    patch("station_director.dual_run.launch_single_run"), \
+                    patch("station_director.dual_run.inspect_single_run", return_value=response("comparison.run-1")), \
+                    patch("station_director.dual_run._assert_inputs_stable", side_effect=DualRunError(
+                        "between_runs", "input_changed", "logical database changed",
+                        category=["logical_database"],
+                    )), \
+                    patch("station_director.dual_run.normalize_completed_run"):
+                result = run_dual_comparison(root, root, root, {
+                    "week_start": "2026-09-14T00:00:00-07:00"
+                }, {}, "comparison")
+            self.assertEqual(result["failure"]["code"], "input_changed")
+            self.assertEqual(result["failure"]["category"], ["logical_database"])
+            self.assertFalse(result["scheduler_invoked"]["run_2"])
+            self.assertIsNone(result["reproducibility"])
+
+    def test_first_and_second_run_failures_stop_comparison_and_cleanup(self):
+        for failed_index in (1, 2):
+            with self.subTest(failed_index=failed_index), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                events = []
+                scope = self._scope(root, events)
+                outcomes = []
+                if failed_index == 2:
+                    outcomes.append(response("comparison.run-1"))
+                outcomes.append(
+                    DualRunError(f"run_{failed_index}", "worker_timeout", "timed out")
+                )
+
+                def inspect(unused_lifecycle):
+                    outcome = outcomes.pop(0)
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+
+                with patch("station_director.dual_run._prepare_scope", return_value=scope), \
+                        patch("station_director.dual_run.launch_single_run"), \
+                        patch("station_director.dual_run.inspect_single_run", side_effect=inspect), \
+                        patch("station_director.dual_run._assert_inputs_stable", return_value={
+                            "checkpoint": "between_runs", "passed": True,
+                            "changed_categories": [],
+                        }), patch("station_director.dual_run.normalize_completed_run", return_value=SimpleNamespace(
+                            digest="a" * 64, record_count=1, provisional_count=0,
+                        )), patch("station_director.dual_run.compare_normalized_runs") as comparison:
+                    result = run_dual_comparison(root, root, root, {
+                        "week_start": "2026-09-14T00:00:00-07:00"
+                    }, {}, "comparison")
+                self.assertEqual(result["failure"]["code"], "c1_run_failed")
+                self.assertEqual(result["failure"]["category"], "worker_timeout")
+                comparison.assert_not_called()
+                self.assertIn("cleanup", events)
+
+    def test_cleanup_failure_overrides_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = self._scope(root, [], cleanup_failure=True)
+            normalized = [
+                SimpleNamespace(digest="a" * 64, record_count=1, provisional_count=0),
+                SimpleNamespace(digest="a" * 64, record_count=1, provisional_count=0),
+            ]
+            comparison = {
+                "passed": True, "run_1_digest": "a" * 64,
+                "run_2_digest": "a" * 64, "run_1_record_count": 1,
+                "run_2_record_count": 1, "changed_records": 0,
+                "added_records": 0, "removed_records": 0,
+                "differences": [], "differences_truncated": False,
+            }
+            with patch("station_director.dual_run._prepare_scope", return_value=scope), \
+                    patch("station_director.dual_run.launch_single_run"), \
+                    patch("station_director.dual_run.inspect_single_run", side_effect=[
+                        response("comparison.run-1"), response("comparison.run-2")
+                    ]), patch("station_director.dual_run._assert_inputs_stable", side_effect=lambda a, b, c, name: {
+                        "checkpoint": name, "passed": True, "changed_categories": []
+                    }), patch("station_director.dual_run.normalize_completed_run", side_effect=normalized), \
+                    patch("station_director.dual_run.compare_normalized_runs", return_value=comparison):
+                result = run_dual_comparison(root, root, root, {
+                    "week_start": "2026-09-14T00:00:00-07:00"
+                }, {}, "comparison")
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure"]["code"], "cleanup_failed")
+
+    def test_input_mutation_during_cleanup_prevents_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = []
+            scope = self._scope(root, events)
+            normalized = [
+                SimpleNamespace(digest="a" * 64, record_count=1, provisional_count=0),
+                SimpleNamespace(digest="a" * 64, record_count=1, provisional_count=0),
+            ]
+            comparison = {
+                "passed": True, "run_1_digest": "a" * 64,
+                "run_2_digest": "a" * 64, "run_1_record_count": 1,
+                "run_2_record_count": 1, "changed_records": 0,
+                "added_records": 0, "removed_records": 0,
+                "differences": [], "differences_truncated": False,
+            }
+
+            def stable(unused_source, unused_media, unused_capture, checkpoint):
+                if checkpoint == "before_success":
+                    self.assertIn("cleanup", events)
+                    raise DualRunError(
+                        checkpoint, "input_changed", "media changed during cleanup",
+                        category=["logical_media"],
+                    )
+                return {"checkpoint": checkpoint, "passed": True, "changed_categories": []}
+
+            with patch("station_director.dual_run._prepare_scope", return_value=scope), \
+                    patch("station_director.dual_run.launch_single_run"), \
+                    patch("station_director.dual_run.inspect_single_run", side_effect=[
+                        response("comparison.run-1"), response("comparison.run-2")
+                    ]), patch("station_director.dual_run._assert_inputs_stable", side_effect=stable), \
+                    patch("station_director.dual_run.normalize_completed_run", side_effect=normalized), \
+                    patch("station_director.dual_run.compare_normalized_runs", return_value=comparison):
+                result = run_dual_comparison(
+                    root, root, root,
+                    {"week_start": "2026-09-14T00:00:00-07:00"}, {}, "comparison",
+                )
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure"]["code"], "input_changed")
+            self.assertEqual(result["failure"]["category"], ["logical_media"])
+            self.assertFalse(result["source_checks"][-1]["passed"])
+
+    def test_failure_codes_distinguish_normalization_comparison_and_mismatch(self):
+        cases = (
+            ("normalization", NormalizationError("bad"), None, "normalization_failed"),
+            ("comparison", None, RuntimeError("bad"), "comparison_failed"),
+            ("mismatch", None, None, "reproducibility_mismatch"),
+        )
+        for label, normalization_error, comparison_error, expected in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                scope = self._scope(root, [])
+                normalized = SimpleNamespace(
+                    digest="a" * 64, record_count=1, provisional_count=0
+                )
+                comparison = {
+                    "passed": label != "mismatch", "run_1_digest": "a" * 64,
+                    "run_2_digest": "a" * 64, "run_1_record_count": 1,
+                    "run_2_record_count": 1, "changed_records": int(label == "mismatch"),
+                    "added_records": 0, "removed_records": 0,
+                    "differences": [], "differences_truncated": False,
+                }
+                normalize_effect = normalization_error or [normalized, normalized]
+                compare_effect = comparison_error or comparison
+                with patch("station_director.dual_run._prepare_scope", return_value=scope), \
+                        patch("station_director.dual_run.launch_single_run"), \
+                        patch("station_director.dual_run.inspect_single_run", side_effect=[
+                            response("comparison.run-1"), response("comparison.run-2")
+                        ]), patch("station_director.dual_run._assert_inputs_stable", side_effect=lambda a, b, c, name: {
+                            "checkpoint": name, "passed": True, "changed_categories": []
+                        }), patch(
+                            "station_director.dual_run.normalize_completed_run",
+                            side_effect=normalize_effect,
+                        ), patch(
+                            "station_director.dual_run.compare_normalized_runs",
+                            side_effect=compare_effect if isinstance(compare_effect, Exception) else None,
+                            return_value=None if isinstance(compare_effect, Exception) else compare_effect,
+                        ):
+                    result = run_dual_comparison(
+                        root, root, root,
+                        {"week_start": "2026-09-14T00:00:00-07:00"}, {}, "comparison",
+                    )
+                self.assertEqual(result["failure"]["code"], expected)
+
+    def test_semantic_validator_rejects_contradictory_success(self):
+        result = {
+            "status": "success", "phase_reached": "complete", "failure": None,
+            "scheduler_invoked": {"run_1": True, "run_2": False},
+            "runs": [], "source_checks": [], "reproducibility": None,
+            "cleanup": [],
+        }
+        with self.assertRaisesRegex(DualRunError, "both schedulers"):
+            _validate_result_semantics(result)
+
+    def test_public_modules_do_not_import_or_reference_c2(self):
+        for relative in (
+            "station_director/cli.py",
+            "station_director/validation.py",
+            "station_director/stage_runner.py",
+            "station_director/__init__.py",
+        ):
+            path = ROOT / relative
+            if not path.exists():
+                continue
+            source = path.read_text(encoding="utf-8")
+            self.assertNotIn("dual_run", source, relative)
+            self.assertNotIn("schedule_normalization", source, relative)
+        self.assertIn(
+            'PHASE_3_DISABLED = "Phase 3 validation is not yet enabled"',
+            (ROOT / "station_director/validation.py").read_text(encoding="utf-8"),
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", (
+                "import sys; import station_director.dual_run; "
+                "assert not any(n == 'fs42' or n.startswith('fs42.') for n in sys.modules)"
+            )],
+            cwd=ROOT, check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        from station_director.validation import _disabled_report
+
+        public = _disabled_report({"proposal_id": "synthetic"})
+        self.assertFalse(public["scheduler_invoked"])
+        self.assertEqual(
+            public["failures"][0], "Phase 3 validation is not yet enabled"
+        )
+
+
+class NativeTwoProcessIntegrationTests(unittest.TestCase):
+    def _complete_dual_run(self, root, *, alter_second=False):
+        media = root / "media"
+        content = media / "synthetic" / "Synthetic"
+        content.mkdir(parents=True)
+        for target, color in ((content / "clip.mp4", "black"), (content / "other.mp4", "white")):
+            subprocess.run(
+                [
+                    "ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
+                    f"color=c={color}:s=16x16:r=1", "-t", "3600",
+                    "-pix_fmt", "yuv420p", str(target),
+                ], check=True, timeout=30,
+            )
+        project = synthetic_project(root, media)
+        proposal = base_proposal()
+        proposal["directives"] = [{
+            "type": "theme", "name": "synthetic", "channel": 2,
+            "start_date": "2026-09-14", "end_date": "2026-09-14",
+            "hours": [0], "series": "Synthetic",
+        }]
+        policy = load_policy()
+        staging = root / "staging"
+        staging.mkdir()
+        details = []
+
+        from station_director import path_safety as parent_path_safety
+        parent_canonical = parent_path_safety.canonical_media_mapping
+
+        def normalize_media_mapping(value, *args, **kwargs):
+            try:
+                relative = Path(str(value)).relative_to(media)
+            except ValueError:
+                pass
+            else:
+                value = str(Path("/media") / relative)
+            return parent_canonical(value, *args, **kwargs)
+
+        def transport(lifecycle, timeout):
+            environment = dict(os.environ)
+            environment.update(TZ="America/Los_Angeles", PYTHONHASHSEED="0")
+            completed = subprocess.run(
+                [
+                    str(ROOT / "env/bin/python"), "-c",
+                    "import sys; from test.test_station_director_milestone_c2 import complete_worker_child_main; complete_worker_child_main(*sys.argv[1:])",
+                    str(lifecycle.stage), str(media), str(project),
+                ],
+                cwd=ROOT, env=environment, timeout=timeout,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            info = json.loads((lifecycle.stage / "native-info.json").read_text(encoding="utf-8"))
+            details.append(info)
+            if alter_second and lifecycle.run_id.endswith("run-2") and info["status"] == "success":
+                database = lifecycle.stage / "work/runtime/fs42_fluid.db"
+                connection = sqlite3.connect(database)
+                try:
+                    row = connection.execute(
+                        "SELECT id,content_json,plan_json FROM liquid_blocks ORDER BY start_time LIMIT 1"
+                    ).fetchone()
+                    catalog_id = int(json.loads(row[1]))
+                    replacement = str(media / "synthetic/Synthetic/other.mp4")
+                    connection.execute(
+                        "UPDATE catalog_entries SET path=?,realpath=? WHERE id=?",
+                        (replacement, replacement, catalog_id),
+                    )
+                    plan = json.loads(row[2])
+                    plan[0]["path"] = replacement
+                    connection.execute(
+                        "UPDATE liquid_blocks SET plan_json=? WHERE id=?",
+                        (json.dumps(plan), row[0]),
+                    )
+                    connection.commit()
+                finally:
+                    connection.close()
+            lifecycle.launcher_result = LaunchResult(
+                lifecycle.unit_name, 0 if info["status"] == "success" else 1,
+                completed.stdout, completed.stderr,
+            )
+            return lifecycle.launcher_result
+
+        # These patches model only the unavailable isolation transport: the
+        # mount alias, probe attestation, transient-unit launch, and unit cleanup.
+        with patch("station_director.dual_run.check_invocation_context", return_value=(True, "test SSH")), \
+                patch("station_director.isolation.STAGING_PARENT", staging), \
+                patch("station_director.dual_run.STAGING_PARENT", staging), \
+                patch("station_director.dual_run.launch_single_run", side_effect=transport), \
+                patch("station_director.schedule_normalization.canonical_media_mapping", side_effect=normalize_media_mapping), \
+                patch("station_director.single_run.cleanup_unit", return_value=(True, "test unit absent")):
+            result = run_dual_comparison(
+                project, project, media, proposal, policy, "native-integration"
+            )
+        return result, details
+
+    def test_complete_genuine_two_run_lifecycle_succeeds_identically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result, details = self._complete_dual_run(root)
+            self.assertEqual(result["status"], "success", (result.get("failure"), details))
+            self.assertTrue(result["reproducibility"]["passed"])
+            self.assertEqual(len(details), 2)
+            self.assertNotEqual(details[0]["pid"], details[1]["pid"])
+            for field in ("stage", "database", "request", "response"):
+                self.assertNotEqual(details[0][field], details[1][field])
+            self.assertTrue(all(item["fs42_loaded"] for item in details))
+            self.assertEqual([item["cache_size"] for item in details], [1, 1])
+
+    def test_complete_genuine_lifecycle_detects_selected_media_difference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, details = self._complete_dual_run(Path(directory), alter_second=True)
+            self.assertEqual(len(details), 2)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure"]["code"], "reproducibility_mismatch")
+            self.assertFalse(result["reproducibility"]["passed"])
+
+
+if __name__ == "__main__":
+    unittest.main()

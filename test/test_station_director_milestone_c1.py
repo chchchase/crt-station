@@ -29,6 +29,7 @@ from station_director.single_run_protocol import (
     REQUEST_SCHEMA,
     RESPONSE_SCHEMA,
     bind_request,
+    strict_json_loads,
     write_private_json_exclusive,
 )
 from station_director.single_run_worker import run_worker
@@ -189,6 +190,38 @@ class ChannelSeedTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_protocol_json_rejects_duplicate_keys_at_every_depth(self):
+        samples = (
+            '{"status":"success","status":"failed"}',
+            '{"proposal":{"proposal_id":"one","proposal_id":"two"}}',
+            '{"validation_context":{"effective_seed":1,"effective_seed":2}}',
+            '{"channels":[{"number":2,"number":3}]}',
+            '{"diagnostics":{"detail":{"code":"a","code":"b"}}}',
+            '{"policy":{"nested":{"value":1,"value":2}}}',
+        )
+        for raw in samples:
+            with self.subTest(raw=raw), self.assertRaisesRegex(
+                ProtocolError, "duplicate key"
+            ):
+                strict_json_loads(raw)
+
+    def test_held_request_and_response_reject_duplicate_keys_before_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, schema, raw in (
+                ("request.json", REQUEST_SCHEMA,
+                 '{"schema_version":1,"schema_version":1}'),
+                ("response.json", RESPONSE_SCHEMA,
+                 '{"status":"success","status":"failed"}'),
+            ):
+                path = root / name
+                path.write_text(raw, encoding="utf-8")
+                os.chmod(path, 0o600)
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    ProtocolError, "duplicate key"
+                ):
+                    HeldDocument(path, schema)
+
     def test_nested_proposal_and_policy_are_strict(self):
         with tempfile.TemporaryDirectory() as directory:
             stage = Path(directory)

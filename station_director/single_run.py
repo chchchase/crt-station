@@ -61,13 +61,37 @@ class SingleRunLifecycle:
     launcher_result: object = None
     response: dict = None
     cleaned: bool = False
+    unit_settled: bool = False
+
+    def settle_unit(self):
+        """Prove the worker unit absent while retaining the locked stage."""
+        if self.unit_settled:
+            return {"passed": True, "detail": "unit already proven absent"}
+        try:
+            unit_ok, unit_detail = cleanup_unit(self.unit_name)
+        except Exception as exc:
+            unit_ok, unit_detail = False, str(exc)
+        if not unit_ok:
+            quarantine = self.stage / ".quarantine"
+            quarantine.touch(mode=0o600, exist_ok=True)
+            raise SingleRunError(
+                "cleanup", "cleanup_failure",
+                f"unit not proven absent; staging quarantined at {self.stage}: {unit_detail}",
+            )
+        self.unit_settled = True
+        return {"passed": True, "detail": unit_detail}
 
     def cleanup(self):
         if self.cleaned:
             return {"passed": True, "detail": "already cleaned"}
         details = []
+        if (self.stage / ".quarantine").exists():
+            raise SingleRunError(
+                "cleanup", "cleanup_failure", f"staging remains quarantined at {self.stage}"
+            )
         try:
-            unit_ok, unit_detail = cleanup_unit(self.unit_name)
+            settled = self.settle_unit()
+            unit_ok, unit_detail = True, settled["detail"]
         except Exception as exc:
             unit_ok, unit_detail = False, str(exc)
         details.append(f"unit: {unit_detail}")
@@ -101,6 +125,64 @@ def _copy_private(source, target):
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _finalize_prepared_single_run(
+    project_root, stage, lock, token, run_id, proposal, policy, *,
+    configuration_digest, database_digest, media_digest, live_physical_digest,
+):
+    """Bind a C1 request to an already-published immutable source snapshot."""
+    staged_source = Path(stage) / "source"
+    staged_physical = fingerprint_json_files(protected_json_paths(staged_source))
+    staged_configuration = logical_protected_configuration_fingerprint(
+        protected_json_paths(staged_source)
+    )
+    if staged_configuration["digest"] != configuration_digest:
+        raise SingleRunError(
+            "prepare", "source_changed", "staged configuration differs from captured source"
+        )
+    seed_inputs = canonical_seed_inputs(
+        configuration_digest, database_digest, media_digest
+    )
+    context = derive_validation_context(proposal, policy, seed_inputs)
+    configs = {}
+    for identity, path in protected_json_paths(staged_source).items():
+        if not identity.startswith("confs/") or path.name == "main_config.json":
+            continue
+        value = json.loads(path.read_text(encoding="utf-8"))
+        configs[value["station_conf"]["network_name"]] = value
+    unused_projected, affected, unused_sources = project_configuration(
+        configs, proposal, policy
+    )
+    by_name = {item["name"]: item["number"] for item in policy["channels"]}
+    affected_channels = [
+        {"number": by_name[name], "name": name}
+        for name in sorted(affected, key=lambda name: by_name[name])
+    ]
+    request = bind_request(
+        {
+            "schema_version": 1,
+            "operation": "native_single_run",
+            "run_id": run_id,
+            "proposal": proposal,
+            "policy": policy,
+            "seed_inputs": seed_inputs,
+            "input_fingerprints": {
+                "original_logical_configuration_fingerprint": configuration_digest,
+                "original_logical_database_fingerprint": database_digest,
+                "logical_media_manifest_fingerprint": media_digest,
+                "live_physical_configuration_fingerprint": live_physical_digest,
+                "staged_source_physical_configuration_fingerprint": staged_physical["digest"],
+            },
+            "affected_channels": affected_channels,
+            "validation_context": context,
+        }
+    )
+    write_private_json_exclusive(Path(stage) / REQUEST_NAME, request, REQUEST_SCHEMA)
+    return SingleRunLifecycle(
+        Path(project_root), Path(stage), lock, token, run_id,
+        f"fs42-native-{token}.service", request,
+    )
 
 
 def prepare_single_run(
@@ -148,9 +230,6 @@ def prepare_single_run(
             raise SingleRunError(
                 "prepare", "source_changed", "protected source changed during capture"
             )
-        staged_physical = fingerprint_json_files(
-            protected_json_paths(staged_source)
-        )
         configuration = logical_protected_configuration_fingerprint(
             protected_json_paths(staged_source)
         )
@@ -159,47 +238,12 @@ def prepare_single_run(
             media = logical_media_manifest_fingerprint(manifest)
         finally:
             manifest.close()
-        seed_inputs = canonical_seed_inputs(
-            configuration["digest"], database["logical"]["digest"], media["digest"]
-        )
-        context = derive_validation_context(proposal, policy, seed_inputs)
-        configs = {}
-        for path in sorted((staged_source / "confs").glob("*.json")):
-            if path.name == "main_config.json":
-                continue
-            value = json.loads(path.read_text(encoding="utf-8"))
-            configs[value["station_conf"]["network_name"]] = value
-        unused_projected, affected, unused_sources = project_configuration(
-            configs, proposal, policy
-        )
-        by_name = {item["name"]: item["number"] for item in policy["channels"]}
-        affected_channels = [
-            {"number": by_name[name], "name": name}
-            for name in sorted(affected, key=lambda name: by_name[name])
-        ]
-        request = bind_request(
-            {
-                "schema_version": 1,
-                "operation": "native_single_run",
-                "run_id": run_id,
-                "proposal": proposal,
-                "policy": policy,
-                "seed_inputs": seed_inputs,
-                "input_fingerprints": {
-                    "original_logical_configuration_fingerprint": configuration["digest"],
-                    "original_logical_database_fingerprint": database["logical"]["digest"],
-                    "logical_media_manifest_fingerprint": media["digest"],
-                    "live_physical_configuration_fingerprint": live_physical_after["digest"],
-                    "staged_source_physical_configuration_fingerprint": staged_physical["digest"],
-                },
-                "affected_channels": affected_channels,
-                "validation_context": context,
-            }
-        )
-        write_private_json_exclusive(stage / REQUEST_NAME, request, REQUEST_SCHEMA)
-        return SingleRunLifecycle(
-            project_root, stage, lock, token, run_id,
-            f"fs42-native-{token}.service", request,
+        return _finalize_prepared_single_run(
+            project_root, stage, lock, token, run_id, proposal, policy,
+            configuration_digest=configuration["digest"],
+            database_digest=database["logical"]["digest"],
+            media_digest=media["digest"],
+            live_physical_digest=live_physical_after["digest"],
         )
     except Exception as exc:
         lock.close()

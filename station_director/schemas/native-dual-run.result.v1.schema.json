@@ -1,0 +1,149 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://crt-station.invalid/schemas/native-dual-run.result.v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "operation", "comparison_id", "status", "phase_reached", "scheduler_invoked", "validation_context", "affected_channels", "source_checks", "runs", "reproducibility", "failure", "cleanup", "timings_ms"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "operation": {"const": "native_dual_run_comparison"},
+    "comparison_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,100}$"},
+    "status": {"enum": ["success", "failed"]},
+    "phase_reached": {"enum": ["capture", "run_1", "run_2", "normalization", "comparison", "cleanup", "complete", "after_capture", "between_runs", "after_run_2", "before_success"]},
+    "scheduler_invoked": {
+      "type": "object", "additionalProperties": false,
+      "required": ["run_1", "run_2"],
+      "properties": {"run_1": {"type": "boolean"}, "run_2": {"type": "boolean"}}
+    },
+    "validation_context": {
+      "oneOf": [
+        {"type": "object", "maxProperties": 0},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["input_fingerprint", "requested_seed", "effective_seed"],
+          "properties": {
+            "input_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "requested_seed": {"type": "integer"},
+            "effective_seed": {"type": "integer", "minimum": 0}
+          }
+        }
+      ]
+    },
+    "affected_channels": {
+      "type": "array", "maxItems": 6,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["number", "name"],
+        "properties": {"number": {"type": "integer"}, "name": {"type": "string"}}
+      }
+    },
+    "source_checks": {
+      "type": "array", "maxItems": 4,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["checkpoint", "passed", "changed_categories"],
+        "properties": {
+          "checkpoint": {"enum": ["after_capture", "between_runs", "after_run_2", "before_success"]},
+          "passed": {"type": "boolean"},
+          "changed_categories": {
+            "type": "array", "maxItems": 5, "uniqueItems": true,
+            "items": {"enum": ["physical_configuration", "logical_configuration", "logical_database", "physical_media_metadata", "logical_media"]}
+          }
+        }
+      }
+    },
+    "runs": {
+      "type": "array", "maxItems": 2,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["index", "run_id", "status", "normalization_digest", "record_count", "provisional_catalog_count", "channels", "warnings", "timings_ms"],
+        "properties": {
+          "index": {"type": "integer", "enum": [1, 2]},
+          "run_id": {"type": "string"},
+          "status": {"const": "success"},
+          "normalization_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "record_count": {"type": "integer", "minimum": 1},
+          "provisional_catalog_count": {"type": "integer", "minimum": 0},
+          "channels": {"type": "array"},
+          "warnings": {"type": "array"},
+          "timings_ms": {"type": "object"}
+        }
+      }
+    },
+    "reproducibility": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["passed", "run_1_digest", "run_2_digest", "run_1_record_count", "run_2_record_count", "changed_records", "added_records", "removed_records", "differences", "differences_truncated"],
+          "properties": {
+            "passed": {"type": "boolean"},
+            "run_1_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "run_2_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+            "run_1_record_count": {"type": "integer", "minimum": 0},
+            "run_2_record_count": {"type": "integer", "minimum": 0},
+            "changed_records": {"type": "integer", "minimum": 0},
+            "added_records": {"type": "integer", "minimum": 0},
+            "removed_records": {"type": "integer", "minimum": 0},
+            "differences": {
+              "type": "array", "maxItems": 50,
+              "items": {
+                "type": "object", "additionalProperties": false,
+                "required": ["kind", "field_path", "run_1", "run_2", "value_truncated"],
+                "properties": {
+                  "kind": {"enum": ["changed", "added", "removed"]},
+                  "field_path": {"type": "string", "maxLength": 1000},
+                  "run_1": {"type": "string", "maxLength": 512},
+                  "run_2": {"type": "string", "maxLength": 512},
+                  "value_truncated": {"type": "boolean"}
+                }
+              }
+            },
+            "differences_truncated": {"type": "boolean"}
+          }
+        }
+      ]
+    },
+    "failure": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["phase", "code", "category", "message"],
+          "properties": {
+            "phase": {"type": "string"},
+            "code": {"type": "string"},
+            "category": {
+              "oneOf": [
+                {"type": "null"},
+                {"type": "string", "maxLength": 100},
+                {
+                  "type": "array", "maxItems": 5, "uniqueItems": true,
+                  "items": {"enum": ["physical_configuration", "logical_configuration", "logical_database", "physical_media_metadata", "logical_media"]}
+                }
+              ]
+            },
+            "message": {"type": "string", "maxLength": 1000}
+          }
+        }
+      ]
+    },
+    "cleanup": {
+      "type": "array", "maxItems": 2,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["run", "passed", "detail"],
+        "properties": {
+          "run": {"type": "integer", "enum": [1, 2]},
+          "passed": {"type": "boolean"},
+          "detail": {"type": "string", "maxLength": 1000}
+        }
+      }
+    },
+    "timings_ms": {
+      "type": "object", "additionalProperties": false,
+      "required": ["total"],
+      "properties": {"total": {"type": "integer", "minimum": 0}}
+    }
+  }
+}

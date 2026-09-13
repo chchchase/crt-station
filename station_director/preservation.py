@@ -2,6 +2,7 @@ import base64
 import errno
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import stat
@@ -34,6 +35,18 @@ DIGEST_PRAGMAS = (
     "auto_vacuum",
 )
 RAW_SUFFIXES = ("", "-wal", "-shm", "-journal")
+MAX_SCHEMA_OBJECTS = 4096
+MAX_DATABASE_TABLES = 512
+MAX_COLUMNS_PER_TABLE = 512
+MAX_FOREIGN_KEY_FINDINGS = 100000
+MAX_INTEGRITY_ROWS = 1000
+MAX_PROTECTED_JSON_FILES = 256
+MAX_PROTECTED_JSON_FILE_BYTES = 2 * 1024 * 1024
+MAX_PROTECTED_JSON_TOTAL_BYTES = 16 * 1024 * 1024
+MAX_LOGICAL_ROW_BYTES = 2 * 1024 * 1024
+MAX_ROWS_PER_TABLE = 100000000
+MAX_MEDIA_MANIFEST_ENTRIES = 10000000
+MAX_DIRECTORY_ENTRIES = 100000
 UNSUPPORTED_XATTR_ERRNOS = {
     value for value in (getattr(errno, "ENOTSUP", None), getattr(errno, "EOPNOTSUPP", None))
     if value is not None
@@ -56,6 +69,8 @@ def canonical_sqlite_value(value):
     if isinstance(value, int):
         return _frame(b"I", str(value).encode("ascii"))
     if isinstance(value, float):
+        if not math.isfinite(value):
+            raise PreservationError("non-finite SQLite real is unsupported")
         return _frame(b"R", struct.pack(">d", value))
     if isinstance(value, str):
         return _frame(b"T", value.encode("utf-8"))
@@ -128,6 +143,8 @@ def inspect_database_schema(connection):
     for object_type, name, table_name, sql in connection.execute(
         "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
     ):
+        if len(objects) >= MAX_SCHEMA_OBJECTS:
+            raise PreservationError("database schema object limit exceeded")
         objects.append(
             {
                 "type": object_type,
@@ -140,11 +157,15 @@ def inspect_database_schema(connection):
     for item in objects:
         if item["type"] != "table":
             continue
+        if len(tables) >= MAX_DATABASE_TABLES:
+            raise PreservationError("database table limit exceeded")
         name = item["name"]
         columns = []
         for cid, column, declared_type, not_null, default, primary_key, hidden in connection.execute(
             f"PRAGMA table_xinfo({_quote_identifier(name)})"
         ):
+            if len(columns) >= MAX_COLUMNS_PER_TABLE:
+                raise PreservationError(f"database column limit exceeded for {name}")
             columns.append(
                 {
                     "cid": cid,
@@ -160,29 +181,55 @@ def inspect_database_schema(connection):
     return {"objects": objects, "tables": tables}
 
 
-def _table_digest(connection, table, columns):
+@contextmanager
+def _logical_sort_index():
+    with tempfile.TemporaryDirectory(prefix="fs42-logical-") as directory:
+        path = Path(directory) / "rows.sqlite"
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0), 0o600
+        )
+        os.close(descriptor)
+        index = sqlite3.connect(path)
+        try:
+            index.execute("PRAGMA journal_mode=OFF")
+            index.execute("PRAGMA synchronous=OFF")
+            index.execute("CREATE TABLE rows(value BLOB NOT NULL)")
+            index.execute("CREATE INDEX row_order ON rows(value)")
+            yield index
+        finally:
+            index.close()
+
+
+def _table_digest(connection, table, columns, sort_index):
     column_names = [column["name"] for column in columns]
     if not column_names:
         row_count = connection.execute(
             f"SELECT COUNT(*) FROM {_quote_identifier(table)}"
         ).fetchone()[0]
         return row_count, hashlib.sha256(b"").hexdigest()
-    primary = [
-        column["name"]
-        for column in sorted(columns, key=lambda item: item["primary_key"] or 10**9)
-        if column["primary_key"]
-    ]
-    ordering = primary or column_names
     selected = ",".join(_quote_identifier(name) for name in column_names)
-    ordered = ",".join(_quote_identifier(name) for name in ordering)
-    cursor = connection.execute(
-        f"SELECT {selected} FROM {_quote_identifier(table)} ORDER BY {ordered}"
-    )
-    digest = hashlib.sha256()
+    cursor = connection.execute(f"SELECT {selected} FROM {_quote_identifier(table)}")
+    sort_index.execute("DELETE FROM rows")
     count = 0
     for row in cursor:
-        digest.update(_frame(b"r", b"".join(canonical_sqlite_value(value) for value in row)))
+        if count >= MAX_ROWS_PER_TABLE:
+            raise PreservationError(f"row-count limit exceeded for {table}")
+        encoded = _frame(
+            b"r", b"".join(canonical_sqlite_value(value) for value in row)
+        )
+        if len(encoded) > MAX_LOGICAL_ROW_BYTES:
+            raise PreservationError(f"logical row size limit exceeded for {table}")
+        sort_index.execute("INSERT INTO rows(value) VALUES(?)", (encoded,))
         count += 1
+    sort_index.commit()
+    digest = hashlib.sha256()
+    ordered_count = 0
+    for encoded, in sort_index.execute("SELECT value FROM rows ORDER BY value"):
+        digest.update(bytes(encoded))
+        ordered_count += 1
+    if ordered_count != count:
+        raise PreservationError(f"logical row spool count mismatch for {table}")
     return count, digest.hexdigest()
 
 
@@ -195,17 +242,31 @@ def logical_database_fingerprint(connection):
         pragmas[name] = connection.execute(f"PRAGMA {name}").fetchone()[0]
     tables = {}
     aggregate = hashlib.sha256()
-    for name in sorted(schema["tables"]):
-        count, digest = _table_digest(connection, name, schema["tables"][name])
-        tables[name] = {"row_count": count, "digest": digest}
-        aggregate.update(_frame(b"t", name.encode("utf-8")))
-        aggregate.update(bytes.fromhex(digest))
-        aggregate.update(canonical_sqlite_value(count))
-    foreign_rows = connection.execute("PRAGMA foreign_key_check").fetchall()
+    with _logical_sort_index() as sort_index:
+        for name in sorted(schema["tables"]):
+            count, digest = _table_digest(
+                connection, name, schema["tables"][name], sort_index
+            )
+            tables[name] = {"row_count": count, "digest": digest}
+            aggregate.update(_frame(b"t", name.encode("utf-8")))
+            aggregate.update(bytes.fromhex(digest))
+            aggregate.update(canonical_sqlite_value(count))
+    foreign_rows = []
+    for row in connection.execute("PRAGMA foreign_key_check"):
+        if len(foreign_rows) >= MAX_FOREIGN_KEY_FINDINGS:
+            raise PreservationError("foreign-key finding limit exceeded")
+        foreign_rows.append(row)
     foreign_digest = hashlib.sha256()
-    for row in sorted(foreign_rows, key=lambda value: tuple(str(item) for item in value)):
+    for row in sorted(
+        foreign_rows,
+        key=lambda value: b"".join(canonical_sqlite_value(item) for item in value),
+    ):
         foreign_digest.update(_frame(b"f", b"".join(canonical_sqlite_value(item) for item in row)))
-    integrity_rows = [row[0] for row in connection.execute("PRAGMA integrity_check")]
+    integrity_rows = []
+    for row in connection.execute("PRAGMA integrity_check"):
+        if len(integrity_rows) >= MAX_INTEGRITY_ROWS:
+            raise PreservationError("integrity-check result limit exceeded")
+        integrity_rows.append(row[0])
     overall = hashlib.sha256()
     overall.update(bytes.fromhex(schema_digest))
     overall.update(bytes.fromhex(aggregate.hexdigest()))
@@ -235,7 +296,11 @@ def logical_database_fingerprint(connection):
 
 def canonical_foreign_key_findings(connection):
     """Return complete typed FK findings for exact baseline comparison."""
-    rows = connection.execute("PRAGMA foreign_key_check").fetchall()
+    rows = []
+    for row in connection.execute("PRAGMA foreign_key_check"):
+        if len(rows) >= MAX_FOREIGN_KEY_FINDINGS:
+            raise PreservationError("foreign-key finding limit exceeded")
+        rows.append(row)
     return tuple(
         sorted(
             (tuple(canonical_sqlite_value(value) for value in row) for row in rows),
@@ -267,6 +332,54 @@ def fingerprint_and_clone_database(source, target):
         finally:
             destination.close()
     return {"logical": logical, "raw_metadata": diagnostic}
+
+
+def fingerprint_and_clone_database_targets(source, targets):
+    """Clone one pinned read-only SQLite view into every distinct target.
+
+    The source transaction is intentionally scoped only to fingerprinting,
+    backup, and verification of the backups.  It is closed before this helper
+    returns so a later native scheduling run cannot hold the live WAL open.
+    """
+    source = Path(source)
+    targets = [Path(item) for item in targets]
+    if not targets or len({str(item.resolve(strict=False)) for item in targets}) != len(targets):
+        raise PreservationError("database backup targets must be non-empty and distinct")
+    for target in targets:
+        if target.exists() or os.path.lexists(target):
+            raise PreservationError(f"refusing to overwrite staged database: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+    diagnostic = raw_database_metadata(source)
+    results = []
+    try:
+        with readonly_database(source) as connection:
+            logical = logical_database_fingerprint(connection)
+            for target in targets:
+                destination = sqlite3.connect(target)
+                try:
+                    connection.backup(destination)
+                    destination.commit()
+                finally:
+                    destination.close()
+                with readonly_database(target) as backup:
+                    copied = logical_database_fingerprint(backup)
+                if copied["digest"] != logical["digest"]:
+                    raise PreservationError(
+                        f"staged database backup differs from pinned source view: {target}"
+                    )
+                results.append({"target": target, "logical": copied})
+    except Exception:
+        for target in targets:
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+        raise
+    return {
+        "logical": logical,
+        "raw_metadata": diagnostic,
+        "backups": results,
+    }
 
 
 def _xattrs(path, device, capabilities):
@@ -335,6 +448,8 @@ def capture_media_manifest(root, spool_directory=None):
 
     def emit(record):
         nonlocal count
+        if count >= MAX_MEDIA_MANIFEST_ENTRIES:
+            raise PreservationError("media manifest entry-count limit exceeded")
         line = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
         stream.write(line)
         digest.update(line)
@@ -347,7 +462,12 @@ def capture_media_manifest(root, spool_directory=None):
             return
         try:
             with os.scandir(path) as iterator:
-                entries = sorted(iterator, key=lambda entry: entry.name)
+                entries = []
+                for entry in iterator:
+                    if len(entries) >= MAX_DIRECTORY_ENTRIES:
+                        raise PreservationError("media directory entry-count limit exceeded")
+                    entries.append(entry)
+                entries.sort(key=lambda entry: entry.name)
         except OSError as exc:
             raise PreservationError(f"cannot traverse {os.fsdecode(path)}: {exc}") from exc
         for entry in entries:
@@ -424,6 +544,9 @@ def compare_media_manifests(before, after, difference_limit=20):
 def fingerprint_json_files(paths):
     started = time.monotonic()
     entries = {}
+    if len(paths) > MAX_PROTECTED_JSON_FILES:
+        raise PreservationError("protected JSON file-count limit exceeded")
+    aggregate_bytes = 0
     for logical_name, path in sorted(paths.items()):
         path = Path(path)
         try:
@@ -432,8 +555,25 @@ def fingerprint_json_files(paths):
             raise PreservationError(f"cannot open protected file {path}: {exc}") from exc
         try:
             before = os.fstat(descriptor)
-            with os.fdopen(os.dup(descriptor), "rb") as handle:
-                raw = handle.read()
+            chunks = []
+            file_bytes = 0
+            while True:
+                chunk = os.read(
+                    descriptor,
+                    min(65536, MAX_PROTECTED_JSON_FILE_BYTES + 1 - file_bytes),
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                file_bytes += len(chunk)
+                if file_bytes > MAX_PROTECTED_JSON_FILE_BYTES:
+                    raise PreservationError(
+                        f"protected JSON file exceeds size limit: {logical_name}"
+                    )
+            aggregate_bytes += file_bytes
+            if aggregate_bytes > MAX_PROTECTED_JSON_TOTAL_BYTES:
+                raise PreservationError("protected JSON aggregate size limit exceeded")
+            raw = b"".join(chunks)
             after = os.fstat(descriptor)
         finally:
             os.close(descriptor)
@@ -459,9 +599,14 @@ def fingerprint_json_files(paths):
 
 def protected_json_paths(root):
     root = Path(root)
-    paths = {
-        f"confs/{path.name}": path for path in sorted((root / "confs").glob("*.json"))
-    }
+    paths = {}
+    config_paths = []
+    for path in (root / "confs").glob("*.json"):
+        if len(config_paths) >= MAX_PROTECTED_JSON_FILES - 1:
+            raise PreservationError("protected JSON file-count limit exceeded")
+        config_paths.append(path)
+    for path in sorted(config_paths):
+        paths[f"confs/{path.name}"] = path
     state = root / "runtime/watch_in_order_state.json"
     paths["runtime/watch_in_order_state.json"] = state
     return paths

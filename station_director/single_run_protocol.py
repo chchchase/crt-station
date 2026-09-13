@@ -21,6 +21,29 @@ class ProtocolError(RuntimeError):
     pass
 
 
+def strict_json_loads(raw):
+    """Decode protocol JSON while rejecting duplicates at every object level."""
+    def reject_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ProtocolError(f"protocol JSON contains duplicate key: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ProtocolError(f"protocol JSON contains non-finite number: {value}")
+
+    try:
+        return json.loads(
+            raw, object_pairs_hook=reject_duplicates, parse_constant=reject_constant
+        )
+    except ProtocolError:
+        raise
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ProtocolError(f"protocol JSON is malformed: {exc}") from exc
+
+
 def request_digest(payload):
     material = dict(payload)
     material.pop("request_digest", None)
@@ -146,10 +169,7 @@ class HeldDocument:
                 raise ProtocolError("protocol file changed while it was read")
             self._identity = identity(after)
             self._raw_digest = hashlib.sha256(raw.encode("utf-8")).digest()
-            try:
-                self.payload = json.loads(raw)
-            except (UnicodeError, json.JSONDecodeError) as exc:
-                raise ProtocolError(f"protocol JSON is malformed: {exc}") from exc
+            self.payload = strict_json_loads(raw)
             validate_document(self.payload, schema_path)
             if Path(schema_path) == REQUEST_SCHEMA:
                 validate_request_semantics(self.payload)
