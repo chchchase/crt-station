@@ -1,0 +1,124 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://crt-station.invalid/schemas/native-single-run.response.v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "operation", "run_id", "proposal_id", "status", "phase_reached", "scheduler_invoked", "validation_context", "affected_channels", "channels", "verification", "preservation", "path_validation", "warnings", "failure", "timings_ms", "diagnostics"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "operation": {"const": "native_single_run"},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "proposal_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["success", "failed"]},
+    "phase_reached": {"enum": ["request", "probes", "snapshot", "seed", "native_import", "configuration", "catalog", "scheduler", "preservation", "complete"]},
+    "scheduler_invoked": {"type": "boolean"},
+    "validation_context": {
+      "type": "object", "additionalProperties": false,
+      "required": ["input_fingerprint", "requested_seed", "effective_seed"],
+      "properties": {
+        "input_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "requested_seed": {"type": "integer"},
+        "effective_seed": {"type": "integer", "minimum": 0}
+      }
+    },
+    "affected_channels": {
+      "type": "array", "minItems": 1, "maxItems": 6, "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["number", "name"],
+        "properties": {"number": {"type": "integer"}, "name": {"type": "string"}}
+      }
+    },
+    "channels": {"type": "array", "items": {"$ref": "#/$defs/channel"}},
+    "verification": {"oneOf": [{"$ref": "#/$defs/verification"}, {"type": "object", "maxProperties": 0}]},
+    "preservation": {"oneOf": [{
+      "type": "object", "additionalProperties": false,
+      "required": ["retained_history", "protected_channels", "sequence_tables_restored", "foreign_key_baseline"],
+      "properties": {
+        "retained_history": {"const": "pass"}, "protected_channels": {"const": "pass"},
+        "sequence_tables_restored": {"const": "pass"}, "foreign_key_baseline": {"const": "pass"}
+      }
+    }, {"type": "object", "maxProperties": 0}]},
+    "path_validation": {"oneOf": [{
+      "type": "object", "additionalProperties": false,
+      "required": ["passed", "mapping_count", "scheduled_path_checks"],
+      "properties": {
+        "passed": {"const": true}, "mapping_count": {"type": "integer", "minimum": 0},
+        "scheduled_path_checks": {"type": "integer", "minimum": 0}
+      }
+    }, {"type": "object", "maxProperties": 0}]},
+    "warnings": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/diagnostic"}},
+    "failure": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/diagnostic"}]},
+    "timings_ms": {"oneOf": [{
+      "type": "object", "additionalProperties": false,
+      "required": ["prepare", "catalog", "scheduler", "preservation", "total"],
+      "properties": {
+        "prepare": {"type": "integer", "minimum": 0},
+        "catalog": {"type": "integer", "minimum": 0},
+        "scheduler": {"type": "integer", "minimum": 0},
+        "preservation": {"type": "integer", "minimum": 0},
+        "total": {"type": "integer", "minimum": 0}
+      }
+    }, {"type": "object", "maxProperties": 0}]},
+    "diagnostics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["messages", "truncated"],
+      "properties": {
+        "messages": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 1000}},
+        "truncated": {"type": "boolean"}
+      }
+    }
+  },
+  "$defs": {
+    "diagnostic": {
+      "type": "object", "additionalProperties": false,
+      "required": ["phase", "channel", "code", "type", "message"],
+      "properties": {
+        "phase": {"type": "string", "minLength": 1},
+        "channel": {"type": ["string", "null"]},
+        "code": {"type": "string", "minLength": 1},
+        "type": {"type": "string", "minLength": 1},
+        "message": {"type": "string", "minLength": 1, "maxLength": 1000}
+      }
+    },
+    "channel": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "number", "channel_seed", "regeneration_start", "effective_horizon", "retained_blocks", "generated_blocks", "final_blocks", "catalog_reused", "catalog_new", "catalog_protected", "new_catalog_ids", "coverage"],
+      "properties": {
+        "name": {"type": "string"}, "number": {"type": "integer"},
+        "channel_seed": {"type": "integer", "minimum": 0},
+        "regeneration_start": {"type": "string"}, "effective_horizon": {"type": "string"},
+        "retained_blocks": {"type": "integer", "minimum": 0}, "generated_blocks": {"type": "integer", "minimum": 0}, "final_blocks": {"type": "integer", "minimum": 0},
+        "catalog_reused": {"type": "integer", "minimum": 0}, "catalog_new": {"type": "integer", "minimum": 0}, "catalog_protected": {"type": "integer", "minimum": 0},
+        "new_catalog_ids": {"const": "provisional"},
+        "coverage": {"$ref": "#/$defs/coverage"}
+      }
+    },
+    "verification": {
+      "type": "object", "additionalProperties": false,
+      "required": ["original_snapshot", "deterministic_projection", "projected_configuration", "working_database", "logical_media", "physical_transition", "fingerprints"],
+      "properties": {
+        "original_snapshot": {"const": "pass"},
+        "deterministic_projection": {"const": "pass"},
+        "projected_configuration": {"const": "pass"},
+        "working_database": {"const": "pass"},
+        "logical_media": {"const": "pass"},
+        "physical_transition": {"const": "pass"},
+        "fingerprints": {"type": "object", "minProperties": 7, "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
+      }
+    },
+    "coverage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["channel", "proposal_boundary_crossing_ids", "proposal_end_crossing_ids", "effective_horizon_crossing_ids", "gaps", "overlaps", "final_end"],
+      "properties": {
+        "channel": {"type": "string"},
+        "proposal_boundary_crossing_ids": {"type": "array", "items": {"type": "integer"}},
+        "proposal_end_crossing_ids": {"type": "array", "items": {"type": "integer"}},
+        "effective_horizon_crossing_ids": {"type": "array", "items": {"type": "integer"}},
+        "gaps": {"type": "array", "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "string"}}},
+        "overlaps": {"type": "array", "items": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "string"}}},
+        "final_end": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

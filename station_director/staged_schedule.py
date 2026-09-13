@@ -1,4 +1,5 @@
 import json
+import hashlib
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -102,6 +103,21 @@ def validate_plan_json(raw):
         if not isinstance(item["is_stream"], bool) or not isinstance(item["path"], str):
             raise StagedScheduleError(f"invalid plan_json path/stream fields at index {index}")
     return value
+
+
+def validate_all_catalog_reference_shapes(connection):
+    checked = 0
+    for block_id, content_json in connection.execute(
+        "SELECT id,content_json FROM liquid_blocks ORDER BY id"
+    ):
+        try:
+            parse_catalog_references(content_json)
+        except StagedScheduleError as exc:
+            raise StagedScheduleError(
+                f"block {block_id} has an unsupported catalog reference: {exc}"
+            ) from exc
+        checked += 1
+    return checked
 
 
 def _rows(connection, table, where="", parameters=()):
@@ -284,6 +300,26 @@ def assert_protected_state(connection, state):
         raise StagedScheduleError("; ".join(failures))
 
 
+def restore_sequence_state(connection, state):
+    """Restore all sequence tables globally from a schema-checked snapshot."""
+    tables = ("sequence_entries", "sequence_group_state", "named_sequence")
+    expected = {"named_sequence", "sequence_entries", "sequence_group_state"}
+    if not expected.issubset(state):
+        raise StagedScheduleError("sequence snapshot is incomplete")
+    for table in tables:
+        if _columns(connection, table) != state[table]["columns"]:
+            raise StagedScheduleError(f"sequence schema changed for {table}")
+        connection.execute(f"DELETE FROM {_quote(table)}")
+    for table in ("named_sequence", "sequence_entries", "sequence_group_state"):
+        columns = state[table]["columns"]
+        sql = (
+            f"INSERT INTO {_quote(table)} ({','.join(_quote(item) for item in columns)}) "
+            f"VALUES ({','.join('?' for unused in columns)})"
+        )
+        for row in state[table]["rows"]:
+            connection.execute(sql, row)
+
+
 def assert_retained_history(connection, history):
     columns, rows = _rows(
         connection,
@@ -326,8 +362,95 @@ def _catalog_identity(row):
     return row["station"], row["tag"], mapping.logical_identity
 
 
-def reconcile_catalog(connection, channel, generated_rows, protected_ids):
-    columns, original_rows = _rows(connection, "catalog_entries", "station=?", (channel,))
+def capture_catalog_rows(connection, channel):
+    columns, rows = _rows(connection, "catalog_entries", "station=?", (channel,))
+    return columns, rows
+
+
+def capture_catalog_media_metadata(connection, rows, columns):
+    result = {}
+    for values in rows:
+        row = _row_dict(columns, values)
+        identity = _catalog_identity(row)
+        path = row.get("realpath") or row.get("path")
+        metadata = {}
+        for table in ("file_meta", "break_points", "chapter_points"):
+            table_columns, table_rows = _rows(connection, table, "path=?", (path,))
+            if table_rows:
+                normalized = list(table_rows[0])
+                if "path" in table_columns:
+                    normalized[table_columns.index("path")] = identity[2]
+                metadata[table] = tuple(normalized)
+            else:
+                metadata[table] = None
+            metadata[f"{table}_columns"] = tuple(table_columns)
+        result[identity] = metadata
+    return result
+
+
+def _typed_catalog_semantics(row, media_metadata=None):
+    values = []
+    for name in sorted(name for name in row if name != "id"):
+        value = row[name]
+        if name in ("path", "realpath") and value is not None:
+            value = canonical_media_mapping(
+                value, f"catalog {name}", allow_sandbox=True
+            ).logical_identity
+        values.append((name, canonical_sqlite_value(value)))
+    metadata = media_metadata or {}
+    for name in ("file_meta", "break_points", "chapter_points"):
+        row = metadata.get(name)
+        columns = metadata.get(f"{name}_columns", ())
+        if row is None:
+            encoded = canonical_sqlite_value(None)
+        else:
+            encoded = b"".join(
+                column.encode("utf-8") + b"\0" + canonical_sqlite_value(value)
+                for column, value in zip(columns, row)
+            )
+        values.append((f"media:{name}", canonical_sqlite_value(encoded)))
+    digest = hashlib.sha256()
+    for name, value in values:
+        digest.update(name.encode("utf-8") + b"\0" + value)
+    return digest.digest()
+
+
+def _next_catalog_id(connection):
+    maximum = connection.execute(
+        "SELECT COALESCE(MAX(id),0) FROM catalog_entries"
+    ).fetchone()[0]
+    sequence = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name='catalog_entries'"
+    ).fetchone()
+    sequence_value = sequence[0] if sequence else 0
+    return max(maximum, sequence_value) + 1
+
+
+def catalog_allocation_floor(connection):
+    maximum = connection.execute(
+        "SELECT COALESCE(MAX(id),0) FROM catalog_entries"
+    ).fetchone()[0]
+    sequence = connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name='catalog_entries'"
+    ).fetchone()
+    return max(maximum, sequence[0] if sequence else 0)
+
+
+def reconcile_catalog(
+    connection,
+    channel,
+    generated_rows,
+    protected_ids,
+    *,
+    original_rows=None,
+    original_media_metadata=None,
+    generated_media_metadata=None,
+    statistics=None,
+    allocation_floor=None,
+):
+    columns, current_rows = _rows(connection, "catalog_entries", "station=?", (channel,))
+    if original_rows is None:
+        original_rows = current_rows
     originals = [_row_dict(columns, row) for row in original_rows]
     by_identity = {}
     for row in originals:
@@ -354,6 +477,20 @@ def reconcile_catalog(connection, channel, generated_rows, protected_ids):
         generated_by_identity[identity] = row
 
     connection.execute("DELETE FROM catalog_entries WHERE station=?", (channel,))
+    if allocation_floor is not None:
+        remaining_max = connection.execute(
+            "SELECT COALESCE(MAX(id),0) FROM catalog_entries"
+        ).fetchone()[0]
+        restored = max(allocation_floor, remaining_max)
+        updated = connection.execute(
+            "UPDATE sqlite_sequence SET seq=? WHERE name='catalog_entries'",
+            (restored,),
+        )
+        if updated.rowcount == 0:
+            connection.execute(
+                "INSERT INTO sqlite_sequence(name,seq) VALUES('catalog_entries',?)",
+                (restored,),
+            )
     active_ids = set()
     insert_columns = columns
     placeholders = ",".join("?" for unused in insert_columns)
@@ -365,33 +502,61 @@ def reconcile_catalog(connection, channel, generated_rows, protected_ids):
         row = protected[catalog_id]
         connection.execute(sql, [row.get(name) for name in insert_columns])
 
+    next_id = _next_catalog_id(connection)
+    reused = new = 0
     for identity in sorted(generated_by_identity):
         row = generated_by_identity[identity]
         original = by_identity.get(identity)
-        original_is_protected = original and original["id"] in protected
-        original_is_sandbox = original and str(
-            original.get("realpath") or original["path"]
-        ).startswith("/media/")
-        if original_is_protected and original_is_sandbox:
-            active_ids.add(original["id"])
-            continue
-        row["id"] = original["id"] if original and not original_is_protected else None
-        if original:
-            row["count"] = original["count"]
-            row["created_at"] = original["created_at"]
-        values = [row.get(name) for name in insert_columns]
-        if row["id"] is None:
-            auto_columns = [name for name in insert_columns if name != "id"]
-            cursor = connection.execute(
-                f"INSERT INTO catalog_entries ({','.join(_quote(name) for name in auto_columns)}) "
-                f"VALUES ({','.join('?' for unused in auto_columns)})",
-                [row.get(name) for name in auto_columns],
-            )
-            row["id"] = cursor.lastrowid
+        same_semantics = bool(original) and _typed_catalog_semantics(
+            original, (original_media_metadata or {}).get(identity)
+        ) == _typed_catalog_semantics(
+            row, (generated_media_metadata or {}).get(identity)
+        )
+        original_is_protected = bool(original) and original["id"] in protected
+        if original_is_protected:
+            original_is_sandbox = str(
+                original.get("realpath") or original["path"]
+            ).startswith("/media/")
+            if original_is_sandbox and not same_semantics:
+                raise StagedScheduleError(
+                    f"generated catalog conflicts with retained historical row {original['id']}"
+                )
+            if original_is_sandbox:
+                active_ids.add(original["id"])
+                reused += 1
+                continue
+            # The historical host-path row stays exact. A deterministic stage
+            # alias gets a provisional ID so native code can open /media.
+            row["id"] = next_id
+            next_id += 1
+            new += 1
         else:
-            connection.execute(sql, values)
+            row["id"] = original["id"] if same_semantics else next_id
+            if not same_semantics:
+                next_id += 1
+                new += 1
+            else:
+                reused += 1
+        values = [row.get(name) for name in insert_columns]
+        connection.execute(sql, values)
         active_ids.add(row["id"])
 
+    if new:
+        final_sequence = next_id - 1
+        updated = connection.execute(
+            "UPDATE sqlite_sequence SET seq=? WHERE name='catalog_entries'",
+            (final_sequence,),
+        )
+        if updated.rowcount == 0:
+            connection.execute(
+                "INSERT INTO sqlite_sequence(name,seq) VALUES('catalog_entries',?)",
+                (final_sequence,),
+            )
+
+    if statistics is not None:
+        statistics.update(
+            {"reused": reused, "new": new, "protected": len(protected)}
+        )
     return active_ids
 
 

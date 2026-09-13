@@ -42,10 +42,15 @@ def _typed_value(value):
     raise TypeError(f"unsupported canonical value type: {type(value).__name__}")
 
 
-def _canonical_bytes(value):
+def canonical_typed_bytes(value):
+    """Return the stable, typed encoding used by validation identity hashes."""
     return json.dumps(
         _typed_value(value), ensure_ascii=False, allow_nan=False, separators=(",", ":")
     ).encode("utf-8")
+
+
+def _canonical_bytes(value):
+    return canonical_typed_bytes(value)
 
 
 def _reject_constant(value):
@@ -95,6 +100,20 @@ def logical_protected_configuration_fingerprint(paths):
             os.close(descriptor)
         _typed_value(parsed)
         entries.append([identity, parsed])
+    return logical_configuration_values_fingerprint(dict(entries))
+
+
+def logical_configuration_values_fingerprint(values):
+    """Hash an identity-to-JSON-value mapping without filesystem metadata."""
+    entries = []
+    identities = set()
+    for supplied_identity, value in values.items():
+        identity = _protected_identity(supplied_identity)
+        if identity in identities:
+            raise ValueError(f"duplicate protected configuration identity: {identity}")
+        identities.add(identity)
+        _typed_value(value)
+        entries.append([identity, value])
     entries.sort(key=lambda item: item[0])
     return {
         "digest": hashlib.sha256(_canonical_bytes(entries)).hexdigest(),
@@ -213,6 +232,43 @@ def derive_validation_context(proposal, policy, seed_inputs):
         "python_hash_seed": VALIDATION_PYTHON_HASH_SEED,
         "validation_mode": True,
     }
+
+
+def derive_channel_seed(
+    effective_seed, channel_number, channel_identity, regeneration_start, effective_horizon
+):
+    """Derive a channel-private RNG seed from the validation-run root seed."""
+    if isinstance(effective_seed, bool) or not isinstance(effective_seed, int):
+        raise TypeError("effective_seed must be an integer")
+    if isinstance(channel_number, bool) or not isinstance(channel_number, int):
+        raise TypeError("channel number must be an integer")
+    if not isinstance(channel_identity, str) or not channel_identity:
+        raise ValueError("channel identity must be non-empty text")
+    for name, value in (
+        ("regeneration_start", regeneration_start),
+        ("effective_horizon", effective_horizon),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be non-empty text")
+    material = {
+        "domain": "station-director/channel-seed/v1",
+        "effective_seed": effective_seed,
+        "channel_number": channel_number,
+        "channel_identity": channel_identity,
+        "regeneration_start": regeneration_start,
+        "effective_horizon": effective_horizon,
+    }
+    return int.from_bytes(hashlib.sha256(canonical_typed_bytes(material)).digest()[:8], "big")
+
+
+def derive_request_digest(request_without_digest):
+    if not isinstance(request_without_digest, dict):
+        raise TypeError("validation request must be an object")
+    material = {
+        "domain": "station-director/native-single-run-request/v1",
+        "request": request_without_digest,
+    }
+    return hashlib.sha256(canonical_typed_bytes(material)).hexdigest()
 
 
 def verify_validation_context(proposal, policy, seed_inputs, supplied_context):

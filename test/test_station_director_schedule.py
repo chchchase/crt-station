@@ -24,6 +24,7 @@ from station_director.validation import (
     project_configuration,
     semantic_checks,
 )
+from station_director.native_config_checks import newly_unresolved_source_slots
 
 
 def base_proposal(version=2):
@@ -334,6 +335,15 @@ class CliSemanticsTests(unittest.TestCase):
 
 
 class ProjectedConfigurationTests(unittest.TestCase):
+    @staticmethod
+    def _native_resolution_failures(proposal, original):
+        projected, unused_affected, source_channels = project_configuration(
+            original, proposal, load_policy()
+        )
+        failures, errors = newly_unresolved_source_slots(
+            original, projected, source_channels, proposal
+        )
+        return failures + errors
     def test_directives_use_native_marathon_count_and_exact_scopes(self):
         original = configs()
         projected = copy.deepcopy(original)
@@ -385,6 +395,7 @@ class ProjectedConfigurationTests(unittest.TestCase):
             "series": "Batman Beyond",
         }]
         failures, unused = semantic_checks(proposal, load_policy(), inventory(), configs())
+        failures.extend(self._native_resolution_failures(proposal, configs()))
         self.assertTrue(any("newly unresolved or tagless" in item for item in failures), failures)
 
     def test_removal_is_safe_when_another_tag_remains_in_every_source_slot(self):
@@ -409,6 +420,7 @@ class ProjectedConfigurationTests(unittest.TestCase):
         self.assertEqual(source_channels, {"Action"})
         self.assertNotIn("batman beyond", json.dumps(projected["Action"]).casefold())
         failures, unused = semantic_checks(proposal, load_policy(), inventory(), configs())
+        failures.extend(self._native_resolution_failures(proposal, configs()))
         self.assertTrue(any("newly unresolved or tagless" in item for item in failures), failures)
 
     def test_assignment_exclusion_and_directive_conflicts_are_rejected(self):

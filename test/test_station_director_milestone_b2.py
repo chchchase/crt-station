@@ -21,6 +21,8 @@ from station_director.staged_schedule import (
     capture_channel_history,
     inspect_required_schema,
     parse_catalog_references,
+    reconcile_catalog,
+    validate_all_catalog_reference_shapes,
     regenerate_with_callback,
 )
 
@@ -244,12 +246,128 @@ class MediaFingerprintTests(unittest.TestCase):
 
 
 class HistoryTests(unittest.TestCase):
+    def test_catalog_reuse_requires_complete_typed_semantics(self):
+        mutations = {
+            "duration": lambda row: row.update(duration=3599.0),
+            "title": lambda row: row.update(title="Changed"),
+            "tag": lambda row: row.update(tag="Changed tag"),
+            "storage_class": lambda row: row.update(duration=3600),
+            "count": lambda row: row.update(count=9),
+            "created_at": lambda row: row.update(created_at="changed-created"),
+            "updated_at": lambda row: row.update(updated_at="changed-updated"),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                connection = create_database(Path(directory) / "db.sqlite")
+                original = catalog_row("Action", "/mnt/t7/CRT-Media/a.mp4", "Show A", "Show A")
+                connection.execute(
+                    "INSERT INTO catalog_entries "
+                    "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                    "VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    [original[key] for key in original],
+                )
+                generated = catalog_row("Action", "/media/a.mp4", "Show A", "Show A")
+                mutate(generated)
+                active = reconcile_catalog(connection, "Action", [generated], set())
+                self.assertEqual(active, {2})
+                self.assertIsNone(connection.execute(
+                    "SELECT id FROM catalog_entries WHERE id=1"
+                ).fetchone())
+                connection.close()
+
+    def test_catalog_reuse_compares_break_and_chapter_metadata(self):
+        for changed_table in ("break_points", "chapter_points"):
+          with self.subTest(changed_table=changed_table), tempfile.TemporaryDirectory() as directory:
+            connection = create_database(Path(directory) / "db.sqlite")
+            original = catalog_row("Action", "/mnt/t7/CRT-Media/a.mp4", "Show A", "Show A")
+            connection.execute(
+                "INSERT INTO catalog_entries "
+                "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                "VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [original[key] for key in original],
+            )
+            identity = ("Action", "Show A", "crt-media:/a.mp4")
+            columns = ("path", "points", "last_updated")
+            original_meta = {identity: {
+                "file_meta": None, "file_meta_columns": (),
+                "break_points": ("crt-media:/a.mp4", "[1]", "t"),
+                "break_points_columns": columns,
+                "chapter_points": ("crt-media:/a.mp4", "[2]", "t"),
+                "chapter_points_columns": columns,
+            }}
+            changed = dict(original_meta[identity])
+            changed[changed_table] = ("crt-media:/a.mp4", "[9]", "t")
+            generated_meta = {identity: changed}
+            active = reconcile_catalog(
+                connection, "Action",
+                [catalog_row("Action", "/media/a.mp4", "Show A", "Show A")],
+                set(), original_media_metadata=original_meta,
+                generated_media_metadata=generated_meta,
+            )
+            self.assertEqual(active, {2})
+            connection.close()
+
+    def test_new_catalog_id_uses_maximum_and_sqlite_sequence_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = create_database(Path(directory) / "db.sqlite")
+            row = catalog_row("Old", "/mnt/t7/CRT-Media/old.mp4", "Old", "Old")
+            connection.execute(
+                "INSERT INTO catalog_entries "
+                "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                "VALUES (20,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [row[key] for key in row],
+            )
+            connection.execute("DELETE FROM catalog_entries WHERE id=20")
+            active = reconcile_catalog(
+                connection, "Action",
+                [catalog_row("Action", "/media/a.mp4", "A", "A")], set(),
+            )
+            self.assertEqual(active, {21})
+            self.assertEqual(connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='catalog_entries'"
+            ).fetchone()[0], 21)
+            connection.close()
+
+    def test_transient_native_ids_do_not_advance_provisional_allocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = create_database(Path(directory) / "db.sqlite")
+            transient = catalog_row("Action", "/media/transient.mp4", "Transient", "Transient")
+            connection.execute(
+                "INSERT INTO catalog_entries "
+                "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                "VALUES (99,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [transient[key] for key in transient],
+            )
+            active = reconcile_catalog(
+                connection, "Action",
+                [catalog_row("Action", "/media/a.mp4", "A", "A")], set(),
+                original_rows=[], allocation_floor=20,
+            )
+            self.assertEqual(active, {21})
+            self.assertEqual(connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name='catalog_entries'"
+            ).fetchone()[0], 21)
+            connection.close()
+
     def test_supported_and_unsupported_catalog_reference_shapes(self):
         self.assertEqual(parse_catalog_references("7"), (7,))
         self.assertEqual(parse_catalog_references("[7,8]"), (7, 8))
         for value in ("null", "true", "1.5", '"7"', "{}", "[]", "[7,[8]]", "0"):
             with self.subTest(value=value), self.assertRaises(StagedScheduleError):
                 parse_catalog_references(value)
+
+    def test_all_reference_shapes_are_checked_before_future_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = create_database(Path(directory) / "db.sqlite")
+            connection.execute(
+                "INSERT INTO liquid_blocks "
+                "(station,liquid_type,start_time,end_time,break_strategy,title,content_json,plan_json) "
+                "VALUES ('Action','LiquidBlock','2026-09-20','2026-09-21','end','bad','{}','[]')"
+            )
+            with self.assertRaisesRegex(StagedScheduleError, "unsupported catalog reference"):
+                validate_all_catalog_reference_shapes(connection)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM liquid_blocks").fetchone()[0], 1)
+            connection.close()
 
     def _populated_database(self, database, media):
         connection = create_database(database)

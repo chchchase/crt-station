@@ -93,6 +93,24 @@ def check_mount(target, expected_flag, expected_type=None):
         return result(False, exc)
 
 
+def check_stage_backed_tmp(stage_root):
+    try:
+        flags, fs_type = mount_info("/tmp")
+        temporary = Path("/tmp").stat()
+        staged = (Path(stage_root) / "transient").stat()
+        passed = (
+            "rw" in flags
+            and temporary.st_dev == staged.st_dev
+            and temporary.st_ino == staged.st_ino
+        )
+        return result(
+            passed,
+            f"flags={','.join(sorted(flags))}; type={fs_type}; stage-backed={passed}",
+        )
+    except Exception as exc:
+        return result(False, exc)
+
+
 def check_family_blocked(family):
     sock = None
     try:
@@ -187,7 +205,7 @@ def staging_operations(stage_root=Path("/stage")):
     return results
 
 
-def collect_probe_results(environment=None, stage_root=Path("/stage")):
+def collect_probe_results(environment=None, stage_root=Path("/stage"), *, stage_tmp=False):
     """Run the probe suite shared by preflight and schedule validation."""
     results = {}
     results["environment_sanitized"] = check_environment(environment)
@@ -198,7 +216,10 @@ def collect_probe_results(environment=None, stage_root=Path("/stage")):
     results["user_bus_not_exposed"] = result(not bus_exposed, "host user bus is absent")
     results["proc_private"] = check_mount("/proc", "rw", "proc")
     results["dev_private"] = check_mount("/dev", "rw", "tmpfs")
-    results["tmp_private"] = check_mount("/tmp", "rw", "tmpfs")
+    results["tmp_private"] = (
+        check_stage_backed_tmp(stage_root)
+        if stage_tmp else check_mount("/tmp", "rw", "tmpfs")
+    )
     results["project_mount_read_only"] = check_mount("/project", "ro")
     results["media_mount_read_only"] = check_mount("/media", "ro")
     results["staging_mount_writable"] = check_mount("/stage", "rw")
@@ -212,8 +233,12 @@ def collect_probe_results(environment=None, stage_root=Path("/stage")):
     return results
 
 
-def build_probe_payload(run_id, environment=None, stage_root=Path("/stage")):
-    results = collect_probe_results(environment=environment, stage_root=stage_root)
+def build_probe_payload(
+    run_id, environment=None, stage_root=Path("/stage"), *, stage_tmp=False
+):
+    results = collect_probe_results(
+        environment=environment, stage_root=stage_root, stage_tmp=stage_tmp
+    )
     return {
         "schema_version": PROBE_SCHEMA_VERSION,
         "run_id": run_id,
@@ -224,11 +249,14 @@ def build_probe_payload(run_id, environment=None, stage_root=Path("/stage")):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) != 2:
+    if len(argv) not in (2, 3):
         return 2
-    run_id, output_name = argv
+    run_id, output_name = argv[:2]
+    profile = argv[2] if len(argv) == 3 else "standard"
+    if profile not in ("standard", "native-single-run"):
+        return 2
     output = Path(output_name)
-    payload = build_probe_payload(run_id)
+    payload = build_probe_payload(run_id, stage_tmp=profile == "native-single-run")
     temporary = output.with_name(output.name + ".tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary, output)

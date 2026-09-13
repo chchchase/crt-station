@@ -8,6 +8,7 @@ import sys
 import time
 import uuid
 import fcntl
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,7 @@ STAGING_RE = re.compile(r"fs42-i-[0-9a-f]{12}\Z")
 STAGING_MAX_AGE_SECONDS = 6 * 60 * 60
 UNIT_TIMEOUT_SECONDS = 30
 CLEANUP_TIMEOUT_SECONDS = 10
+MAX_CAPTURE_BYTES = 64 * 1024
 PROBE_OUTPUT = "preflight-probe.json"
 class IsolationError(RuntimeError):
     pass
@@ -33,6 +35,10 @@ class LaunchResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    stdout_bytes: int = 0
+    stderr_bytes: int = 0
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
 
 def _utc_now():
@@ -99,37 +105,48 @@ def _is_absent_unit_message(value):
     return any(text in lowered for text in ("not found", "not loaded", "could not be found", "does not exist"))
 
 
-def _run_cleanup_command(argv, runner=subprocess.run):
+def _run_cleanup_command(argv):
     try:
-        completed = runner(argv, capture_output=True, text=True, timeout=CLEANUP_TIMEOUT_SECONDS)
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=CLEANUP_TIMEOUT_SECONDS)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     detail = (completed.stderr or completed.stdout).strip()
     return completed.returncode == 0 or _is_absent_unit_message(detail), detail
 
 
-def cleanup_unit(unit_name, runner=subprocess.run):
+def _unit_absent(unit_name):
+    try:
+        shown = subprocess.run(
+            ["systemctl", "--user", "show", "--property=LoadState", "--value", unit_name],
+            capture_output=True, text=True, timeout=CLEANUP_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    detail = (shown.stderr or shown.stdout).strip()
+    absent = shown.returncode != 0 and _is_absent_unit_message(detail)
+    absent = absent or (shown.returncode == 0 and shown.stdout.strip() == "not-found")
+    return absent, detail or "no output"
+
+
+def cleanup_unit(unit_name):
     details = []
     for action in ("stop", "reset-failed"):
         ok, detail = _run_cleanup_command(
-            ["systemctl", "--user", action, unit_name], runner=runner
+            ["systemctl", "--user", action, unit_name]
         )
         details.append(f"{action}: {detail or ('ok' if ok else 'failed')}")
-        if not ok:
-            return False, "; ".join(details)
-    try:
-        shown = runner(
-            ["systemctl", "--user", "show", "--property=LoadState", "--value", unit_name],
-            capture_output=True,
-            text=True,
-            timeout=CLEANUP_TIMEOUT_SECONDS,
+    absent, detail = _unit_absent(unit_name)
+    details.append(f"show: {detail}")
+    for signal in ("TERM", "KILL"):
+        if absent:
+            break
+        ok, detail = _run_cleanup_command(
+            ["systemctl", "--user", "kill", "--kill-who=all", f"--signal={signal}", unit_name]
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, "; ".join(details + [f"show: {exc}"])
-    show_text = (shown.stderr or shown.stdout).strip()
-    absent = shown.returncode != 0 and _is_absent_unit_message(show_text)
-    absent = absent or (shown.returncode == 0 and shown.stdout.strip() == "not-found")
-    details.append(f"show: {show_text or 'no output'}")
+        details.append(f"kill-{signal}: {detail or ('ok' if ok else 'failed')}")
+        _run_cleanup_command(["systemctl", "--user", "stop", unit_name])
+        absent, detail = _unit_absent(unit_name)
+        details.append(f"show-after-{signal}: {detail}")
     return absent, "; ".join(details)
 
 
@@ -143,7 +160,10 @@ def _safe_staging_directory(path, active_paths=()):
         info = path.lstat()
     except FileNotFoundError:
         return False
-    return stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid()
+    return (
+        stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid == os.getuid() and not (path / ".quarantine").exists()
+    )
 
 
 def cleanup_staging_directory(path, active_paths=()):
@@ -233,7 +253,87 @@ def sandbox_python(project_root):
     return _sandbox_python(project_root)
 
 
-def build_bwrap_command(project_root, staging_path, sandbox_argv):
+class HeldStageTemporary:
+    """An exclusively-created stage-local /tmp source held through launch."""
+
+    def __init__(self, staging_path):
+        supplied_stage = Path(staging_path)
+        try:
+            stage_info = supplied_stage.lstat()
+            expected_stage = STAGING_PARENT.resolve(strict=True) / supplied_stage.name
+            resolved_stage = supplied_stage.resolve(strict=True)
+        except OSError as exc:
+            raise IsolationError(f"could not verify staging directory: {exc}") from exc
+        if (
+            supplied_stage.name != resolved_stage.name
+            or not STAGING_RE.fullmatch(supplied_stage.name)
+            or resolved_stage != expected_stage
+            or not stat.S_ISDIR(stage_info.st_mode)
+            or stat.S_ISLNK(stage_info.st_mode)
+            or stage_info.st_uid != os.getuid()
+            or stat.S_IMODE(stage_info.st_mode) != 0o700
+        ):
+            raise IsolationError(f"refusing unsafe staging directory: {supplied_stage}")
+        self.stage = resolved_stage
+        self.path = self.stage / "transient"
+        self.descriptor = None
+        try:
+            os.mkdir(self.path, mode=0o700)
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            self.descriptor = os.open(self.path, flags)
+            info = os.fstat(self.descriptor)
+            self.identity = (info.st_dev, info.st_ino)
+            self.assert_ready()
+        except FileExistsError as exc:
+            raise IsolationError(
+                f"refusing pre-existing stage temporary path: {self.path}"
+            ) from exc
+        except Exception:
+            self.close()
+            try:
+                self.path.rmdir()
+            except OSError:
+                pass
+            raise
+
+    def assert_ready(self):
+        if self.descriptor is None:
+            raise IsolationError("stage temporary descriptor is closed")
+        try:
+            held = os.fstat(self.descriptor)
+            current = self.path.lstat()
+        except OSError as exc:
+            raise IsolationError(f"stage temporary path changed: {exc}") from exc
+        if (
+            not stat.S_ISDIR(held.st_mode)
+            or not stat.S_ISDIR(current.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or (current.st_dev, current.st_ino) != self.identity
+            or (held.st_dev, held.st_ino) != self.identity
+            or stat.S_IMODE(current.st_mode) != 0o700
+            or current.st_uid != os.getuid()
+        ):
+            raise IsolationError("stage temporary path identity or permissions changed")
+
+    def close(self):
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+
+def prepare_stage_temporary(staging_path):
+    return HeldStageTemporary(staging_path)
+
+
+def build_bwrap_command(
+    project_root, staging_path, sandbox_argv, *, stage_tmp=False,
+    verified_temporary=None,
+):
     project_root = Path(project_root).resolve()
     staging_path = Path(staging_path).resolve()
     command = [
@@ -248,6 +348,18 @@ def build_bwrap_command(project_root, staging_path, sandbox_argv):
     ]
     for path in _existing_runtime_mounts():
         command.extend(("--ro-bind", str(path), str(path)))
+    if stage_tmp:
+        if (
+            not isinstance(verified_temporary, HeldStageTemporary)
+            or verified_temporary.stage != staging_path
+        ):
+            raise IsolationError("stage-backed /tmp requires a held verified source")
+        verified_temporary.assert_ready()
+        temporary_mount = ("--bind", str(verified_temporary.path), "/tmp")
+    else:
+        if verified_temporary is not None:
+            raise IsolationError("ordinary tmpfs profile cannot accept a stage temporary source")
+        temporary_mount = ("--tmpfs", "/tmp")
     command.extend(
         (
             "--ro-bind", str(project_root), "/project",
@@ -255,7 +367,7 @@ def build_bwrap_command(project_root, staging_path, sandbox_argv):
             "--bind", str(staging_path), "/stage",
             "--proc", "/proc",
             "--dev", "/dev",
-            "--tmpfs", "/tmp",
+            *temporary_mount,
             "--chdir", "/stage",
             "--setenv", "PATH", "/usr/bin:/bin",
             "--setenv", "HOME", "/nonexistent",
@@ -276,43 +388,95 @@ def build_bwrap_command(project_root, staging_path, sandbox_argv):
 class IsolationLauncher:
     """The single Bubblewrap launcher intended for preflight and staged validation."""
 
-    def __init__(self, project_root, runner=subprocess.run):
+    def __init__(self, project_root):
         self.project_root = Path(project_root).resolve()
-        self.runner = runner
 
-    def run(self, staging_path, sandbox_argv, unit_name, timeout=UNIT_TIMEOUT_SECONDS):
-        bwrap = build_bwrap_command(self.project_root, staging_path, sandbox_argv)
-        command = [
-            "systemd-run",
-            "--user",
-            "--quiet",
-            "--wait",
-            "--collect",
-            "--pipe",
-            "--service-type=exec",
-            f"--unit={unit_name}",
-            "--property=RestrictAddressFamilies=AF_UNIX",
-            f"--property=RuntimeMaxSec={max(1, timeout - 5)}s",
-            "--",
-            *bwrap,
-        ]
+    def run(
+        self, staging_path, sandbox_argv, unit_name, timeout=UNIT_TIMEOUT_SECONDS,
+        *, stage_tmp=False,
+    ):
+        temporary = None
         try:
-            completed = self.runner(
-                command, capture_output=True, text=True, timeout=timeout
+            if stage_tmp:
+                temporary = prepare_stage_temporary(staging_path)
+            bwrap = build_bwrap_command(
+                self.project_root, staging_path, sandbox_argv,
+                stage_tmp=stage_tmp, verified_temporary=temporary,
             )
-            return LaunchResult(
-                unit_name, completed.returncode, completed.stdout, completed.stderr
-            )
-        except subprocess.TimeoutExpired as exc:
-            return LaunchResult(
-                unit_name,
-                124,
-                exc.stdout or "",
-                exc.stderr or "",
-                timed_out=True,
-            )
-        except OSError as exc:
-            return LaunchResult(unit_name, 127, "", str(exc))
+            command = [
+                "systemd-run",
+                "--user",
+                "--quiet",
+                "--wait",
+                "--collect",
+                "--pipe",
+                "--service-type=exec",
+                f"--unit={unit_name}",
+                "--property=RestrictAddressFamilies=AF_UNIX",
+                f"--property=RuntimeMaxSec={max(1, timeout - 5)}s",
+                "--",
+                *bwrap,
+            ]
+            result = _run_bounded(command, unit_name, timeout)
+            if temporary is not None:
+                temporary.assert_ready()
+            return result
+        finally:
+            if temporary is not None:
+                temporary.close()
+
+
+def _run_bounded(command, unit_name, timeout, limit=MAX_CAPTURE_BYTES):
+    """Drain both child streams fully while retaining only bounded prefixes."""
+    try:
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as exc:
+        return LaunchResult(unit_name, 127, "", str(exc), stderr_bytes=len(str(exc).encode()))
+    captures = {"stdout": bytearray(), "stderr": bytearray()}
+    totals = {"stdout": 0, "stderr": 0}
+    def drain(name, pipe):
+        while True:
+            chunk = pipe.read(65536)
+            if not chunk:
+                break
+            totals[name] += len(chunk)
+            available = max(0, limit - len(captures[name]))
+            captures[name].extend(chunk[:available])
+        pipe.close()
+    threads = [
+        threading.Thread(target=drain, args=("stdout", process.stdout)),
+        threading.Thread(target=drain, args=("stderr", process.stderr)),
+    ]
+    for thread in threads:
+        thread.start()
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+        returncode = 124
+    for thread in threads:
+        thread.join(timeout=5)
+    def decoded(name):
+        value = captures[name].decode("utf-8", errors="replace")
+        value = value.replace("/mnt/t7/CRT-Media", "crt-media:")
+        value = re.sub(r"/home/[^\s:]+", "/project/[redacted]", value)
+        value = re.sub(
+            r"(?i)\b(token|password|secret|api[_-]?key)\s*[:=]\s*[^\s]+",
+            r"\1=[REDACTED]", value,
+        )
+        return value
+    return LaunchResult(
+        unit_name, returncode, decoded("stdout"), decoded("stderr"), timed_out,
+        totals["stdout"], totals["stderr"], totals["stdout"] > limit,
+        totals["stderr"] > limit,
+    )
 
 
 def _failed_probe_results(detail):
@@ -421,14 +585,15 @@ def _write_reports(report_dir, report):
 
 def run_preflight(
     project_root,
-    runner=subprocess.run,
+    profile="standard",
     now=None,
-    context_checker=check_invocation_context,
 ):
+    if profile not in ("standard", "native-single-run"):
+        raise IsolationError(f"unknown isolation profile: {profile}")
     project_root = Path(project_root).resolve()
     run_id = _new_run_id()
     report_dir = _unique_report_directory(project_root, run_id)
-    outside_codex, invocation_detail = context_checker()
+    outside_codex, invocation_detail = check_invocation_context()
     stale_ok, stale_failures = True, []
     stage = None
     stage_lock = None
@@ -445,11 +610,15 @@ def run_preflight(
                 token, stage, stage_lock = _create_staging_directory()
                 unit_name = f"fs42-isolation-{token}.service"
                 python = _sandbox_python(project_root)
-                launcher = IsolationLauncher(project_root, runner=runner)
+                launcher = IsolationLauncher(project_root)
+                probe_argv = [python, "/project/station_director/isolation_probe.py", run_id, f"/stage/{PROBE_OUTPUT}"]
+                if profile == "native-single-run":
+                    probe_argv.append(profile)
                 launch = launcher.run(
                     stage,
-                    [python, "/project/station_director/isolation_probe.py", run_id, f"/stage/{PROBE_OUTPUT}"],
+                    probe_argv,
                     unit_name,
+                    stage_tmp=profile == "native-single-run",
                 )
                 probe_results, probe_error = _load_probe_output(stage / PROBE_OUTPUT, run_id)
             except (IsolationError, OSError) as exc:
@@ -462,7 +631,9 @@ def run_preflight(
             )
     finally:
         if unit_name is not None:
-            unit_cleanup = cleanup_unit(unit_name, runner=runner)
+            unit_cleanup = cleanup_unit(unit_name)
+        if stage is not None and not unit_cleanup[0] and stage.exists():
+            (stage / ".quarantine").touch(mode=0o600, exist_ok=True)
         if stage_lock is not None:
             stage_lock.close()
         if stage is not None and os.path.lexists(stage):
@@ -472,6 +643,7 @@ def run_preflight(
     bwrap_pass = launch.returncode == 0 and not launch.timed_out
     report = {
         "schema_version": 1,
+        "profile": profile,
         "run_id": run_id,
         "created_at": _utc_now().isoformat(),
         "result": "FAIL",

@@ -13,7 +13,7 @@ from fs42.media_processor import MediaProcessor
 from fs42.sequence_api import SequenceAPI
 from fs42.autobump_agent import AutoBumpAgent
 from fs42.slot_reader import SlotReader
-from fs42.scheduling_context import scheduling_random, validation_order
+from fs42.scheduling_context import in_validation_mode, scheduling_random, validation_order
 
 
 
@@ -94,9 +94,15 @@ class ShowCatalog:
                     if isinstance(entry, CatalogEntry):
                         flat_list.append(entry)
                     else:
+                        if in_validation_mode():
+                            raise TypeError(
+                                f"Entry {entry} on {tag} is not a CatalogEntry instance"
+                            )
                         print(f"Warning: Entry {entry} on {tag} is not a CatalogEntry instance. Skipping.")
 
             except Exception as e:
+                if in_validation_mode():
+                    raise
                 print(f"Error processing tag '{tag}': {e}")
 
         CatalogAPI.set_entries(self.config, flat_list)

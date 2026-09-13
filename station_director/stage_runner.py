@@ -24,6 +24,9 @@ from station_director.validation import _db_time, project_configuration
 REQUEST_SCHEMA_VERSION = 1
 RESULT_SCHEMA_VERSION = 1
 DISABLED_MESSAGE = "Phase 3 validation is not yet enabled"
+PROJECT_ROOT = Path("/project")
+STAGE_ROOT = Path("/stage")
+MEDIA_ROOT = Path("/media")
 
 
 def _write_result(path, payload):
@@ -108,12 +111,10 @@ def _load_configurations(config_root):
 def run_worker(
     request_path,
     result_path,
-    *,
-    project_root=Path("/project"),
-    stage_root=Path("/stage"),
-    media_root=Path("/media"),
-    probe_builder=build_probe_payload,
 ):
+    project_root = PROJECT_ROOT
+    stage_root = STAGE_ROOT
+    media_root = MEDIA_ROOT
     request = _load_request(request_path)
     run_id = request["run_id"]
     proposal = request["proposal"]
@@ -130,7 +131,7 @@ def run_worker(
         "validation_context": request["validation_context"],
     }
     try:
-        probes = probe_builder(run_id, stage_root=stage_root)
+        probes = build_probe_payload(run_id, stage_root=stage_root)
         payload["probe_attestation"] = probes
         if not probes.get("overall_pass"):
             payload["failure"] = "Isolation probe attestation failed; " + DISABLED_MESSAGE
@@ -151,6 +152,24 @@ def run_worker(
         projected, affected, unused_sources = project_configuration(
             configs, proposal, request["policy"]
         )
+        native_checks = importlib.import_module(
+            "station_director.native_config_checks"
+        )
+        station_schema = json.loads(
+            (Path(project_root) / "fs42/station_config_schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        native_failures = native_checks.validate_processed_configurations(
+            projected, station_schema
+        )
+        unresolved, resolution_errors = native_checks.newly_unresolved_source_slots(
+            configs, projected, unused_sources, proposal
+        )
+        native_failures.extend(unresolved)
+        native_failures.extend(resolution_errors)
+        if native_failures:
+            raise ValueError("; ".join(sorted(set(native_failures))))
         mapping_rows = []
         for name in sorted(projected):
             unused_mapped, mappings = map_station_config(

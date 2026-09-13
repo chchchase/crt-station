@@ -27,7 +27,8 @@ class FakeRunner:
                 raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
             bind_index = argv.index("--bind")
             stage = Path(argv[bind_index + 1])
-            run_id = argv[-2]
+            probe_index = argv.index("/project/station_director/isolation_probe.py")
+            run_id = argv[probe_index + 1]
             results = {
                 name: {"passed": True, "detail": f"verified {name}"}
                 for name in isolation.PROBE_RESULTS
@@ -50,23 +51,71 @@ class FakeRunner:
         if argv[:3] == ["systemctl", "--user", "stop"] and self.mode == "cleanup_failure":
             return completed(argv, 1, stderr="permission denied")
         if argv[:3] == ["systemctl", "--user", "show"]:
+            if self.mode == "cleanup_failure":
+                return completed(argv, 0, stdout="loaded\n")
             return completed(argv, 1, stderr="Unit could not be found")
         return completed(argv, 1, stderr="Unit not loaded")
 
 
 class IsolationTests(unittest.TestCase):
-    def run_mocked_preflight(self, directory, mode="success"):
+    def run_mocked_preflight(self, directory, mode="success", profile="standard"):
         root = Path(directory)
         (root / "runtime/director").mkdir(parents=True, exist_ok=True)
         staging_parent = root / "tmp"
         staging_parent.mkdir(exist_ok=True)
         runner = FakeRunner(mode)
-        context_checker = lambda: (True, "test SSH context")
-        with patch.object(isolation, "STAGING_PARENT", staging_parent):
-            report, json_path, text_path = isolation.run_preflight(
-                root, runner=runner, context_checker=context_checker
-            )
+        def launch(unused_launcher, stage, argv, unit, timeout=30, stage_tmp=False):
+            temporary = isolation.prepare_stage_temporary(stage) if stage_tmp else None
+            try:
+                bwrap = isolation.build_bwrap_command(
+                    root, stage, argv, stage_tmp=stage_tmp,
+                    verified_temporary=temporary,
+                )
+            finally:
+                if temporary is not None:
+                    temporary.close()
+            command = [
+                "systemd-run", "--property=RestrictAddressFamilies=AF_UNIX",
+                *bwrap,
+            ]
+            try:
+                value = runner(command, timeout=timeout)
+                return isolation.LaunchResult(unit, value.returncode, value.stdout, value.stderr)
+            except subprocess.TimeoutExpired:
+                return isolation.LaunchResult(unit, 124, "", "", timed_out=True)
+        with patch.object(isolation, "STAGING_PARENT", staging_parent), patch.object(
+            isolation, "check_invocation_context", return_value=(True, "test SSH context")
+        ), patch.object(isolation.IsolationLauncher, "run", autospec=True, side_effect=launch), patch.object(
+            isolation.subprocess, "run", side_effect=runner
+        ):
+            report, json_path, text_path = isolation.run_preflight(root, profile=profile)
         return report, json_path, text_path, runner, staging_parent
+
+    def test_native_single_run_profile_creates_stage_tmp_before_bind_and_cleans_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report, unused_json, unused_text, runner, staging_parent = self.run_mocked_preflight(
+                directory, profile="native-single-run"
+            )
+            self.assertEqual(report["result"], "PASS")
+            self.assertEqual(report["profile"], "native-single-run")
+            systemd_call = next(call for call in runner.calls if call[0] == "systemd-run")
+            transient_sources = [
+                systemd_call[index + 1]
+                for index, value in enumerate(systemd_call[:-2])
+                if value == "--bind" and systemd_call[index + 2] == "/tmp"
+            ]
+            self.assertEqual(len(transient_sources), 1)
+            self.assertTrue(transient_sources[0].endswith("/transient"))
+            self.assertFalse(any(staging_parent.iterdir()))
+
+    def test_native_single_run_launch_failure_still_cleans_stage_tmp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report, unused_json, unused_text, unused_runner, staging_parent = self.run_mocked_preflight(
+                directory, mode="failure", profile="native-single-run"
+            )
+            self.assertEqual(report["result"], "FAIL")
+            self.assertTrue(report["cleanup"]["staging"]["passed"])
+            self.assertFalse(any(staging_parent.iterdir()))
 
     def test_success_requires_launcher_probe_reports_and_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -112,13 +161,14 @@ class IsolationTests(unittest.TestCase):
                 self.assertEqual(report["result"], "FAIL")
                 self.assertTrue(report["probe_output_error"])
 
-    def test_real_cleanup_error_fails_but_staging_is_removed(self):
+    def test_real_cleanup_error_quarantines_staging(self):
         with tempfile.TemporaryDirectory() as directory:
             report, unused_json, unused_text, unused_runner, staging_parent = self.run_mocked_preflight(directory, "cleanup_failure")
             self.assertEqual(report["result"], "FAIL")
             self.assertFalse(report["cleanup"]["unit"]["passed"])
-            self.assertTrue(report["cleanup"]["staging"]["passed"])
-            self.assertFalse(any(staging_parent.iterdir()))
+            self.assertFalse(report["cleanup"]["staging"]["passed"])
+            retained = list(staging_parent.iterdir())
+            self.assertEqual(len(retained), 1)
 
     def test_stale_cleanup_checks_shape_owner_symlinks_and_active_lock(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -164,7 +214,8 @@ class IsolationTests(unittest.TestCase):
 
     def test_collected_unit_is_a_successful_cleanup(self):
         runner = FakeRunner()
-        ok, detail = isolation.cleanup_unit("already-collected.service", runner=runner)
+        with patch.object(isolation.subprocess, "run", side_effect=runner):
+            ok, detail = isolation.cleanup_unit("already-collected.service")
         self.assertTrue(ok, detail)
 
     def test_report_directories_are_unique_and_do_not_overwrite(self):
@@ -247,11 +298,10 @@ class IsolationTests(unittest.TestCase):
             root = Path(directory)
             (root / "runtime/director").mkdir(parents=True)
             runner = FakeRunner()
-            report, unused_json, unused_text = isolation.run_preflight(
-                root,
-                runner=runner,
-                context_checker=lambda: (False, "Codex detected"),
-            )
+            with patch.object(
+                isolation, "check_invocation_context", return_value=(False, "Codex detected")
+            ):
+                report, unused_json, unused_text = isolation.run_preflight(root)
             self.assertEqual(report["result"], "FAIL")
             self.assertFalse(report["verified_outside_codex"])
             self.assertFalse(any(call[0] == "systemd-run" for call in runner.calls))

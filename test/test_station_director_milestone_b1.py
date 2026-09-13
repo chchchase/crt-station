@@ -179,6 +179,8 @@ class WorkerTests(unittest.TestCase):
                 }
             }
             (project / "confs/action.json").write_text(json.dumps(config))
+            (project / "fs42").mkdir()
+            (project / "fs42/station_config_schema.json").write_text("{}")
             policy = {"channels": [{"number": 2, "name": "Action"}]}
             request = {
                 "schema_version": 1,
@@ -204,14 +206,24 @@ class WorkerTests(unittest.TestCase):
             ), patch(
                 "station_director.stage_runner.capture_channel_history",
                 return_value=history,
+            ), patch(
+                "station_director.native_config_checks.validate_processed_configurations",
+                return_value=[],
+            ), patch(
+                "station_director.native_config_checks.newly_unresolved_source_slots",
+                return_value=([], []),
+            ), patch(
+                "station_director.stage_runner.PROJECT_ROOT", project,
+            ), patch(
+                "station_director.stage_runner.STAGE_ROOT", stage,
+            ), patch(
+                "station_director.stage_runner.MEDIA_ROOT", media,
+            ), patch(
+                "station_director.stage_runner.build_probe_payload", side_effect=passing_probes,
             ):
                 payload = run_worker(
                     request_path,
                     result_path,
-                    project_root=project,
-                    stage_root=stage,
-                    media_root=media,
-                    probe_builder=passing_probes,
                 )
             self.assertEqual(payload["status"], "disabled")
             self.assertEqual(payload["failure"], DISABLED_MESSAGE)
@@ -243,14 +255,10 @@ class WorkerTests(unittest.TestCase):
                     }
                 )
             )
-            payload = run_worker(
-                request_path,
-                result_path,
-                project_root=stage / "missing-project",
-                stage_root=stage,
-                media_root=stage / "missing-media",
-                probe_builder=failed,
-            )
+            with patch("station_director.stage_runner.STAGE_ROOT", stage), patch(
+                "station_director.stage_runner.build_probe_payload", side_effect=failed
+            ):
+                payload = run_worker(request_path, result_path)
             self.assertEqual(payload["status"], "failed")
             self.assertFalse(payload["path_validation"]["passed"])
 

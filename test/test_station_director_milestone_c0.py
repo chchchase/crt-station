@@ -254,7 +254,7 @@ class SchedulingContextTests(unittest.TestCase):
                 sequence_api.SequenceAPI._build_sequence(station, "show", slot)
             return [call.args[2] for call in sequence_io.delete_sequence.call_args_list]
 
-        self.assertEqual(run_once(), list(set(children)))
+        self.assertCountEqual(run_once(), children)
         self.assertEqual(run_once(context()), sorted(children))
 
     def test_catalog_tie_order_changes_only_in_validation_context(self):
@@ -593,14 +593,13 @@ class ImportBoundaryTests(unittest.TestCase):
             result = Path(directory) / "result.json"
             with patch(
                 "station_director.stage_runner._load_native_validation_context"
-            ) as loader:
+            ) as loader, patch(
+                "station_director.stage_runner.build_probe_payload",
+                side_effect=lambda run_id, **unused: probe_payload(run_id, False),
+            ):
                 run_worker(
                     self._request(directory),
                     result,
-                    project_root=Path(directory) / "missing",
-                    stage_root=directory,
-                    media_root=Path(directory) / "missing-media",
-                    probe_builder=lambda run_id, **unused: probe_payload(run_id, False),
                 )
             loader.assert_not_called()
 
@@ -618,14 +617,10 @@ class ImportBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch(
             "station_director.stage_runner._load_native_validation_context",
             side_effect=load_context,
-        ):
+        ), patch("station_director.stage_runner.build_probe_payload", side_effect=probes):
             run_worker(
                 self._request(directory),
                 Path(directory) / "result.json",
-                project_root=Path(directory) / "missing",
-                stage_root=directory,
-                media_root=Path(directory) / "missing-media",
-                probe_builder=probes,
             )
         self.assertEqual(events, ["probes", "native-import"])
 
@@ -637,14 +632,13 @@ class ImportBoundaryTests(unittest.TestCase):
             request_path.write_text(json.dumps(request))
             with patch(
                 "station_director.stage_runner._load_native_validation_context"
-            ) as loader:
+            ) as loader, patch(
+                "station_director.stage_runner.build_probe_payload",
+                side_effect=lambda run_id, **unused: probe_payload(run_id),
+            ):
                 payload = run_worker(
                     request_path,
                     Path(directory) / "result.json",
-                    project_root=Path(directory) / "missing",
-                    stage_root=directory,
-                    media_root=Path(directory) / "missing-media",
-                    probe_builder=lambda run_id, **unused: probe_payload(run_id),
                 )
         loader.assert_not_called()
         self.assertEqual(payload["status"], "failed")

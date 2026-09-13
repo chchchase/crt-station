@@ -1,0 +1,108 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://crt-station.invalid/schemas/native-single-run.request.v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "operation", "run_id", "proposal", "policy", "seed_inputs", "input_fingerprints", "affected_channels", "validation_context", "request_digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "operation": {"const": "native_single_run"},
+    "run_id": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$"},
+    "proposal": {"$ref": "https://crt-station.invalid/schemas/proposal.v2.schema.json"},
+    "policy": {"$ref": "#/$defs/policy"},
+    "seed_inputs": {"$ref": "#/$defs/seed_inputs"},
+    "input_fingerprints": {"$ref": "#/$defs/input_fingerprints"},
+    "affected_channels": {
+      "type": "array", "minItems": 1, "maxItems": 6, "uniqueItems": true,
+      "items": {"$ref": "#/$defs/affected_channel"}
+    },
+    "validation_context": {"$ref": "#/$defs/context"},
+    "request_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "seed_inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["logical_protected_configuration_fingerprint", "logical_database_fingerprint", "logical_media_manifest_fingerprint"],
+      "properties": {
+        "logical_protected_configuration_fingerprint": {"$ref": "#/$defs/digest"},
+        "logical_database_fingerprint": {"$ref": "#/$defs/digest"},
+        "logical_media_manifest_fingerprint": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "input_fingerprints": {
+      "type": "object", "additionalProperties": false,
+      "required": ["original_logical_configuration_fingerprint", "original_logical_database_fingerprint", "logical_media_manifest_fingerprint", "live_physical_configuration_fingerprint", "staged_source_physical_configuration_fingerprint"],
+      "properties": {
+        "original_logical_configuration_fingerprint": {"$ref": "#/$defs/digest"},
+        "original_logical_database_fingerprint": {"$ref": "#/$defs/digest"},
+        "logical_media_manifest_fingerprint": {"$ref": "#/$defs/digest"},
+        "live_physical_configuration_fingerprint": {"$ref": "#/$defs/digest"},
+        "staged_source_physical_configuration_fingerprint": {"$ref": "#/$defs/digest"}
+      }
+    },
+    "affected_channel": {
+      "type": "object", "additionalProperties": false,
+      "required": ["number", "name"],
+      "properties": {
+        "number": {"type": "integer", "enum": [2, 3, 4, 5, 6, 7]},
+        "name": {"enum": ["Action", "After School", "Anime", "Cartoon Network", "Disney", "Late Night"]}
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_fingerprint", "requested_seed", "effective_seed", "reference_clock", "start_time", "end_time", "timezone", "python_hash_seed", "validation_mode"],
+      "properties": {
+        "input_fingerprint": {"$ref": "#/$defs/digest"},
+        "requested_seed": {"type": "integer"},
+        "effective_seed": {"type": "integer", "minimum": 0},
+        "reference_clock": {"type": "string", "minLength": 1},
+        "start_time": {"type": "string", "minLength": 1},
+        "end_time": {"type": "string", "minLength": 1},
+        "timezone": {"const": "America/Los_Angeles"},
+        "python_hash_seed": {"const": "0"},
+        "validation_mode": {"const": true}
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "series_assignment_policy", "inventory_excluded_roots", "watch_in_order_series", "channels"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "series_assignment_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["exclusive_across_active_channels", "watch_in_order_included", "require_transfer_report_before_change", "normal_proposals_may_modify_watch_in_order"],
+          "properties": {
+            "exclusive_across_active_channels": {"type": "boolean"},
+            "watch_in_order_included": {"type": "boolean"},
+            "require_transfer_report_before_change": {"type": "boolean"},
+            "normal_proposals_may_modify_watch_in_order": {"type": "boolean"}
+          }
+        },
+        "inventory_excluded_roots": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "watch_in_order_series": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "channels": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["number", "name", "accepts_recommendations", "has_schedule", "keywords"],
+            "properties": {
+              "number": {"type": "integer", "minimum": 1, "maximum": 8},
+              "name": {"type": "string", "minLength": 1},
+              "accepts_recommendations": {"type": "boolean"},
+              "has_schedule": {"type": "boolean"},
+              "keywords": {"type": "array", "items": {"type": "string"}}
+            }
+          }
+        }
+      }
+    }
+  }
+}

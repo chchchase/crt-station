@@ -233,6 +233,17 @@ def logical_database_fingerprint(connection):
     }
 
 
+def canonical_foreign_key_findings(connection):
+    """Return complete typed FK findings for exact baseline comparison."""
+    rows = connection.execute("PRAGMA foreign_key_check").fetchall()
+    return tuple(
+        sorted(
+            (tuple(canonical_sqlite_value(value) for value in row) for row in rows),
+            key=lambda row: b"".join(row),
+        )
+    )
+
+
 def fingerprint_database(path):
     diagnostic = raw_database_metadata(path)
     with readonly_database(path) as connection:

@@ -49,7 +49,11 @@ def build_parser():
 
     isolation = subcommands.add_parser("isolation", help="Check the schedule isolation boundary")
     isolation_commands = isolation.add_subparsers(dest="isolation_command", required=True)
-    isolation_commands.add_parser("preflight", help="Exercise the shared Bubblewrap launcher")
+    preflight = isolation_commands.add_parser("preflight", help="Exercise the shared Bubblewrap launcher")
+    preflight.add_argument(
+        "--profile", choices=("standard", "native-single-run"), default="standard",
+        help="Isolation mount profile to attest",
+    )
 
     schedule = subcommands.add_parser("schedule", help="Plan and validate schedule proposals")
     schedule_commands = schedule.add_subparsers(dest="schedule_command", required=True)
@@ -134,7 +138,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         if args.command == "isolation" and args.isolation_command == "preflight":
-            report, json_path, text_path = run_preflight(ROOT)
+            report, json_path, text_path = run_preflight(ROOT, profile=args.profile)
             print(f"Result: {report['result']}")
             print(f"JSON: {json_path.relative_to(ROOT)}")
             print(f"Text: {text_path.relative_to(ROOT)}")
