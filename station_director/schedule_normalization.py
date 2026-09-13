@@ -143,6 +143,16 @@ def _canonical(value):
                       separators=(",", ":")).encode("utf-8")
 
 
+def canonical_typed_value_bytes(value):
+    """Public C2/C3 canonical scalar/container encoding contract."""
+    return _canonical(value)
+
+
+def canonical_catalog_semantics(connection, columns, row):
+    """Return the complete normalized catalog/media semantics for one row."""
+    return _catalog_semantics(connection, columns, row)
+
+
 def _quote(value):
     return '"' + str(value).replace('"', '""') + '"'
 

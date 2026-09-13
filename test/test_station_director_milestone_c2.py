@@ -982,11 +982,61 @@ class NormalizationTests(unittest.TestCase):
 
 
 class DualRunLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.baseline_summary = {
+            "status": "pass", "channels": [{
+                "number": 2, "name": "Action",
+                "channel_seed": 9,
+                "regeneration_start": "2026-09-14 00:00:00",
+                "effective_horizon": "2026-09-21 00:00:00",
+                "retained_pre_seam_blocks": 0,
+                "boundary_crossing": {"baseline_start": 0, "proposed_start": 0,
+                                      "baseline_horizon": 0, "proposed_horizon": 0},
+                "counts": {"baseline_blocks": 1, "proposed_blocks": 1,
+                           "components": 1, "unchanged_blocks": 1,
+                           "replaced_pairs": 0, "removed_blocks": 0,
+                           "generated_blocks": 0, "reshaped_components": 0,
+                           "reshaped_baseline_blocks": 0,
+                           "reshaped_proposed_blocks": 0,
+                           "title_changes": 0, "selected_media_changes": 0,
+                           "playback_plan_changes": 0, "block_type_changes": 0,
+                           "sequence_changes": 0, "break_changes": 0},
+                "coverage": {side: {"covered_us": 604800000000,
+                                    "gap_count": 0, "gap_us": 0,
+                                    "overlap_count": 0, "overlap_us": 0,
+                                    "interval_us": 604800000000,
+                                    "finding_digest": "d" * 64}
+                             for side in ("baseline", "proposed")},
+                "samples": {"replaced": [], "reshaped": []},
+                "samples_truncated": False, "baseline_findings": [], "errors": [],
+                "digest": "b" * 64,
+            }],
+            "requested_configuration_effects": [],
+            "resulting_schedule_changes": {
+                "changed_channels": 0, "unchanged_blocks": 1,
+                "replaced_pairs": 0, "removed_blocks": 0, "generated_blocks": 0,
+                "reshaped_components": 0, "title_changes": 0,
+                "selected_media_changes": 0, "playback_plan_changes": 0,
+                "block_type_changes": 0, "sequence_changes": 0, "break_changes": 0,
+            },
+            "unexpected_differences": [], "digest": "c" * 64,
+        }
+        self.baseline_patch = patch(
+            "station_director.dual_run.compare_baseline_to_proposed",
+            return_value=self.baseline_summary,
+        )
+        self.baseline_patch.start()
+        self.addCleanup(self.baseline_patch.stop)
+
     def _scope(self, root, events, *, cleanup_failure=False):
         context = {
             "input_fingerprint": "1" * 64,
             "requested_seed": 42,
             "effective_seed": 7,
+            "reference_clock": "2026-09-14 00:00:00-07:00",
+            "start_time": "2026-09-14 00:00:00",
+            "end_time": "2026-09-21 00:00:00",
+            "timezone": "America/Los_Angeles",
         }
         affected = [{"number": 2, "name": "Action"}]
         lifecycles = []
@@ -1005,8 +1055,9 @@ class DualRunLifecycleTests(unittest.TestCase):
 
             def cleanup_stages(self):
                 self.cleanup_results = [
-                    {"run": 2, "passed": not cleanup_failure, "detail": "run 2"},
-                    {"run": 1, "passed": True, "detail": "run 1"},
+                    {"run": 2, "passed": not cleanup_failure,
+                     "quarantined": cleanup_failure, "detail": "run 2"},
+                    {"run": 1, "passed": True, "quarantined": False, "detail": "run 1"},
                 ]
                 events.append("cleanup")
                 if cleanup_failure:
@@ -1060,8 +1111,8 @@ class DualRunLifecycleTests(unittest.TestCase):
             self.assertEqual(result["scheduler_invoked"], {"run_1": True, "run_2": True})
             self.assertLess(events.index("settle-1"), events.index("launch-2"))
             self.assertEqual(result["cleanup"], [
-                {"run": 2, "passed": True, "detail": "run 2"},
-                {"run": 1, "passed": True, "detail": "run 1"},
+                {"run": 2, "passed": True, "quarantined": False, "detail": "run 2"},
+                {"run": 1, "passed": True, "quarantined": False, "detail": "run 1"},
             ])
 
     def test_input_change_between_runs_is_not_nondeterminism(self):

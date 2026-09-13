@@ -1,0 +1,2001 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://crt-station.invalid/schemas/validation-report.v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "report_type",
+    "software",
+    "proposal",
+    "validation",
+    "phases",
+    "context",
+    "channels",
+    "channel_seeds",
+    "requested_configuration_effects",
+    "resulting_schedule_changes",
+    "baseline_comparison",
+    "reproducibility",
+    "guide_validation",
+    "preservation",
+    "source_stability",
+    "findings",
+    "timings_ms",
+    "cleanup",
+    "publication"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "report_type": {
+      "const": "station_director_validation"
+    },
+    "software": {
+      "$ref": "#/$defs/software"
+    },
+    "proposal": {
+      "$ref": "#/$defs/proposal"
+    },
+    "validation": {
+      "$ref": "#/$defs/validation"
+    },
+    "context": {
+      "$ref": "#/$defs/context"
+    },
+    "channels": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "$ref": "#/$defs/channel"
+      }
+    },
+    "channel_seeds": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "$ref": "#/$defs/channel_seed"
+      }
+    },
+    "requested_configuration_effects": {
+      "$ref": "#/$defs/effects"
+    },
+    "resulting_schedule_changes": {
+      "$ref": "#/$defs/resulting"
+    },
+    "baseline_comparison": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/baseline"
+        }
+      ]
+    },
+    "reproducibility": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/reproducibility"
+        }
+      ]
+    },
+    "guide_validation": {
+      "$ref": "#/$defs/guide_pair"
+    },
+    "preservation": {
+      "$ref": "#/$defs/preservation"
+    },
+    "findings": {
+      "$ref": "#/$defs/finding_groups"
+    },
+    "timings_ms": {
+      "$ref": "#/$defs/timings"
+    },
+    "cleanup": {
+      "$ref": "#/$defs/cleanup_pair"
+    },
+    "publication": {
+      "$ref": "#/$defs/publication"
+    },
+    "phases": {
+      "$ref": "#/$defs/phases"
+    },
+    "source_stability": {
+      "$ref": "#/$defs/source_stability"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "status": {
+                "const": "success"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "phase_reached": {
+                "const": "complete"
+              },
+              "scheduler_invoked": {
+                "properties": {
+                  "run_1": {
+                    "const": true
+                  },
+                  "run_2": {
+                    "const": true
+                  }
+                }
+              },
+              "live_inputs_changed": {
+                "const": false
+              }
+            }
+          },
+          "phases": {
+            "properties": {
+              "capture": {
+                "const": "completed"
+              },
+              "run_1": {
+                "const": "completed"
+              },
+              "run_2": {
+                "const": "completed"
+              },
+              "guide_validation": {
+                "const": "completed"
+              },
+              "reproducibility": {
+                "const": "completed"
+              },
+              "baseline_comparison": {
+                "const": "completed"
+              },
+              "cleanup": {
+                "const": "completed"
+              },
+              "source_stability": {
+                "const": "completed"
+              }
+            }
+          },
+          "channels": {
+            "minItems": 1,
+            "items": {
+              "properties": {
+                "errors": {
+                  "maxItems": 0
+                }
+              }
+            }
+          },
+          "channel_seeds": {
+            "minItems": 1
+          },
+          "baseline_comparison": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/baseline"
+              },
+              {
+                "properties": {
+                  "runs_matched": {
+                    "const": true
+                  }
+                }
+              }
+            ]
+          },
+          "reproducibility": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/reproducibility"
+              },
+              {
+                "properties": {
+                  "passed": {
+                    "const": true
+                  }
+                }
+              }
+            ]
+          },
+          "guide_validation": {
+            "properties": {
+              "run_1": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/guide"
+                  },
+                  {
+                    "properties": {
+                      "run": {
+                        "const": 1
+                      },
+                      "status": {
+                        "const": "pass"
+                      },
+                      "digest": {
+                        "$ref": "#/$defs/digest"
+                      },
+                      "record_count": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "byte_count": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              "run_2": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/guide"
+                  },
+                  {
+                    "properties": {
+                      "run": {
+                        "const": 2
+                      },
+                      "status": {
+                        "const": "pass"
+                      },
+                      "digest": {
+                        "$ref": "#/$defs/digest"
+                      },
+                      "record_count": {
+                        "type": "integer",
+                        "minimum": 1
+                      },
+                      "byte_count": {
+                        "type": "integer",
+                        "minimum": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              "comparison": {
+                "properties": {
+                  "status": {
+                    "const": "passed"
+                  }
+                }
+              }
+            }
+          },
+          "preservation": {
+            "properties": {
+              "run_1": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/preservation_run"
+                  },
+                  {
+                    "properties": {
+                      "run": {
+                        "const": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              "run_2": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/preservation_run"
+                  },
+                  {
+                    "properties": {
+                      "run": {
+                        "const": 2
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "source_stability": {
+            "properties": {
+              "after_capture": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/source_check"
+                  },
+                  {
+                    "properties": {
+                      "checkpoint": {
+                        "const": "after_capture"
+                      },
+                      "passed": {
+                        "const": true
+                      }
+                    }
+                  }
+                ]
+              },
+              "between_runs": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/source_check"
+                  },
+                  {
+                    "properties": {
+                      "checkpoint": {
+                        "const": "between_runs"
+                      },
+                      "passed": {
+                        "const": true
+                      }
+                    }
+                  }
+                ]
+              },
+              "after_run_2": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/source_check"
+                  },
+                  {
+                    "properties": {
+                      "checkpoint": {
+                        "const": "after_run_2"
+                      },
+                      "passed": {
+                        "const": true
+                      }
+                    }
+                  }
+                ]
+              },
+              "before_success": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/source_check"
+                  },
+                  {
+                    "properties": {
+                      "checkpoint": {
+                        "const": "before_success"
+                      },
+                      "passed": {
+                        "const": true
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "cleanup": {
+            "properties": {
+              "run_1": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/cleanup"
+                  },
+                  {
+                    "properties": {
+                      "run": {
+                        "const": 1
+                      },
+                      "passed": {
+                        "const": true
+                      },
+                      "quarantined": {
+                        "const": false
+                      },
+                      "diagnostic": {
+                        "type": "null"
+                      }
+                    }
+                  }
+                ]
+              },
+              "run_2": {
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/cleanup"
+                  },
+                  {
+                    "properties": {
+                      "run": {
+                        "const": 2
+                      },
+                      "passed": {
+                        "const": true
+                      },
+                      "quarantined": {
+                        "const": false
+                      },
+                      "diagnostic": {
+                        "type": "null"
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "findings": {
+            "properties": {
+              "unexpected_differences": {
+                "maxItems": 0
+              },
+              "errors": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "phase_reached": {
+                "not": {
+                  "const": "complete"
+                }
+              }
+            }
+          },
+          "findings": {
+            "properties": {
+              "errors": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              },
+              "phase_reached": {
+                "const": "capture"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "scheduler_invoked": {
+                "properties": {
+                  "run_1": {
+                    "const": false
+                  },
+                  "run_2": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          },
+          "phases": {
+            "properties": {
+              "capture": {
+                "enum": [
+                  "attempted",
+                  "failed"
+                ]
+              },
+              "run_1": {
+                "const": "unavailable"
+              },
+              "run_2": {
+                "const": "unavailable"
+              },
+              "guide_validation": {
+                "const": "unavailable"
+              },
+              "reproducibility": {
+                "const": "unavailable"
+              },
+              "baseline_comparison": {
+                "const": "unavailable"
+              }
+            }
+          },
+          "guide_validation": {
+            "properties": {
+              "run_1": {
+                "type": "null"
+              },
+              "run_2": {
+                "type": "null"
+              },
+              "comparison": {
+                "properties": {
+                  "status": {
+                    "const": "unavailable"
+                  }
+                }
+              }
+            }
+          },
+          "reproducibility": {
+            "type": "null"
+          },
+          "baseline_comparison": {
+            "type": "null"
+          },
+          "preservation": {
+            "properties": {
+              "run_1": {
+                "type": "null"
+              },
+              "run_2": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              },
+              "phase_reached": {
+                "const": "run_1"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "scheduler_invoked": {
+                "properties": {
+                  "run_2": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          },
+          "phases": {
+            "properties": {
+              "capture": {
+                "const": "completed"
+              },
+              "run_1": {
+                "enum": [
+                  "attempted",
+                  "failed"
+                ]
+              },
+              "run_2": {
+                "const": "unavailable"
+              },
+              "guide_validation": {
+                "const": "unavailable"
+              },
+              "reproducibility": {
+                "const": "unavailable"
+              },
+              "baseline_comparison": {
+                "const": "unavailable"
+              }
+            }
+          },
+          "guide_validation": {
+            "properties": {
+              "run_1": {
+                "type": "null"
+              },
+              "run_2": {
+                "type": "null"
+              },
+              "comparison": {
+                "properties": {
+                  "status": {
+                    "const": "unavailable"
+                  }
+                }
+              }
+            }
+          },
+          "reproducibility": {
+            "type": "null"
+          },
+          "baseline_comparison": {
+            "type": "null"
+          },
+          "preservation": {
+            "properties": {
+              "run_1": {
+                "type": "null"
+              },
+              "run_2": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              },
+              "phase_reached": {
+                "const": "run_2"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "phases": {
+            "properties": {
+              "capture": {
+                "const": "completed"
+              },
+              "run_1": {
+                "const": "completed"
+              },
+              "run_2": {
+                "enum": [
+                  "attempted",
+                  "failed"
+                ]
+              },
+              "reproducibility": {
+                "const": "unavailable"
+              },
+              "baseline_comparison": {
+                "const": "unavailable"
+              }
+            }
+          },
+          "reproducibility": {
+            "type": "null"
+          },
+          "baseline_comparison": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              },
+              "phase_reached": {
+                "const": "normalization"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "phases": {
+            "properties": {
+              "reproducibility": {
+                "const": "unavailable"
+              },
+              "baseline_comparison": {
+                "const": "unavailable"
+              }
+            }
+          },
+          "reproducibility": {
+            "type": "null"
+          },
+          "baseline_comparison": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              },
+              "phase_reached": {
+                "const": "comparison"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "phases": {
+            "properties": {
+              "baseline_comparison": {
+                "const": "unavailable"
+              }
+            }
+          },
+          "baseline_comparison": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              },
+              "phase_reached": {
+                "const": "baseline_comparison"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "phases": {
+            "properties": {
+              "baseline_comparison": {
+                "const": "failed"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              },
+              "phase_reached": {
+                "const": "cleanup"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "phases": {
+            "properties": {
+              "cleanup": {
+                "const": "failed"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "validation": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              },
+              "phase_reached": {
+                "const": "before_success"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "phases": {
+            "properties": {
+              "source_stability": {
+                "const": "failed"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "software": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "director_version",
+        "report_schema_version"
+      ],
+      "properties": {
+        "director_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "report_schema_version": {
+          "const": 1
+        }
+      }
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "schema_version",
+        "digest"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$"
+        },
+        "schema_version": {
+          "type": "integer",
+          "enum": [
+            1,
+            2
+          ]
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_id",
+        "status",
+        "phase_reached",
+        "scheduler_invoked",
+        "live_inputs_changed",
+        "completed_at"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "pattern": "^v-[0-9]{8}T[0-9]{12}Z-[a-f0-9]{32}$"
+        },
+        "status": {
+          "enum": [
+            "success",
+            "failed"
+          ]
+        },
+        "phase_reached": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "scheduler_invoked": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "run_1",
+            "run_2"
+          ],
+          "properties": {
+            "run_1": {
+              "type": "boolean"
+            },
+            "run_2": {
+              "type": "boolean"
+            }
+          }
+        },
+        "live_inputs_changed": {
+          "type": "boolean"
+        },
+        "completed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested_seed",
+        "effective_seed",
+        "reference_clock",
+        "timezone",
+        "proposal_start",
+        "proposal_end"
+      ],
+      "properties": {
+        "requested_seed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "effective_seed": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "reference_clock": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timezone": {
+          "const": "America/Los_Angeles"
+        },
+        "proposal_start": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "proposal_end": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "effect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "canonical_operation"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "assignment",
+            "directive",
+            "exclusion"
+          ]
+        },
+        "canonical_operation": {
+          "type": "string",
+          "maxLength": 20000
+        }
+      }
+    },
+    "channel_seed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "number",
+        "channel_seed"
+      ],
+      "properties": {
+        "number": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 7
+        },
+        "channel_seed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "effects": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "$ref": "#/$defs/effect"
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline_blocks",
+        "proposed_blocks",
+        "components",
+        "unchanged_blocks",
+        "replaced_pairs",
+        "removed_blocks",
+        "generated_blocks",
+        "reshaped_components",
+        "reshaped_baseline_blocks",
+        "reshaped_proposed_blocks",
+        "title_changes",
+        "selected_media_changes",
+        "playback_plan_changes",
+        "block_type_changes",
+        "sequence_changes",
+        "break_changes"
+      ],
+      "properties": {
+        "baseline_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "proposed_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "components": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unchanged_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "replaced_pairs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "removed_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "generated_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reshaped_components": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reshaped_baseline_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reshaped_proposed_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "title_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "selected_media_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "playback_plan_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "block_type_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sequence_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "break_changes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "covered_us",
+        "gap_count",
+        "gap_us",
+        "overlap_count",
+        "overlap_us",
+        "interval_us",
+        "finding_digest"
+      ],
+      "properties": {
+        "covered_us": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "gap_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "gap_us": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "overlap_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "overlap_us": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "interval_us": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "finding_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "value",
+        "value_truncated"
+      ],
+      "properties": {
+        "value": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "value_truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "simple_finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "count"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "channel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "number",
+        "name",
+        "regeneration_start",
+        "effective_horizon",
+        "retained_pre_seam_blocks",
+        "boundary_crossing",
+        "counts",
+        "coverage",
+        "samples",
+        "samples_truncated",
+        "baseline_findings",
+        "errors",
+        "digest"
+      ],
+      "properties": {
+        "number": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 7
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "regeneration_start": {
+          "type": "string"
+        },
+        "effective_horizon": {
+          "type": "string"
+        },
+        "retained_pre_seam_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "boundary_crossing": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "baseline_start",
+            "proposed_start",
+            "baseline_horizon",
+            "proposed_horizon"
+          ],
+          "properties": {
+            "baseline_start": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "proposed_start": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "baseline_horizon": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "proposed_horizon": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "counts": {
+          "$ref": "#/$defs/counts"
+        },
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "baseline",
+            "proposed"
+          ],
+          "properties": {
+            "baseline": {
+              "$ref": "#/$defs/coverage"
+            },
+            "proposed": {
+              "$ref": "#/$defs/coverage"
+            }
+          }
+        },
+        "samples": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "replaced",
+            "reshaped"
+          ],
+          "properties": {
+            "replaced": {
+              "type": "array",
+              "maxItems": 50,
+              "items": {
+                "$ref": "#/$defs/sample"
+              }
+            },
+            "reshaped": {
+              "type": "array",
+              "maxItems": 50,
+              "items": {
+                "$ref": "#/$defs/sample"
+              }
+            }
+          }
+        },
+        "samples_truncated": {
+          "type": "boolean"
+        },
+        "baseline_findings": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/simple_finding"
+          }
+        },
+        "errors": {
+          "type": "array",
+          "maxItems": 2,
+          "items": {
+            "$ref": "#/$defs/simple_finding"
+          }
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "resulting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "changed_channels",
+        "unchanged_blocks",
+        "replaced_pairs",
+        "removed_blocks",
+        "generated_blocks",
+        "reshaped_components",
+        "title_changes",
+        "selected_media_changes",
+        "playback_plan_changes",
+        "block_type_changes",
+        "sequence_changes",
+        "break_changes"
+      ],
+      "properties": {
+        "changed_channels": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 6
+        },
+        "unchanged_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "replaced_pairs": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "removed_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "generated_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reshaped_components": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "title_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "selected_media_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "playback_plan_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "block_type_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sequence_changes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "break_changes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "digest",
+        "runs_matched",
+        "run_1_digest",
+        "run_2_digest"
+      ],
+      "properties": {
+        "status": {
+          "const": "pass"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "runs_matched": {
+          "type": "boolean"
+        },
+        "run_1_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "run_2_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "reproducibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passed",
+        "run_1_digest",
+        "run_2_digest",
+        "run_1_record_count",
+        "run_2_record_count",
+        "changed_records",
+        "added_records",
+        "removed_records",
+        "differences_truncated"
+      ],
+      "properties": {
+        "passed": {
+          "type": "boolean"
+        },
+        "run_1_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "run_2_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "run_1_record_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "run_2_record_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "changed_records": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "added_records": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "removed_records": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "differences_truncated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "guide": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run",
+        "status",
+        "digest",
+        "record_count",
+        "byte_count"
+      ],
+      "properties": {
+        "run": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "digest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "record_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "byte_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "source_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint",
+        "passed",
+        "changed_categories"
+      ],
+      "properties": {
+        "checkpoint": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "changed_categories": {
+          "type": "array",
+          "maxItems": 5,
+          "items": {
+            "type": "string",
+            "maxLength": 100
+          }
+        }
+      }
+    },
+    "preservation_run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run",
+        "retained_history",
+        "protected_channels",
+        "sequence_tables_restored",
+        "foreign_key_baseline",
+        "path_validation_passed",
+        "mapping_count",
+        "scheduled_path_checks",
+        "fingerprint_summary_digest"
+      ],
+      "properties": {
+        "run": {
+          "type": "integer",
+          "enum": [
+            1,
+            2
+          ]
+        },
+        "retained_history": {
+          "const": "pass"
+        },
+        "protected_channels": {
+          "const": "pass"
+        },
+        "sequence_tables_restored": {
+          "const": "pass"
+        },
+        "foreign_key_baseline": {
+          "const": "pass"
+        },
+        "path_validation_passed": {
+          "const": true
+        },
+        "mapping_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "scheduled_path_checks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "fingerprint_summary_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "preservation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_1",
+        "run_2"
+      ],
+      "properties": {
+        "run_1": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/preservation_run"
+            }
+          ]
+        },
+        "run_2": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/preservation_run"
+            }
+          ]
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "phase",
+        "template",
+        "channel",
+        "count",
+        "exception_class",
+        "diagnostic_digest"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,99}$"
+        },
+        "phase": {
+          "type": "string",
+          "enum": [
+            "capture",
+            "run_1",
+            "run_2",
+            "normalization",
+            "comparison",
+            "baseline_comparison",
+            "cleanup",
+            "before_success",
+            "complete",
+            "report"
+          ]
+        },
+        "template": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "channel": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 999
+        },
+        "count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "exception_class": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,99}$"
+        },
+        "diagnostic_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "$ref": "#/$defs/finding"
+      }
+    },
+    "finding_groups": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseline_findings",
+        "requested_configuration_effects",
+        "resulting_schedule_changes",
+        "unexpected_differences",
+        "warnings",
+        "errors"
+      ],
+      "properties": {
+        "baseline_findings": {
+          "$ref": "#/$defs/findings"
+        },
+        "requested_configuration_effects": {
+          "$ref": "#/$defs/effects"
+        },
+        "resulting_schedule_changes": {
+          "type": "array",
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/resulting"
+          }
+        },
+        "unexpected_differences": {
+          "$ref": "#/$defs/findings"
+        },
+        "warnings": {
+          "$ref": "#/$defs/findings"
+        },
+        "errors": {
+          "$ref": "#/$defs/findings"
+        }
+      }
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "total"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run",
+        "passed",
+        "quarantined",
+        "diagnostic"
+      ],
+      "properties": {
+        "run": {
+          "type": "integer",
+          "enum": [
+            1,
+            2
+          ]
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "quarantined": {
+          "type": "boolean"
+        },
+        "diagnostic": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/finding"
+            }
+          ]
+        }
+      }
+    },
+    "publication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "immutable",
+        "latest"
+      ],
+      "properties": {
+        "immutable": {
+          "const": "pending"
+        },
+        "latest": {
+          "const": "pending"
+        }
+      }
+    },
+    "phase_state": {
+      "enum": [
+        "not_started",
+        "attempted",
+        "completed",
+        "failed",
+        "unavailable"
+      ]
+    },
+    "phases": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capture",
+        "run_1",
+        "run_2",
+        "guide_validation",
+        "reproducibility",
+        "baseline_comparison",
+        "cleanup",
+        "source_stability"
+      ],
+      "properties": {
+        "capture": {
+          "$ref": "#/$defs/phase_state"
+        },
+        "run_1": {
+          "$ref": "#/$defs/phase_state"
+        },
+        "run_2": {
+          "$ref": "#/$defs/phase_state"
+        },
+        "guide_validation": {
+          "$ref": "#/$defs/phase_state"
+        },
+        "reproducibility": {
+          "$ref": "#/$defs/phase_state"
+        },
+        "baseline_comparison": {
+          "$ref": "#/$defs/phase_state"
+        },
+        "cleanup": {
+          "$ref": "#/$defs/phase_state"
+        },
+        "source_stability": {
+          "$ref": "#/$defs/phase_state"
+        }
+      }
+    },
+    "guide_comparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "unavailable"
+          ]
+        }
+      }
+    },
+    "guide_pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_1",
+        "run_2",
+        "comparison"
+      ],
+      "properties": {
+        "run_1": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/guide"
+            }
+          ]
+        },
+        "run_2": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/guide"
+            }
+          ]
+        },
+        "comparison": {
+          "$ref": "#/$defs/guide_comparison"
+        }
+      }
+    },
+    "cleanup_pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_1",
+        "run_2"
+      ],
+      "properties": {
+        "run_1": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/cleanup"
+            }
+          ]
+        },
+        "run_2": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/cleanup"
+            }
+          ]
+        }
+      }
+    },
+    "source_stability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "after_capture",
+        "between_runs",
+        "after_run_2",
+        "before_success"
+      ],
+      "properties": {
+        "after_capture": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/source_check"
+            }
+          ]
+        },
+        "between_runs": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/source_check"
+            }
+          ]
+        },
+        "after_run_2": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/source_check"
+            }
+          ]
+        },
+        "before_success": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/source_check"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

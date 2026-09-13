@@ -1,5 +1,6 @@
 """Private C2 orchestration for two independently isolated C1 executions."""
 
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,11 @@ from station_director.schedule_normalization import (
     NormalizationError,
     compare_normalized_runs,
     normalize_completed_run,
+)
+from station_director.schedule_comparison import (
+    COMPARISON_SPOOL_RESERVE_BYTES,
+    compare_baseline_summaries,
+    compare_baseline_to_proposed,
 )
 from station_director.single_run import (
     SingleRunError,
@@ -105,11 +111,13 @@ class DualRunScope:
                 result = lifecycle.cleanup()
                 self.cleanup_results.append({
                     "run": index, "passed": result["passed"],
+                    "quarantined": False,
                     "detail": _bounded_detail(result["detail"], lifecycle.stage),
                 })
             except Exception as exc:
                 self.cleanup_results.append({
                     "run": index, "passed": False,
+                    "quarantined": (lifecycle.stage / ".quarantine").exists(),
                     "detail": _bounded_detail(exc, lifecycle.stage),
                 })
                 failures.append(f"run {index}: {exc}")
@@ -214,7 +222,8 @@ def _space_requirement(source_database, config_size, manifest_size=0):
     # retain both stages if cleanup must quarantine them.
     return max(
         MINIMUM_FREE_BYTES,
-        allocated * 8 + config_size * 4 + manifest_size * 4 + 64 * 1024 * 1024,
+        allocated * 8 + config_size * 4 + manifest_size * 4
+        + COMPARISON_SPOOL_RESERVE_BYTES + 2 * 1024 * 1024,
     )
 
 
@@ -414,9 +423,28 @@ def _base_result(comparison_id):
         "source_checks": [],
         "runs": [],
         "reproducibility": None,
+        "baseline_comparison": None,
         "failure": None,
         "cleanup": [],
         "timings_ms": {"total": 0},
+    }
+
+
+def _run_preservation_summary(response):
+    fingerprints = response["verification"]["fingerprints"]
+    encoded = json.dumps(
+        fingerprints, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return {
+        "retained_history": response["preservation"]["retained_history"],
+        "protected_channels": response["preservation"]["protected_channels"],
+        "sequence_tables_restored": response["preservation"]["sequence_tables_restored"],
+        "foreign_key_baseline": response["preservation"]["foreign_key_baseline"],
+        "path_validation_passed": response["path_validation"]["passed"],
+        "mapping_count": response["path_validation"]["mapping_count"],
+        "scheduled_path_checks": response["path_validation"]["scheduled_path_checks"],
+        "fingerprint_summary_digest": hashlib.sha256(encoded).hexdigest(),
     }
 
 
@@ -435,6 +463,11 @@ def _validate_result_semantics(result):
             raise DualRunError("protocol", "invalid_result", "successful C2 lacks source attestations")
         if result["reproducibility"] is None or not result["reproducibility"]["passed"]:
             raise DualRunError("protocol", "invalid_result", "successful C2 lacks reproducibility proof")
+        if (result["baseline_comparison"] is None
+                or result["baseline_comparison"]["status"] != "pass"
+                or not result["baseline_comparison"]["runs_matched"]
+                or result["baseline_comparison"]["unexpected_differences"]):
+            raise DualRunError("protocol", "invalid_result", "successful C2 lacks baseline comparison proof")
         if [item["run"] for item in result["cleanup"]] != [2, 1] or not all(
             item["passed"] for item in result["cleanup"]
         ):
@@ -458,13 +491,15 @@ def run_dual_comparison(
         )
         result["validation_context"] = {
             key: scope.lifecycles[0].request["validation_context"][key]
-            for key in ("input_fingerprint", "requested_seed", "effective_seed")
+            for key in ("input_fingerprint", "requested_seed", "effective_seed",
+                        "reference_clock", "start_time", "end_time", "timezone")
         }
         result["affected_channels"] = scope.lifecycles[0].request["affected_channels"]
         result["source_checks"].append(
             {"checkpoint": "after_capture", "passed": True, "changed_categories": []}
         )
         normalized = []
+        baseline_summaries = []
         for index, lifecycle in enumerate(scope.lifecycles, 1):
             result["phase_reached"] = f"run_{index}"
             remaining = deadline - time.monotonic()
@@ -522,6 +557,21 @@ def run_dual_comparison(
                     category=f"run_{index}",
                 ) from exc
             normalized.append(normalized_run)
+            try:
+                baseline_summaries.append(compare_baseline_to_proposed(
+                    lifecycle.stage,
+                    lifecycle.stage / "source/runtime/fs42_fluid.db",
+                    lifecycle.stage / "work/runtime/fs42_fluid.db",
+                    response["channels"],
+                    proposal_boundary_to_db(proposal["week_start"], "week_start"),
+                    proposal,
+                ))
+            except Exception as exc:
+                raise DualRunError(
+                    "baseline_comparison", "baseline_comparison_failed",
+                    f"run {index} baseline comparison failed ({type(exc).__name__})",
+                    category=f"run_{index}",
+                ) from exc
             result["runs"].append({
                 "index": index,
                 "run_id": lifecycle.run_id,
@@ -531,6 +581,7 @@ def run_dual_comparison(
                 "provisional_catalog_count": normalized_run.provisional_count,
                 "channels": response["channels"],
                 "guide_validation": response["guide_validation"],
+                "preservation_summary": _run_preservation_summary(response),
                 "warnings": response["warnings"],
                 "timings_ms": response["timings_ms"],
             })
@@ -564,6 +615,25 @@ def run_dual_comparison(
                 ("normalized guide outputs differ" if guide_difference
                  else "normalized native runs differ"),
             )
+        baseline_match = compare_baseline_summaries(
+            baseline_summaries[0], baseline_summaries[1]
+        )
+        result["baseline_comparison"] = {
+            **baseline_summaries[0],
+            "runs_matched": baseline_match["passed"],
+            "run_1_digest": baseline_match["run_1_digest"],
+            "run_2_digest": baseline_match["run_2_digest"],
+        }
+        if not baseline_match["passed"]:
+            raise DualRunError(
+                "baseline_comparison", "baseline_summary_mismatch",
+                "independent baseline-versus-proposed summaries differ",
+            )
+        if result["baseline_comparison"]["unexpected_differences"]:
+            raise DualRunError(
+                "baseline_comparison", "unexpected_schedule_difference",
+                "proposed schedule introduced a new coverage defect",
+            )
         comparison_succeeded = True
     except Exception as exc:
         result["status"] = "failed"
@@ -574,6 +644,7 @@ def run_dual_comparison(
             "run_2": "c1_run_failed",
             "normalization": "normalization_failed",
             "comparison": "comparison_failed",
+            "baseline_comparison": "baseline_comparison_failed",
             "cleanup": "cleanup_failed",
         }.get(result["phase_reached"], "comparison_failed")
         code = getattr(exc, "code", fallback_code)

@@ -1,0 +1,13 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://crt-station.invalid/schemas/latest-validation-pointer.v1.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "proposal_id", "run_id", "validation_json_digest"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "proposal_id": {"type": "string", "pattern": "^p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$"},
+    "run_id": {"type": "string", "pattern": "^v-[0-9]{8}T[0-9]{12}Z-[a-f0-9]{32}$"},
+    "validation_json_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+  }
+}

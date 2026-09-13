@@ -3,13 +3,13 @@
   "$id": "https://crt-station.invalid/schemas/native-dual-run.result.v1.schema.json",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "operation", "comparison_id", "status", "phase_reached", "scheduler_invoked", "validation_context", "affected_channels", "source_checks", "runs", "reproducibility", "failure", "cleanup", "timings_ms"],
+  "required": ["schema_version", "operation", "comparison_id", "status", "phase_reached", "scheduler_invoked", "validation_context", "affected_channels", "source_checks", "runs", "reproducibility", "baseline_comparison", "failure", "cleanup", "timings_ms"],
   "properties": {
     "schema_version": {"const": 1},
     "operation": {"const": "native_dual_run_comparison"},
     "comparison_id": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,100}$"},
     "status": {"enum": ["success", "failed"]},
-    "phase_reached": {"enum": ["capture", "run_1", "run_2", "normalization", "comparison", "cleanup", "complete", "after_capture", "between_runs", "after_run_2", "before_success"]},
+    "phase_reached": {"enum": ["capture", "run_1", "run_2", "normalization", "comparison", "baseline_comparison", "cleanup", "complete", "after_capture", "between_runs", "after_run_2", "before_success"]},
     "scheduler_invoked": {
       "type": "object", "additionalProperties": false,
       "required": ["run_1", "run_2"],
@@ -20,11 +20,13 @@
         {"type": "object", "maxProperties": 0},
         {
           "type": "object", "additionalProperties": false,
-          "required": ["input_fingerprint", "requested_seed", "effective_seed"],
+          "required": ["input_fingerprint", "requested_seed", "effective_seed", "reference_clock", "start_time", "end_time", "timezone"],
           "properties": {
             "input_fingerprint": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
             "requested_seed": {"type": "integer"},
-            "effective_seed": {"type": "integer", "minimum": 0}
+            "effective_seed": {"type": "integer", "minimum": 0},
+            "reference_clock": {"type": "string"}, "start_time": {"type": "string"},
+            "end_time": {"type": "string"}, "timezone": {"const": "America/Los_Angeles"}
           }
         }
       ]
@@ -56,7 +58,7 @@
       "type": "array", "maxItems": 2,
       "items": {
         "type": "object", "additionalProperties": false,
-        "required": ["index", "run_id", "status", "normalization_digest", "record_count", "provisional_catalog_count", "channels", "guide_validation", "warnings", "timings_ms"],
+        "required": ["index", "run_id", "status", "normalization_digest", "record_count", "provisional_catalog_count", "channels", "guide_validation", "preservation_summary", "warnings", "timings_ms"],
         "properties": {
           "index": {"type": "integer", "enum": [1, 2]},
           "run_id": {"type": "string"},
@@ -66,6 +68,7 @@
           "provisional_catalog_count": {"type": "integer", "minimum": 0},
           "channels": {"type": "array"},
           "guide_validation": {"$ref": "#/$defs/guide_validation"},
+          "preservation_summary": {"$ref": "#/$defs/preservation_summary"},
           "warnings": {"type": "array"},
           "timings_ms": {"type": "object"}
         }
@@ -105,6 +108,12 @@
         }
       ]
     },
+    "baseline_comparison": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/baseline_comparison"}
+      ]
+    },
     "failure": {
       "oneOf": [
         {"type": "null"},
@@ -133,10 +142,11 @@
       "type": "array", "maxItems": 2,
       "items": {
         "type": "object", "additionalProperties": false,
-        "required": ["run", "passed", "detail"],
+        "required": ["run", "passed", "quarantined", "detail"],
         "properties": {
           "run": {"type": "integer", "enum": [1, 2]},
           "passed": {"type": "boolean"},
+          "quarantined": {"type": "boolean"},
           "detail": {"type": "string", "maxLength": 1000}
         }
       }
@@ -148,6 +158,94 @@
     }
   },
   "$defs": {
+    "comparison_counts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["baseline_blocks", "proposed_blocks", "components", "unchanged_blocks", "replaced_pairs", "removed_blocks", "generated_blocks", "reshaped_components", "reshaped_baseline_blocks", "reshaped_proposed_blocks", "title_changes", "selected_media_changes", "playback_plan_changes", "block_type_changes", "sequence_changes", "break_changes"],
+      "properties": {
+        "baseline_blocks": {"type": "integer", "minimum": 0}, "proposed_blocks": {"type": "integer", "minimum": 0},
+        "components": {"type": "integer", "minimum": 0}, "unchanged_blocks": {"type": "integer", "minimum": 0},
+        "replaced_pairs": {"type": "integer", "minimum": 0}, "removed_blocks": {"type": "integer", "minimum": 0},
+        "generated_blocks": {"type": "integer", "minimum": 0}, "reshaped_components": {"type": "integer", "minimum": 0},
+        "reshaped_baseline_blocks": {"type": "integer", "minimum": 0}, "reshaped_proposed_blocks": {"type": "integer", "minimum": 0},
+        "title_changes": {"type": "integer", "minimum": 0}, "selected_media_changes": {"type": "integer", "minimum": 0},
+        "playback_plan_changes": {"type": "integer", "minimum": 0}, "block_type_changes": {"type": "integer", "minimum": 0},
+        "sequence_changes": {"type": "integer", "minimum": 0}, "break_changes": {"type": "integer", "minimum": 0}
+      }
+    },
+    "coverage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["covered_us", "gap_count", "gap_us", "overlap_count", "overlap_us", "interval_us", "finding_digest"],
+      "properties": {
+        "covered_us": {"type": "integer", "minimum": 0}, "gap_count": {"type": "integer", "minimum": 0},
+        "gap_us": {"type": "integer", "minimum": 0}, "overlap_count": {"type": "integer", "minimum": 0},
+        "overlap_us": {"type": "integer", "minimum": 0}, "interval_us": {"type": "integer", "minimum": 1},
+        "finding_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "finding": {
+      "type": "object", "additionalProperties": false, "required": ["code", "count"],
+      "properties": {"code": {"type": "string", "maxLength": 100}, "count": {"type": "integer", "minimum": 1}}
+    },
+    "comparison_channel": {
+      "type": "object", "additionalProperties": false,
+      "required": ["number", "name", "channel_seed", "regeneration_start", "effective_horizon", "retained_pre_seam_blocks", "boundary_crossing", "counts", "coverage", "samples", "samples_truncated", "baseline_findings", "errors", "digest"],
+      "properties": {
+        "number": {"type": "integer", "minimum": 2, "maximum": 7}, "name": {"type": "string", "maxLength": 200},
+        "channel_seed": {"type": "integer", "minimum": 0},
+        "regeneration_start": {"type": "string"}, "effective_horizon": {"type": "string"},
+        "retained_pre_seam_blocks": {"type": "integer", "minimum": 0},
+        "boundary_crossing": {"type": "object", "additionalProperties": false,
+          "required": ["baseline_start", "proposed_start", "baseline_horizon", "proposed_horizon"],
+          "properties": {"baseline_start": {"type": "integer", "minimum": 0}, "proposed_start": {"type": "integer", "minimum": 0}, "baseline_horizon": {"type": "integer", "minimum": 0}, "proposed_horizon": {"type": "integer", "minimum": 0}}},
+        "counts": {"$ref": "#/$defs/comparison_counts"},
+        "coverage": {"type": "object", "additionalProperties": false, "required": ["baseline", "proposed"], "properties": {"baseline": {"$ref": "#/$defs/coverage"}, "proposed": {"$ref": "#/$defs/coverage"}}},
+        "samples": {"type": "object", "additionalProperties": false, "required": ["replaced", "reshaped"], "properties": {
+          "replaced": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/comparison_sample"}},
+          "reshaped": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/comparison_sample"}}}},
+        "samples_truncated": {"type": "boolean"},
+        "baseline_findings": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/finding"}},
+        "errors": {"type": "array", "maxItems": 2, "items": {"$ref": "#/$defs/finding"}},
+        "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "comparison_sample": {"type": "object", "additionalProperties": false, "required": ["value", "value_truncated"], "properties": {"value": {"type": "string", "maxLength": 512}, "value_truncated": {"type": "boolean"}}},
+    "requested_effect": {"type": "object", "additionalProperties": false, "required": ["kind", "canonical_operation"], "properties": {"kind": {"enum": ["assignment", "directive", "exclusion"]}, "canonical_operation": {"type": "string", "maxLength": 20000}}},
+    "baseline_comparison": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "channels", "requested_configuration_effects", "resulting_schedule_changes", "unexpected_differences", "digest", "runs_matched", "run_1_digest", "run_2_digest"],
+      "properties": {
+        "status": {"const": "pass"}, "channels": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"$ref": "#/$defs/comparison_channel"}},
+        "requested_configuration_effects": {"type": "array", "maxItems": 10000, "items": {"$ref": "#/$defs/requested_effect"}},
+        "resulting_schedule_changes": {"$ref": "#/$defs/resulting_changes"},
+        "unexpected_differences": {"type": "array", "maxItems": 12, "items": {"type": "object", "additionalProperties": false, "required": ["channel", "code", "count"], "properties": {"channel": {"type": "integer"}, "code": {"type": "string"}, "count": {"type": "integer", "minimum": 1}}}},
+        "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "runs_matched": {"type": "boolean"},
+        "run_1_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "run_2_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "preservation_summary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["retained_history", "protected_channels", "sequence_tables_restored", "foreign_key_baseline", "path_validation_passed", "mapping_count", "scheduled_path_checks", "fingerprint_summary_digest"],
+      "properties": {
+        "retained_history": {"const": "pass"}, "protected_channels": {"const": "pass"},
+        "sequence_tables_restored": {"const": "pass"}, "foreign_key_baseline": {"const": "pass"},
+        "path_validation_passed": {"const": true}, "mapping_count": {"type": "integer", "minimum": 0},
+        "scheduled_path_checks": {"type": "integer", "minimum": 0},
+        "fingerprint_summary_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "resulting_changes": {
+      "type": "object", "additionalProperties": false,
+      "required": ["changed_channels", "unchanged_blocks", "replaced_pairs", "removed_blocks", "generated_blocks", "reshaped_components", "title_changes", "selected_media_changes", "playback_plan_changes", "block_type_changes", "sequence_changes", "break_changes"],
+      "properties": {
+        "changed_channels": {"type": "integer", "minimum": 0, "maximum": 6},
+        "unchanged_blocks": {"type": "integer", "minimum": 0}, "replaced_pairs": {"type": "integer", "minimum": 0},
+        "removed_blocks": {"type": "integer", "minimum": 0}, "generated_blocks": {"type": "integer", "minimum": 0},
+        "reshaped_components": {"type": "integer", "minimum": 0}, "title_changes": {"type": "integer", "minimum": 0},
+        "selected_media_changes": {"type": "integer", "minimum": 0}, "playback_plan_changes": {"type": "integer", "minimum": 0},
+        "block_type_changes": {"type": "integer", "minimum": 0}, "sequence_changes": {"type": "integer", "minimum": 0},
+        "break_changes": {"type": "integer", "minimum": 0}
+      }
+    },
     "guide_boundary": {
       "type": "object", "additionalProperties": false,
       "required": ["name", "instant", "match_count", "title"],
