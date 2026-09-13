@@ -1,4 +1,5 @@
 import json
+import hashlib
 import math
 import os
 import shutil
@@ -61,6 +62,49 @@ def insert_catalog(connection, catalog_id, path, **changes):
 
 ROOT = Path(__file__).parents[1]
 
+GUIDE_MAGIC = b"FS42-GUIDE\x00\x01"
+GUIDE_VALUE = {"path": "/guide/test", "value": {"title": "Synthetic"}}
+
+
+def guide_bytes(value=GUIDE_VALUE):
+    raw = json.dumps(
+        value, ensure_ascii=False, allow_nan=False, sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return GUIDE_MAGIC + len(raw).to_bytes(8, "big") + raw
+
+
+def write_test_guide(stage, value=GUIDE_VALUE):
+    directory = Path(stage) / "guide"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    raw = guide_bytes(value)
+    path = directory / "guide-v1.records"
+    path.write_bytes(raw)
+    path.chmod(0o600)
+    return raw
+
+
+def guide_result(value=GUIDE_VALUE):
+    raw = guide_bytes(value)
+    return {
+        "status": "pass", "format_version": 1,
+        "primary_failure": None,
+        "snapshot_preparation": {"status": "pass", "message": None},
+        "snapshot_verification": {"status": "pass", "message": None},
+        "post_read_verification": {"status": "pass", "message": None},
+        "artifact_identity": "guide/guide-v1.records",
+        "digest": hashlib.sha256(raw).hexdigest(), "record_count": 1,
+        "byte_count": len(raw),
+        "channels": [{
+            "number": 2, "name": "Action", "network_long_name": "",
+            "hidden": False, "has_schedule": True, "listing_count": 1,
+            "transition_probe_count": 1, "zero_match_count": 0,
+            "one_match_count": 1, "named_boundaries": [],
+            "named_boundaries_truncated": False,
+        }],
+        "errors": [], "errors_truncated": False,
+    }
+
 
 def response(run_id, *, warning=None, timing=1, name="Action"):
     warnings = [] if warning is None else [{
@@ -115,11 +159,12 @@ def response(run_id, *, warning=None, timing=1, name="Action"):
         "path_validation": {
             "passed": True, "mapping_count": 1, "scheduled_path_checks": 1,
         },
+        "guide_validation": guide_result(),
         "warnings": warnings,
         "failure": None,
         "timings_ms": {
             "prepare": timing, "catalog": timing, "scheduler": timing,
-            "preservation": timing, "total": timing,
+            "preservation": timing, "guide": timing, "total": timing,
         },
         "diagnostics": {"messages": [], "truncated": False},
     }
@@ -195,6 +240,7 @@ def complete_worker_child_main(stage_text, media_text, project_text):
         "fs42_loaded": any(name == "fs42" or name.startswith("fs42.") for name in sys.modules),
         "cache_size": len(ShowCatalog._fluid_cache_scanned),
         "status": result["status"], "failure": result["failure"],
+        "guide_validation": result.get("guide_validation"),
         "catalog_paths": catalog_paths,
     }
     info_path = stage / "native-info.json"
@@ -247,6 +293,7 @@ def make_run(root, name, catalog_id, media="a.mp4", **catalog_changes):
     )
     connection.commit()
     connection.close()
+    write_test_guide(stage)
     return stage, database
 
 
@@ -1103,6 +1150,26 @@ class DualRunLifecycleTests(unittest.TestCase):
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["failure"]["code"], "cleanup_failed")
 
+    def test_guide_primary_and_cleanup_failures_remain_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scope = self._scope(root, [], cleanup_failure=True)
+            with patch("station_director.dual_run._prepare_scope", return_value=scope), \
+                    patch("station_director.dual_run.launch_single_run"), \
+                    patch("station_director.dual_run.inspect_single_run", side_effect=DualRunError(
+                        "run_1", "c1_run_failed", "guide failed",
+                        category="guide_validation_failed",
+                    )), patch("station_director.dual_run._assert_inputs_stable", return_value={
+                        "checkpoint": "before_success", "passed": True,
+                        "changed_categories": [],
+                    }):
+                result = run_dual_comparison(root, root, root, {
+                    "week_start": "2026-09-14T00:00:00-07:00"
+                }, {}, "comparison")
+            self.assertEqual(result["failure"]["code"], "c1_run_failed")
+            self.assertEqual(result["failure"]["category"], "guide_validation_failed")
+            self.assertTrue(any(not item["passed"] for item in result["cleanup"]))
+
     def test_input_mutation_during_cleanup_prevents_success(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1232,7 +1299,7 @@ class DualRunLifecycleTests(unittest.TestCase):
 
 
 class NativeTwoProcessIntegrationTests(unittest.TestCase):
-    def _complete_dual_run(self, root, *, alter_second=False):
+    def _complete_dual_run(self, root, *, alter_second=False, alter_guide_second=False):
         media = root / "media"
         content = media / "synthetic" / "Synthetic"
         content.mkdir(parents=True)
@@ -1304,6 +1371,40 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
                     connection.commit()
                 finally:
                     connection.close()
+            if alter_guide_second and lifecycle.run_id.endswith("run-2") and info["status"] == "success":
+                guide_path = lifecycle.stage / "guide/guide-v1.records"
+                raw = guide_path.read_bytes()
+                position = len(GUIDE_MAGIC)
+                records = []
+                changed = False
+                while position < len(raw):
+                    size = int.from_bytes(raw[position:position + 8], "big")
+                    position += 8
+                    item = json.loads(raw[position:position + size])
+                    position += size
+                    if not changed and item["path"].startswith("/guide/schedules/"):
+                        item["value"]["title"] += " Different"
+                        changed = True
+                    records.append(item)
+                self.assertTrue(changed)
+                rebuilt = GUIDE_MAGIC
+                for item in records:
+                    encoded = json.dumps(
+                        item, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    rebuilt += len(encoded).to_bytes(8, "big") + encoded
+                guide_path.write_bytes(rebuilt)
+                guide_path.chmod(0o600)
+                response_path = lifecycle.stage / "native-single-run.response.json"
+                response_value = json.loads(response_path.read_text(encoding="utf-8"))
+                response_value["guide_validation"]["digest"] = hashlib.sha256(rebuilt).hexdigest()
+                response_value["guide_validation"]["byte_count"] = len(rebuilt)
+                response_path.write_text(
+                    json.dumps(response_value, sort_keys=True, separators=(",", ":")) + "\n",
+                    encoding="utf-8",
+                )
+                response_path.chmod(0o600)
             lifecycle.launcher_result = LaunchResult(
                 lifecycle.unit_name, 0 if info["status"] == "success" else 1,
                 completed.stdout, completed.stderr,
@@ -1335,6 +1436,7 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
                 self.assertNotEqual(details[0][field], details[1][field])
             self.assertTrue(all(item["fs42_loaded"] for item in details))
             self.assertEqual([item["cache_size"] for item in details], [1, 1])
+            self.assertTrue(all(item["guide_validation"]["status"] == "pass" for item in details))
 
     def test_complete_genuine_lifecycle_detects_selected_media_difference(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1342,6 +1444,18 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
             self.assertEqual(len(details), 2)
             self.assertEqual(result["status"], "failed")
             self.assertEqual(result["failure"]["code"], "reproducibility_mismatch")
+            self.assertFalse(result["reproducibility"]["passed"])
+
+    def test_complete_genuine_lifecycle_detects_guide_only_difference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, details = self._complete_dual_run(
+                Path(directory), alter_guide_second=True
+            )
+            self.assertEqual(len(details), 2)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(
+                result["failure"]["code"], "guide_reproducibility_mismatch"
+            )
             self.assertFalse(result["reproducibility"]["passed"])
 
 

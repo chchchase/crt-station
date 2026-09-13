@@ -2,6 +2,7 @@ from fastapi import APIRouter
 from fs42.station_manager import StationManager
 from fs42.catalog_api import CatalogAPI
 from fs42.liquid_manager import LiquidManager
+from fs42.guide_payloads import build_channels_payload
 
 router = APIRouter(prefix="/summary", tags=["summary"])
 
@@ -24,22 +25,6 @@ async def get_summary():
         }
         summaries.append(summary)
     return {"summary_data": summaries}
-
-def build_channels_payload(stations):
-    """Transform already-loaded station data into the guide channel payload."""
-    # Minimal station listing for the guide
-    channels = [
-        {
-            "network_name": station["network_name"],
-            "network_long_name": station.get("network_long_name", ""),
-            "channel_number": station["channel_number"],
-            "hidden": station.get("hidden", False),
-            "has_schedule": station.get("_has_schedule", False),
-        }
-        for station in stations
-    ]
-    return {"channels": channels}
-
 
 @router.get("/channels")
 def get_channels():

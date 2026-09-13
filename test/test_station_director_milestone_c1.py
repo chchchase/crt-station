@@ -109,6 +109,26 @@ def passing_channel():
                      "proposal_end_crossing_ids": [], "effective_horizon_crossing_ids": [1],
                      "gaps": [], "overlaps": [], "final_end": "2026-09-21 06:00:00"},
     }
+
+
+def passing_guide():
+    return {
+        "status": "pass", "format_version": 1,
+        "primary_failure": None,
+        "snapshot_preparation": {"status": "pass", "message": None},
+        "snapshot_verification": {"status": "pass", "message": None},
+        "post_read_verification": {"status": "pass", "message": None},
+        "artifact_identity": "guide/guide-v1.records", "digest": "8" * 64,
+        "record_count": 1, "byte_count": 32,
+        "channels": [{
+            "number": 2, "name": "Action", "network_long_name": "",
+            "hidden": False, "has_schedule": True, "listing_count": 1,
+            "transition_probe_count": 1, "zero_match_count": 0,
+            "one_match_count": 1, "named_boundaries": [],
+            "named_boundaries_truncated": False,
+        }],
+        "errors": [], "errors_truncated": False,
+    }
 def make_snapshot(stage, media):
     source = stage / "source"
     (source / "confs").mkdir(parents=True)
@@ -407,9 +427,10 @@ class WorkerBoundaryTests(unittest.TestCase):
                     "path_validation": {
                         "passed": True, "mapping_count": 0, "scheduled_path_checks": 0,
                     },
+                    "guide_validation": passing_guide(),
                     "timings_ms": {
                         "prepare": 0, "catalog": 0, "scheduler": 1,
-                        "preservation": 0, "total": 1,
+                        "preservation": 0, "guide": 0, "total": 1,
                     },
                 }
             )
@@ -695,7 +716,7 @@ class SyntheticNativeEngineTests(unittest.TestCase):
         phases = (
             "context", "configuration", "allocation", "catalog", "reconciliation",
             "schedule_construction", "explicit_range", "channel_result",
-            "preservation", "final_verification",
+            "preservation", "guide", "final_verification",
         )
         for phase in phases:
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
@@ -759,6 +780,10 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                     stack.enter_context(patch.object(native, "ShowCatalog", Catalog))
                     stack.enter_context(patch.object(native, "LiquidSchedule", Schedule))
                     stack.enter_context(patch.object(native, "_validate_final_cross_channel_exclusions"))
+                    if phase != "guide":
+                        stack.enter_context(patch.object(
+                            native, "_run_guide_validation", return_value=passing_guide()
+                        ))
                     restore = stack.enter_context(patch.object(
                         native, "_restore_sequences", wraps=native._restore_sequences,
                     ))
@@ -771,6 +796,7 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                         "schedule_construction": "LiquidSchedule",
                         "channel_result": "_build_channel_result",
                         "preservation": "_verify_final_preservation",
+                        "guide": "_run_guide_validation",
                         "final_verification": "_final_input_verification",
                     }.get(phase)
                     if target:
@@ -943,7 +969,9 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                     side_effect=lambda channel, unused_context: projected[channel]["station_conf"],
                 ), patch.object(native, "MEDIA_ROOT", media), patch.object(native, "ShowCatalog", Catalog), patch.object(
                     native, "LiquidSchedule", schedule_factory
-                ), patch.object(native, "_validate_final_cross_channel_exclusions"):
+                ), patch.object(native, "_validate_final_cross_channel_exclusions"), patch.object(
+                    native, "_run_guide_validation", return_value=passing_guide()
+                ):
                     result = native.execute_native_single_run(request, test_attestation(request))
                 results.append(result["channels"])
                 self.assertTrue(result["scheduler_invoked"])
@@ -1307,10 +1335,11 @@ class LifecycleTests(unittest.TestCase):
                 "path_validation": {
                     "passed": True, "mapping_count": 0, "scheduled_path_checks": 0,
                 },
+                "guide_validation": passing_guide(),
                 "warnings": [], "failure": None,
                 "timings_ms": {
                     "prepare": 0, "catalog": 0, "scheduler": 1,
-                    "preservation": 0, "total": 1,
+                    "preservation": 0, "guide": 0, "total": 1,
                 },
                 "diagnostics": {"messages": [], "truncated": False},
             }

@@ -80,26 +80,12 @@ class LiquidIO:
             rows = cursor.fetchall()
             cursor.close()
 
-            # Collect all content IDs for batch lookup
-            content_ids = set()
-            for row in rows:
-                content_json = json.loads(row[9]) if row[9] else None
-                if content_json:
-                    if isinstance(content_json, list):
-                        content_ids.update(content_json)
-                    else:
-                        content_ids.add(content_json)
+            content_ids = LiquidIO.content_ids_from_rows(rows)
 
             # Batch fetch all content entries
             content_cache = CatalogAPI.get_entries_by_ids(list(content_ids)) if content_ids else {}
 
-            # Build blocks with cached content
-            liquid_blocks = []
-            for row in rows:
-                block = LiquidIO._build_block_from_row(row, content_cache)
-                liquid_blocks.append(block)
-
-            return liquid_blocks
+            return LiquidIO.blocks_from_rows(rows, content_cache)
 
     def query_liquid_blocks(self, station_name: str, start: str, end: str) -> list[LiquidBlock]:
         with self._get_connection() as connection:
@@ -112,26 +98,12 @@ class LiquidIO:
             rows = cursor.fetchall()
             cursor.close()
 
-            # Collect all content IDs for batch lookup
-            content_ids = set()
-            for row in rows:
-                content_json = json.loads(row[9]) if row[9] else None
-                if content_json:
-                    if isinstance(content_json, list):
-                        content_ids.update(content_json)
-                    else:
-                        content_ids.add(content_json)
+            content_ids = LiquidIO.content_ids_from_rows(rows)
 
             # Batch fetch all content entries
             content_cache = CatalogAPI.get_entries_by_ids(list(content_ids)) if content_ids else {}
 
-            # Build blocks with cached content
-            liquid_blocks = []
-            for row in rows:
-                block = LiquidIO._build_block_from_row(row, content_cache)
-                liquid_blocks.append(block)
-
-            return liquid_blocks
+            return LiquidIO.blocks_from_rows(rows, content_cache)
 
     def query_all_liquid_blocks(self, start: str, end: str) -> dict[str, list[LiquidBlock]]:
 
@@ -149,24 +121,39 @@ class LiquidIO:
             rows = cursor.fetchall()
             cursor.close()
 
-            # Collect content IDs across every station for one batch lookup
-            content_ids = set()
-            for row in rows:
-                content_json = json.loads(row[9]) if row[9] else None
-                if content_json:
-                    if isinstance(content_json, list):
-                        content_ids.update(content_json)
-                    else:
-                        content_ids.add(content_json)
+            content_ids = LiquidIO.content_ids_from_rows(rows)
 
             content_cache = CatalogAPI.get_entries_by_ids(list(content_ids)) if content_ids else {}
 
             by_station = {}
-            for row in rows:
-                block = LiquidIO._build_block_from_row(row, content_cache)
+            for row, block in zip(rows, LiquidIO.blocks_from_rows(rows, content_cache)):
                 by_station.setdefault(row[1], []).append(block)
 
             return by_station
+
+    @staticmethod
+    def content_ids_from_rows(rows):
+        """Extract catalog references without constructing an I/O object."""
+        content_ids = set()
+        for row in rows:
+            content_json = json.loads(row[9]) if row[9] else None
+            if content_json:
+                if isinstance(content_json, list):
+                    content_ids.update(content_json)
+                else:
+                    content_ids.add(content_json)
+        return content_ids
+
+    @staticmethod
+    def blocks_from_rows(rows, content_cache, *, normalize_titles=None, title_patterns=None):
+        """Apply the native database-row transformation without opening SQLite."""
+        return [
+            LiquidIO._build_block_from_row(
+                row, content_cache, normalize_titles=normalize_titles,
+                title_patterns=title_patterns,
+            )
+            for row in rows
+        ]
 
     def put_liquid_blocks(self, station_name: str, liquid_blocks: list[LiquidBlock]):
         """
@@ -220,7 +207,10 @@ class LiquidIO:
             connection.commit()
 
     @staticmethod
-    def _build_block_from_row(row, content_cache: dict = None):
+    def _build_block_from_row(
+        row, content_cache: dict = None, *, normalize_titles=None,
+        title_patterns=None,
+    ):
         """
         Helper method to build a LiquidBlock from a database row.
         If content_cache is provided, uses it for batch lookups instead of individual CatalogAPI calls.
@@ -260,11 +250,16 @@ class LiquidIO:
             jobj = _plan_json[0]
             content_obj = CatalogEntry(jobj["path"], jobj["duration"], AutoBumpAgent.tag_str)
 
-        main_normal = StationManager().server_conf.get("normalize_titles", True)
+        if normalize_titles is None:
+            main_normal = StationManager().server_conf.get("normalize_titles", True)
+        else:
+            main_normal = normalize_titles
+            custom_patterns = [] if title_patterns is None else title_patterns
         the_title = _title
 
         if main_normal:
-            custom_patterns = StationManager().server_conf.get("title_patterns", [])
+            if normalize_titles is None:
+                custom_patterns = StationManager().server_conf.get("title_patterns", [])
             the_title = TitleParser.parse_title(the_title, custom_patterns)
 
         args = (

@@ -482,7 +482,8 @@ def run_dual_comparison(
                 raise DualRunError(
                     f"run_{index}", "c1_run_failed",
                     f"C1 run {index} failed ({type(exc).__name__})",
-                    category=getattr(exc, "code", None),
+                    category=(getattr(exc, "category", None)
+                              or getattr(exc, "code", None)),
                 ) from exc
             result["scheduler_invoked"][f"run_{index}"] = response["scheduler_invoked"]
             if response["status"] != "success":
@@ -529,6 +530,7 @@ def run_dual_comparison(
                 "record_count": normalized_run.record_count,
                 "provisional_catalog_count": normalized_run.provisional_count,
                 "channels": response["channels"],
+                "guide_validation": response["guide_validation"],
                 "warnings": response["warnings"],
                 "timings_ms": response["timings_ms"],
             })
@@ -547,9 +549,20 @@ def run_dual_comparison(
             ) from exc
         result["reproducibility"] = comparison
         if not comparison["passed"]:
+            guide_digests = [
+                item["guide_validation"]["digest"] for item in result["runs"]
+            ]
+            guide_difference = len(set(guide_digests)) != 1 or any(
+                item["field_path"].startswith("/guide/")
+                or "/guide_validation" in item["field_path"]
+                for item in comparison["differences"]
+            )
             raise DualRunError(
-                "comparison", "reproducibility_mismatch",
-                "normalized native runs differ",
+                "comparison",
+                ("guide_reproducibility_mismatch" if guide_difference
+                 else "reproducibility_mismatch"),
+                ("normalized guide outputs differ" if guide_difference
+                 else "normalized native runs differ"),
             )
         comparison_succeeded = True
     except Exception as exc:

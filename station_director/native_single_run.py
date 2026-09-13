@@ -13,6 +13,14 @@ from fs42.liquid_schedule import LiquidSchedule
 from fs42.liquid_io import LiquidIO
 from fs42.scheduling_context import ValidationSchedulingContext, activate_validation_context
 from fs42.station_manager import StationManager
+from fs42.guide_reader import (
+    GuideLoadingError,
+    GuideValidationError,
+    fingerprint_guide_snapshot,
+    prepare_guide_snapshot,
+    stream_validate_staged_guide,
+    verify_guide_snapshot,
+)
 
 from station_director.native_config_checks import (
     newly_unresolved_source_slots,
@@ -49,7 +57,8 @@ PROJECT_ROOT = Path("/project")
 
 class NativeRunError(RuntimeError):
     def __init__(self, code, message, *, phase, channel=None, scheduler_invoked=False,
-                 original_failure=None, restoration_failure=None):
+                 original_failure=None, restoration_failure=None,
+                 guide_validation=None):
         super().__init__(message)
         self.code = code
         self.phase = phase
@@ -57,6 +66,7 @@ class NativeRunError(RuntimeError):
         self.scheduler_invoked = scheduler_invoked
         self.original_failure = original_failure
         self.restoration_failure = restoration_failure
+        self.guide_validation = guide_validation
 
 
 def _load_json(path):
@@ -294,6 +304,92 @@ def _final_input_verification(attestation, request):
     attestation.verify(request)
 
 
+def _run_guide_validation(database, channel_results, proposal_start, proposal_end):
+    state = {
+        "status": "failed",
+        "primary_failure": None,
+        "snapshot_preparation": {"status": "not_run", "message": None},
+        "snapshot_verification": {"status": "not_run", "message": None},
+        "post_read_verification": {"status": "not_run", "message": None},
+        "errors": [], "errors_truncated": False,
+    }
+    snapshot = None
+    try:
+        snapshot = prepare_guide_snapshot(database, STAGE_ROOT)
+        state["snapshot_preparation"] = {"status": "pass", "message": None}
+    except Exception as exc:
+        state["snapshot_preparation"] = {
+            "status": "failed", "message": f"{type(exc).__name__}: {exc}"[:1000],
+        }
+        state["primary_failure"] = {
+            "phase": "guide_snapshot", "code": "guide_loading_failed",
+            "message": f"{type(exc).__name__}: {exc}"[:1000],
+        }
+        raise NativeRunError(
+            "guide_loading_failed", str(exc), phase="guide", scheduler_invoked=True,
+            guide_validation=state,
+        ) from exc
+
+    primary = None
+    failure_code = "guide_loading_failed"
+    artifact = None
+    summaries = None
+    verification_failures = []
+    try:
+        manager = StationManager()
+        stations = manager.stations
+        failure_code = "guide_validation_failed"
+        artifact, summaries = stream_validate_staged_guide(
+            snapshot, STAGE_ROOT, stations, channel_results,
+            proposal_start, proposal_end,
+            normalize_titles=manager.server_conf.get("normalize_titles", True),
+            title_patterns=manager.server_conf.get("title_patterns", []),
+        )
+    except Exception as exc:
+        primary = exc
+        failure_code = (
+            "guide_validation_failed" if isinstance(exc, GuideValidationError)
+            else "guide_loading_failed" if isinstance(exc, GuideLoadingError)
+            else failure_code
+        )
+        state["primary_failure"] = {
+            "phase": "guide_read", "code": failure_code,
+            "message": f"{type(exc).__name__}: {exc}"[:1000],
+        }
+    finally:
+        try:
+            after = fingerprint_guide_snapshot(snapshot)
+            if after != snapshot.working_logical_digest:
+                raise GuideValidationError("guide snapshot logical fingerprint differs from working baseline")
+            state["post_read_verification"] = {"status": "pass", "message": None}
+        except Exception as exc:
+            verification_failures.append(exc)
+            state["post_read_verification"] = {
+                "status": "failed", "message": f"{type(exc).__name__}: {exc}"[:1000],
+            }
+        try:
+            verify_guide_snapshot(snapshot, database)
+            state["snapshot_verification"] = {"status": "pass", "message": None}
+        except Exception as exc:
+            verification_failures.append(exc)
+            state["snapshot_verification"] = {
+                "status": "failed", "message": f"{type(exc).__name__}: {exc}"[:1000],
+            }
+
+    if primary is not None or verification_failures:
+        cause = primary if primary is not None else verification_failures[0]
+        raise NativeRunError(
+            failure_code if primary is not None else "guide_validation_failed",
+            str(cause), phase="guide", scheduler_invoked=True,
+            original_failure=primary, guide_validation=state,
+        ) from cause
+    state.update({
+        "status": "pass", **artifact, "channels": summaries,
+        "primary_failure": None,
+    })
+    return state
+
+
 def execute_native_single_run(request, attestation=None):
     if not isinstance(attestation, VerifiedWorkerAttestation):
         raise NativeRunError(
@@ -495,6 +591,12 @@ def _execute_native_single_run(request, attestation, restoration):
     finally:
         connection.close()
     finished = time.monotonic()
+    guide_started = time.monotonic()
+    guide_validation = _run_guide_validation(
+        database, channel_results,
+        datetime.fromisoformat(proposal_start), datetime.fromisoformat(proposal_end),
+    )
+    guide_finished = time.monotonic()
     _final_input_verification(attestation, request)
     return {
         "scheduler_invoked": scheduler_entered,
@@ -506,12 +608,14 @@ def _execute_native_single_run(request, attestation, restoration):
             "foreign_key_baseline": "pass",
         },
         "path_validation": {"passed": True, "mapping_count": mapping_count, "scheduled_path_checks": checked_paths},
+        "guide_validation": guide_validation,
         "timings_ms": {
             "prepare": round((prepared_at - started) * 1000),
             "catalog": round(catalog_seconds * 1000),
             "scheduler": round(scheduler_seconds * 1000),
             "preservation": round((finished - preservation_started) * 1000),
-            "total": round((finished - started) * 1000),
+            "guide": round((guide_finished - guide_started) * 1000),
+            "total": round((guide_finished - started) * 1000),
         },
         "verification": {
             "original_snapshot": "pass",

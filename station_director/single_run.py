@@ -102,6 +102,22 @@ class SingleRunLifecycle:
                 "cleanup", "cleanup_failure",
                 f"unit not proven absent; staging quarantined at {self.stage}: {unit_detail}",
             )
+        guide_input = self.stage / "guide-input"
+        guide_database = guide_input / "guide.db"
+        if guide_input.exists() and not guide_input.is_symlink():
+            try:
+                if guide_database.exists() and not guide_database.is_symlink():
+                    os.chmod(guide_database, 0o600)
+                os.chmod(guide_input, 0o700)
+            except OSError as exc:
+                try:
+                    (self.stage / ".quarantine").touch(mode=0o600, exist_ok=True)
+                except OSError:
+                    pass
+                raise SingleRunError(
+                    "cleanup", "cleanup_failure",
+                    f"guide snapshot could not be prepared for cleanup: {type(exc).__name__}",
+                ) from exc
         stage_ok, stage_detail = cleanup_staging_directory(self.stage)
         details.append(f"stage: {stage_detail}")
         self.cleaned = unit_ok and stage_ok

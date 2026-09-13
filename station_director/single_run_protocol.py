@@ -95,6 +95,7 @@ def validate_response_semantics(payload):
         or not payload["verification"]
         or not payload["preservation"]
         or not payload["path_validation"]
+        or not payload["guide_validation"]
         or not payload["timings_ms"]
         or payload["phase_reached"] != "complete"
     ):
@@ -113,6 +114,16 @@ def validate_response_semantics(payload):
         "request", "probes", "snapshot", "seed", "native_import", "configuration", "catalog"
     }:
         raise ProtocolError("response claims scheduling before the scheduler phase")
+    guide = payload["guide_validation"]
+    if payload["status"] == "success" and (
+        guide.get("status") != "pass"
+        or any(guide[name].get("status") != "pass" for name in (
+            "snapshot_preparation", "snapshot_verification", "post_read_verification"
+        ))
+    ):
+        raise ProtocolError("successful response does not contain complete guide verification")
+    if payload["status"] == "failed" and guide and guide.get("status") != "failed":
+        raise ProtocolError("failed response contains a successful guide result")
 
 
 def validate_document(payload, schema_path):

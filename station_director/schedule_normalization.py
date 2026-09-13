@@ -27,6 +27,11 @@ MAX_COLUMNS_PER_TABLE = 512
 MAX_REFERENCE_LEDGER_ROWS = 1000000
 MAX_CANONICAL_RECORDS = 10000000
 MAX_ROWS_PER_TABLE = 100000000
+GUIDE_MAGIC = b"FS42-GUIDE\x00\x01"
+GUIDE_ARTIFACT_IDENTITY = "guide/guide-v1.records"
+MAX_GUIDE_RECORD_BYTES = 512 * 1024
+MAX_GUIDE_STREAM_BYTES = 64 * 1024 * 1024
+MAX_GUIDE_RECORDS = 100000
 JSON_COLUMNS = {
     ("liquid_blocks", "sequence_key"),
     ("liquid_blocks", "break_info"),
@@ -72,6 +77,7 @@ EXPECTED_RESPONSE_FIELDS = {
     "phase_reached", "scheduler_invoked", "validation_context",
     "affected_channels", "channels", "verification", "preservation",
     "path_validation", "warnings", "failure", "timings_ms", "diagnostics",
+    "guide_validation",
 }
 
 
@@ -413,6 +419,106 @@ def _normalized_response(response):
     return result
 
 
+def _queue_guide_records(index, stage, response):
+    guide = response["guide_validation"]
+    if guide.get("artifact_identity") != GUIDE_ARTIFACT_IDENTITY:
+        raise NormalizationError("guide artifact identity is not the fixed C3a1 identity")
+    path = Path(stage) / GUIDE_ARTIFACT_IDENTITY
+    directory = path.parent
+    directory_descriptor = os.open(
+        directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except Exception:
+        os.close(directory_descriptor)
+        raise
+    digest = hashlib.sha256()
+    try:
+        directory_before = os.fstat(directory_descriptor)
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_uid != os.geteuid()
+            or before.st_size > MAX_GUIDE_STREAM_BYTES
+            or before.st_size != guide.get("byte_count")
+            or not stat.S_ISDIR(directory_before.st_mode)
+            or stat.S_IMODE(directory_before.st_mode) != 0o700
+            or directory_before.st_uid != os.geteuid()
+            or os.listdir(directory_descriptor) != [path.name]
+        ):
+            raise NormalizationError("guide artifact is unsafe or oversized")
+
+        def read_exact(size):
+            chunks = []
+            remaining = size
+            while remaining:
+                chunk = os.read(descriptor, min(65536, remaining))
+                if not chunk:
+                    raise NormalizationError("guide artifact is truncated")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            digest.update(raw)
+            return raw
+
+        if read_exact(len(GUIDE_MAGIC)) != GUIDE_MAGIC:
+            raise NormalizationError("guide artifact format/version mismatch")
+        count = 0
+        while True:
+            length = os.read(descriptor, 8)
+            if not length:
+                break
+            digest.update(length)
+            if len(length) != 8:
+                length += read_exact(8 - len(length))
+            size = int.from_bytes(length, "big")
+            if size > MAX_GUIDE_RECORD_BYTES:
+                raise NormalizationError("guide artifact record exceeds size limit")
+            raw = read_exact(size)
+            count += 1
+            if count > MAX_GUIDE_RECORDS:
+                raise NormalizationError("guide artifact record-count limit exceeded")
+            try:
+                record = json.loads(
+                    raw.decode("utf-8"), object_pairs_hook=_pairs,
+                    parse_constant=_reject_constant,
+                )
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise NormalizationError(f"malformed guide artifact record: {exc}") from exc
+            if not isinstance(record, dict) or set(record) != {"path", "value"}:
+                raise NormalizationError("guide artifact record shape is unsupported")
+            record_path = record["path"]
+            if not isinstance(record_path, str) or not record_path.startswith("/guide/"):
+                raise NormalizationError("guide artifact record path is invalid")
+            _queue_record(index, record_path, record["value"])
+        after = os.fstat(descriptor)
+        path_info = path.lstat()
+        directory_after = os.fstat(directory_descriptor)
+        identity = lambda item: (
+            item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns,
+            item.st_ctime_ns, item.st_nlink,
+        )
+        if identity(before) != identity(after) or (
+            path_info.st_dev, path_info.st_ino
+        ) != (after.st_dev, after.st_ino):
+            raise NormalizationError("guide artifact changed or was replaced")
+        if (
+            identity(directory_before) != identity(directory_after)
+            or os.listdir(directory_descriptor) != [path.name]
+        ):
+            raise NormalizationError("guide artifact directory changed")
+        if count != guide.get("record_count"):
+            raise NormalizationError("guide artifact record count mismatch")
+        if digest.hexdigest() != guide.get("digest"):
+            raise NormalizationError("guide artifact digest mismatch")
+    finally:
+        os.close(descriptor)
+        os.close(directory_descriptor)
+
+
 @dataclass
 class NormalizedRun:
     stream_path: Path
@@ -684,6 +790,7 @@ def normalize_completed_run(stage, baseline_database, response, proposal_boundar
                     value = json.loads(raw.decode("utf-8"))
                     _queue_record(index, path, value)
 
+            _queue_guide_records(index, stage, response)
             response_value = _normalized_response(response)
             _queue_record(index, "/c1-response", response_value)
             missing = index.execute(

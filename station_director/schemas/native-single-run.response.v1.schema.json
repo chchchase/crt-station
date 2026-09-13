@@ -3,14 +3,14 @@
   "$id": "https://crt-station.invalid/schemas/native-single-run.response.v1.schema.json",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "operation", "run_id", "proposal_id", "status", "phase_reached", "scheduler_invoked", "validation_context", "affected_channels", "channels", "verification", "preservation", "path_validation", "warnings", "failure", "timings_ms", "diagnostics"],
+  "required": ["schema_version", "operation", "run_id", "proposal_id", "status", "phase_reached", "scheduler_invoked", "validation_context", "affected_channels", "channels", "verification", "preservation", "path_validation", "guide_validation", "warnings", "failure", "timings_ms", "diagnostics"],
   "properties": {
     "schema_version": {"const": 1},
     "operation": {"const": "native_single_run"},
     "run_id": {"type": "string", "minLength": 1, "maxLength": 128},
     "proposal_id": {"type": "string", "minLength": 1},
     "status": {"enum": ["success", "failed"]},
-    "phase_reached": {"enum": ["request", "probes", "snapshot", "seed", "native_import", "configuration", "catalog", "scheduler", "preservation", "complete"]},
+    "phase_reached": {"enum": ["request", "probes", "snapshot", "seed", "native_import", "configuration", "catalog", "scheduler", "preservation", "guide", "complete"]},
     "scheduler_invoked": {"type": "boolean"},
     "validation_context": {
       "type": "object", "additionalProperties": false,
@@ -47,16 +47,18 @@
         "scheduled_path_checks": {"type": "integer", "minimum": 0}
       }
     }, {"type": "object", "maxProperties": 0}]},
+    "guide_validation": {"oneOf": [{"$ref": "#/$defs/guide_validation"}, {"type": "object", "maxProperties": 0}]},
     "warnings": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/diagnostic"}},
     "failure": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/diagnostic"}]},
     "timings_ms": {"oneOf": [{
       "type": "object", "additionalProperties": false,
-      "required": ["prepare", "catalog", "scheduler", "preservation", "total"],
+      "required": ["prepare", "catalog", "scheduler", "preservation", "guide", "total"],
       "properties": {
         "prepare": {"type": "integer", "minimum": 0},
         "catalog": {"type": "integer", "minimum": 0},
         "scheduler": {"type": "integer", "minimum": 0},
         "preservation": {"type": "integer", "minimum": 0},
+        "guide": {"type": "integer", "minimum": 0},
         "total": {"type": "integer", "minimum": 0}
       }
     }, {"type": "object", "maxProperties": 0}]},
@@ -70,6 +72,82 @@
     }
   },
   "$defs": {
+    "guide_boundary": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "instant", "match_count", "title"],
+      "properties": {
+        "name": {"type": "string", "maxLength": 100},
+        "instant": {"type": "string"},
+        "match_count": {"type": "integer", "minimum": 0, "maximum": 1},
+        "title": {"type": ["string", "null"], "maxLength": 1000}
+      }
+    },
+    "guide_channel": {
+      "type": "object", "additionalProperties": false,
+      "required": ["number", "name", "network_long_name", "hidden", "has_schedule", "listing_count", "transition_probe_count", "zero_match_count", "one_match_count", "named_boundaries", "named_boundaries_truncated"],
+      "properties": {
+        "number": {"type": "integer"}, "name": {"type": "string"},
+        "network_long_name": {"type": "string"}, "hidden": {"type": "boolean"},
+        "has_schedule": {"const": true},
+        "listing_count": {"type": "integer", "minimum": 0},
+        "transition_probe_count": {"type": "integer", "minimum": 0},
+        "zero_match_count": {"type": "integer", "minimum": 0},
+        "one_match_count": {"type": "integer", "minimum": 0},
+        "named_boundaries": {"type": "array", "maxItems": 16, "items": {"$ref": "#/$defs/guide_boundary"}},
+        "named_boundaries_truncated": {"type": "boolean"}
+      }
+    },
+    "guide_validation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "primary_failure", "snapshot_preparation", "snapshot_verification", "post_read_verification", "errors", "errors_truncated"],
+      "properties": {
+        "status": {"enum": ["pass", "failed"]},
+        "primary_failure": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/guide_primary_failure"}]},
+        "snapshot_preparation": {"$ref": "#/$defs/guide_verification"},
+        "snapshot_verification": {"$ref": "#/$defs/guide_verification"},
+        "post_read_verification": {"$ref": "#/$defs/guide_verification"},
+        "format_version": {"const": 1},
+        "artifact_identity": {"const": "guide/guide-v1.records"},
+        "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "record_count": {"type": "integer", "minimum": 1, "maximum": 100000},
+        "byte_count": {"type": "integer", "minimum": 13, "maximum": 67108864},
+        "channels": {"type": "array", "minItems": 1, "maxItems": 6, "items": {"$ref": "#/$defs/guide_channel"}},
+        "errors": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/diagnostic"}},
+        "errors_truncated": {"type": "boolean"}
+      },
+      "allOf": [{
+        "if": {"properties": {"status": {"const": "pass"}}},
+        "then": {
+          "required": ["format_version", "artifact_identity", "digest", "record_count", "byte_count", "channels"],
+          "properties": {
+            "primary_failure": {"type": "null"},
+            "snapshot_preparation": {"properties": {"status": {"const": "pass"}}},
+            "snapshot_verification": {"properties": {"status": {"const": "pass"}}},
+            "post_read_verification": {"properties": {"status": {"const": "pass"}}}
+          }
+        },
+        "else": {
+          "not": {"anyOf": [{"required": ["artifact_identity"]}, {"required": ["digest"]}, {"required": ["channels"]}]}
+        }
+      }]
+    },
+    "guide_primary_failure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["phase", "code", "message"],
+      "properties": {
+        "phase": {"enum": ["guide_snapshot", "guide_read"]},
+        "code": {"enum": ["guide_loading_failed", "guide_validation_failed"]},
+        "message": {"type": "string", "minLength": 1, "maxLength": 1000}
+      }
+    },
+    "guide_verification": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "message"],
+      "properties": {
+        "status": {"enum": ["pass", "failed", "not_run"]},
+        "message": {"type": ["string", "null"], "maxLength": 1000}
+      }
+    },
     "diagnostic": {
       "type": "object", "additionalProperties": false,
       "required": ["phase", "channel", "code", "type", "message"],

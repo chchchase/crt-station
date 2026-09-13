@@ -3,6 +3,7 @@ from datetime import datetime
 from fs42.station_manager import StationManager
 from fs42.liquid_api import LiquidAPI
 from fs42.metadata_io import MetadataIO
+from fs42.guide_payloads import build_all_schedules_payload, _listing_projection
 
 router = APIRouter(prefix="/schedules", tags=["schedules"])
 
@@ -105,30 +106,7 @@ def _attach_meta_batch(by_station):
                 block.meta = metas[path]
 
 
-def _listing_projection(blocks, include_meta):
-    # only get the stuff we need
-    listings = []
-    for block in blocks:
-        listing = {
-            "title": block.title,
-            "start_time": block.start_time.isoformat(),
-            "end_time": block.end_time.isoformat(),
-        }
-        if include_meta:
-            meta = getattr(block, "meta", None)
-            if meta:
-                listing["meta"] = meta
-        listings.append(listing)
-    return listings
-
-
 # NOTE: must stay above /{network_name}, or that route captures "all".
-def build_all_schedules_payload(start, end, by_station, include_meta=False):
-    """Transform already-loaded schedule data into the guide payload."""
-    schedules = {name: _listing_projection(blocks, include_meta) for name, blocks in by_station.items()}
-    return {"start": start, "end": end, "schedules": schedules}
-
-
 @router.get("/all")
 def get_all_schedules(start: str = None, end: str = None, include_meta: bool = False):
     if not start or not end:

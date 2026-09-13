@@ -78,6 +78,7 @@ def _base_response(request):
         "verification": {},
         "preservation": {},
         "path_validation": {},
+        "guide_validation": {},
         "warnings": [],
         "failure": None,
         "timings_ms": {},
@@ -115,6 +116,7 @@ def run_worker(
                 channels=result["channels"],
                 preservation=result["preservation"],
                 path_validation=result["path_validation"],
+                guide_validation=result["guide_validation"],
                 timings_ms=result["timings_ms"],
                 verification=result["verification"],
                 scheduler_invoked=result["scheduler_invoked"],
@@ -141,6 +143,9 @@ def run_worker(
                 response["phase_reached"], getattr(exc, "code", "native_failure"),
                 exc, getattr(exc, "channel", None),
             )
+            guide_validation = getattr(exc, "guide_validation", None)
+            if guide_validation is not None:
+                response["guide_validation"] = guide_validation
             for label in ("original_failure", "restoration_failure"):
                 detail = getattr(exc, label, None)
                 if detail:
