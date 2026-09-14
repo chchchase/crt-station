@@ -45,6 +45,7 @@ from station_director.single_run import (
     inspect_single_run,
     launch_single_run,
 )
+from station_director.c1_diagnostics import launcher_summary, make_diagnostic
 from station_director.single_run_protocol import validate_document
 from station_director.validation_context import (
     logical_media_manifest_fingerprint,
@@ -57,7 +58,7 @@ COMPARISON_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
 MINIMUM_FREE_BYTES = 512 * 1024 * 1024
 PER_RUN_TIMEOUT_SECONDS = 30 * 60
 TOTAL_TIMEOUT_SECONDS = 75 * 60
-RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v1.schema.json"
+RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v2.schema.json"
 
 CAPTURE_FAILURE_KINDS = frozenset({
     "source_path_resolution", "invocation_verification", "stage_allocation",
@@ -80,7 +81,8 @@ SINGLE_RUN_CAPTURE_MESSAGES = {
 class DualRunError(RuntimeError):
     def __init__(self, phase, code, message, *, category=None,
                  capture_failure_kind=None, capture_run=None,
-                 finalization_subphase=None):
+                 finalization_subphase=None, c1_diagnostic=None,
+                 launcher_summary_value=None):
         super().__init__(message)
         self.phase = phase
         self.code = code
@@ -97,6 +99,8 @@ class DualRunError(RuntimeError):
             raise ValueError("invalid finalization subphase")
         self.capture_run = capture_run
         self.finalization_subphase = finalization_subphase
+        self.c1_diagnostic = c1_diagnostic
+        self.launcher_summary = launcher_summary_value
 
 
 def _raise_if_cancelled(exc):
@@ -624,7 +628,7 @@ def _prepare_scope(project_root, source_root, media_root, proposal, policy, comp
 
 def _base_result(comparison_id):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "operation": "native_dual_run_comparison",
         "comparison_id": comparison_id,
         "status": "failed",
@@ -664,6 +668,22 @@ def _validate_result_semantics(result):
     """Enforce outcome relationships that JSON Schema cannot express safely."""
     failure = result.get("failure")
     if failure is not None:
+        c1 = failure.get("c1_diagnostic")
+        launcher = failure.get("launcher_summary")
+        if failure.get("code") == "c1_run_failed":
+            from station_director.c1_diagnostics import validate_diagnostic
+            if not isinstance(c1, dict) or c1.get("run") not in (1, 2):
+                raise DualRunError("protocol", "invalid_result", "C1 failure lacks run identity")
+            validate_diagnostic(c1.get("detail"))
+            run_key = f"run_{c1['run']}"
+            if failure.get("phase") != run_key:
+                raise DualRunError("protocol", "invalid_result", "C1 run/phase mismatch")
+            if c1["detail"]["scheduler_invoked"] != result["scheduler_invoked"][run_key]:
+                raise DualRunError("protocol", "invalid_result", "C1 scheduler state mismatch")
+            if not isinstance(launcher, dict):
+                raise DualRunError("protocol", "invalid_result", "C1 failure lacks launcher summary")
+        elif c1 is not None or launcher is not None:
+            raise DualRunError("protocol", "invalid_result", "unexpected C1 diagnostic")
         capture_run = failure.get("capture_run")
         subphase = failure.get("finalization_subphase")
         finalization_failure = (
@@ -744,7 +764,13 @@ def run_dual_comparison(
             if remaining <= 0:
                 raise DualRunError(
                     f"run_{index}", "c1_run_failed", "C2 total timeout expired",
-                    category="total_timeout",
+                    category="launcher_timeout",
+                    c1_diagnostic={"run": index, "detail": make_diagnostic(
+                        "launcher_timeout", "launch")},
+                    launcher_summary_value={
+                        "outcome": "timed_out", "stdout_bytes": 0,
+                        "stderr_bytes": 0, "stdout_truncated": False,
+                        "stderr_truncated": False},
                 )
             try:
                 launch_single_run(
@@ -753,20 +779,35 @@ def run_dual_comparison(
                 response = inspect_single_run(lifecycle)
             except Exception as exc:
                 _raise_if_cancelled(exc)
+                if isinstance(exc, SingleRunError) and exc.c1_diagnostic is not None:
+                    diagnostic = exc.c1_diagnostic
+                    launch_summary = exc.launcher_summary
+                elif getattr(lifecycle, "launcher_result", None) is not None:
+                    diagnostic = make_diagnostic(
+                        "worker_response_invalid", "response")
+                    launch_summary = launcher_summary(lifecycle.launcher_result)
+                else:
+                    diagnostic = make_diagnostic("launcher_failed", "launch")
+                    launch_summary = {
+                        "outcome": "launch_error", "stdout_bytes": 0,
+                        "stderr_bytes": 0, "stdout_truncated": False,
+                        "stderr_truncated": False}
                 raise DualRunError(
                     f"run_{index}", "c1_run_failed",
-                    f"C1 run {index} failed ({type(exc).__name__})",
-                    category=((exc.category or exc.code)
-                              if isinstance(exc, DualRunError)
-                              else exc.code if isinstance(exc, SingleRunError)
-                              else None),
+                    "An isolated native scheduling run failed.",
+                    category=diagnostic["code"],
+                    c1_diagnostic={"run": index, "detail": diagnostic},
+                    launcher_summary_value=launch_summary,
                 ) from exc
             result["scheduler_invoked"][f"run_{index}"] = response["scheduler_invoked"]
             if response["status"] != "success":
+                launch_summary = launcher_summary(lifecycle.launcher_result)
                 raise DualRunError(
                     f"run_{index}", "c1_run_failed",
-                    f"C1 run {index} returned failure",
-                    category=(response.get("failure") or {}).get("code"),
+                    "An isolated native scheduling run failed.",
+                    category=response["failure"]["code"],
+                    c1_diagnostic={"run": index, "detail": response["failure"]},
+                    launcher_summary_value=launch_summary,
                 )
             try:
                 lifecycle.settle_unit()
@@ -924,6 +965,9 @@ def run_dual_comparison(
                         if code == "source_capture_failed" else
                         safe_message),
         }
+        if isinstance(exc, DualRunError) and exc.code == "c1_run_failed":
+            result["failure"]["c1_diagnostic"] = exc.c1_diagnostic
+            result["failure"]["launcher_summary"] = exc.launcher_summary
         if capture_failure_kind is not None:
             result["failure"]["capture_failure_kind"] = capture_failure_kind
         if capture_run is not None:

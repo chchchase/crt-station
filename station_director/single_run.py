@@ -23,11 +23,13 @@ from station_director.preservation import (
 )
 from station_director.single_run_protocol import (
     HeldDocument,
-    RESPONSE_SCHEMA,
+    ProtocolError,
+    RESPONSE_SCHEMA_V2 as RESPONSE_SCHEMA,
     bind_request,
     write_private_json_exclusive,
     REQUEST_SCHEMA,
 )
+from station_director.c1_diagnostics import launcher_summary, make_diagnostic
 from station_director.validation_context import (
     canonical_seed_inputs,
     derive_validation_context,
@@ -55,7 +57,8 @@ FINALIZATION_SUBPHASES = frozenset({
 
 
 class SingleRunError(RuntimeError):
-    def __init__(self, phase, code, message, *, finalization_subphase=None):
+    def __init__(self, phase, code, message, *, finalization_subphase=None,
+                 c1_diagnostic=None, launcher=None):
         super().__init__(message)
         self.phase = phase
         self.code = code
@@ -63,6 +66,8 @@ class SingleRunError(RuntimeError):
                 and finalization_subphase not in FINALIZATION_SUBPHASES):
             raise ValueError("invalid finalization subphase")
         self.finalization_subphase = finalization_subphase
+        self.c1_diagnostic = c1_diagnostic
+        self.launcher_summary = launcher
 
 
 class SingleRunFinalizationError(SingleRunError):
@@ -386,23 +391,49 @@ def inspect_single_run(lifecycle):
     if lifecycle.launcher_result is None:
         raise SingleRunError("inspect", "not_launched", "run has not been launched")
     if lifecycle.launcher_result.timed_out:
-        raise SingleRunError("timeout", "worker_timeout", "native worker timed out")
-    with HeldDocument(lifecycle.stage / RESPONSE_NAME, RESPONSE_SCHEMA) as document:
+        raise SingleRunError(
+            "launch", "worker_timeout", "native worker timed out",
+            c1_diagnostic=make_diagnostic("launcher_timeout", "launch"),
+            launcher=launcher_summary(lifecycle.launcher_result))
+    response_path = lifecycle.stage / RESPONSE_NAME
+    if not os.path.lexists(response_path):
+        raise SingleRunError(
+            "response", "worker_response_missing", "worker response is missing",
+            c1_diagnostic=make_diagnostic("worker_response_missing", "response"),
+            launcher=launcher_summary(lifecycle.launcher_result))
+    try:
+        document_context = HeldDocument(response_path, RESPONSE_SCHEMA)
+    except ProtocolError as exc:
+        raise SingleRunError(
+            "response", "worker_response_invalid", "worker response is invalid",
+            c1_diagnostic=make_diagnostic("worker_response_invalid", "response"),
+            launcher=launcher_summary(lifecycle.launcher_result)) from exc
+    with document_context as document:
         response = document.payload
         if response["run_id"] != lifecycle.run_id:
-            raise SingleRunError("protocol", "run_id_mismatch", "worker run ID mismatch")
+            raise SingleRunError("response", "run_id_mismatch", "worker run ID mismatch",
+                                 c1_diagnostic=make_diagnostic("worker_response_identity_mismatch", "response"),
+                                 launcher=launcher_summary(lifecycle.launcher_result))
         if response["proposal_id"] != lifecycle.request["proposal"]["proposal_id"]:
-            raise SingleRunError("protocol", "proposal_id_mismatch", "worker proposal ID mismatch")
+            raise SingleRunError("response", "proposal_id_mismatch", "worker proposal ID mismatch",
+                                 c1_diagnostic=make_diagnostic("worker_response_identity_mismatch", "response"),
+                                 launcher=launcher_summary(lifecycle.launcher_result))
         context = response["validation_context"]
         expected = lifecycle.request["validation_context"]
         for name in ("input_fingerprint", "requested_seed", "effective_seed"):
             if context[name] != expected[name]:
-                raise SingleRunError("protocol", "context_mismatch", f"worker {name} mismatch")
+                raise SingleRunError("response", "context_mismatch", "worker context mismatch",
+                                     c1_diagnostic=make_diagnostic("worker_context_mismatch", "response"),
+                                     launcher=launcher_summary(lifecycle.launcher_result))
         if response["affected_channels"] != lifecycle.request["affected_channels"]:
-            raise SingleRunError("protocol", "affected_channels_mismatch", "worker affected channels mismatch")
+            raise SingleRunError("response", "affected_channels_mismatch", "worker affected channels mismatch",
+                                 c1_diagnostic=make_diagnostic("worker_channels_mismatch", "response"),
+                                 launcher=launcher_summary(lifecycle.launcher_result))
         document.assert_unchanged()
     if lifecycle.launcher_result.returncode != (0 if response["status"] == "success" else 1):
-        raise SingleRunError("protocol", "exit_status_mismatch", "worker exit status contradicts response")
+        raise SingleRunError("response", "exit_status_mismatch", "worker exit status contradicts response",
+                             c1_diagnostic=make_diagnostic("worker_exit_status_mismatch", "response"),
+                             launcher=launcher_summary(lifecycle.launcher_result))
     lifecycle.response = response
     return response
 

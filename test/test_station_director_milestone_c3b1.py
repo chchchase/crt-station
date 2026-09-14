@@ -392,6 +392,24 @@ class LockAndOutcomeTests(unittest.TestCase):
 
 
 class CoordinatorFlowTests(unittest.TestCase):
+    def test_safe_c1_diagnostic_reaches_bounded_cli(self):
+        outcome = CoordinatorOutcome(
+            state="failed", proposal_id=VALID_PROPOSAL["proposal_id"],
+            run_id=RUN_ID, validation_status="failed", phase="run_1",
+            failure_code="c1_run_failed", scheduler_invoked=(False, False),
+            c1_run=1, c1_domain="worker_verification", c1_phase="snapshot",
+            c1_code="original_database_verification_failed",
+            c1_fingerprint_category="original_logical_database",
+            c1_launcher_outcome="nonzero_exit", c1_stdout_bytes=12,
+            c1_stderr_bytes=34, c1_stdout_truncated=True,
+            c1_stderr_truncated=False)
+        rendered = render_cli_outcome(outcome)
+        self.assertIn("C1 run: 1", rendered)
+        self.assertIn("C1 code: original_database_verification_failed", rendered)
+        self.assertIn("C1 fingerprint category: original_logical_database", rendered)
+        self.assertIn("C1 output bytes: stdout=12 stderr=34", rendered)
+        self.assertNotIn("/", rendered)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -508,7 +526,7 @@ class CoordinatorFlowTests(unittest.TestCase):
                 failure_code="source_capture_failed",
                 capture_failure_kind="single_run_finalization")
 
-    def test_finalization_run_and_subphase_reach_v3_report_text_and_cli(self):
+    def test_finalization_run_and_subphase_reach_v4_report_text_and_cli(self):
         result = self.coordinator._minimal_c2_failure(
             RUN_ID, "source_capture_failed", "capture",
             capture_failure_kind="single_run_finalization",
@@ -525,7 +543,7 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertEqual(len(report_directories), 1)
         document = json.loads(
             (report_directories[0] / "validation.json").read_text(encoding="utf-8"))
-        self.assertEqual(document["schema_version"], 3)
+        self.assertEqual(document["schema_version"], 4)
         finding = document["findings"]["errors"][0]
         self.assertEqual(finding["capture_run"], 2)
         self.assertEqual(finding["finalization_subphase"], "proposal_projection")

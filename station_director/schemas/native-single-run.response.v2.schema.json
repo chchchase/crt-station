@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crt-station.invalid/schemas/native-single-run.response.v2.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "operation", "run_id", "proposal_id", "status", "phase_reached", "scheduler_invoked", "validation_context", "affected_channels", "channels", "verification", "preservation", "path_validation", "guide_validation", "warnings", "failure", "timings_ms", "diagnostics"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "operation": {"$ref": "native-single-run.response.v1.schema.json#/properties/operation"},
+    "run_id": {"$ref": "native-single-run.response.v1.schema.json#/properties/run_id"},
+    "proposal_id": {"$ref": "native-single-run.response.v1.schema.json#/properties/proposal_id"},
+    "status": {"$ref": "native-single-run.response.v1.schema.json#/properties/status"},
+    "phase_reached": {"$ref": "native-single-run.response.v1.schema.json#/properties/phase_reached"},
+    "scheduler_invoked": {"type": "boolean"},
+    "validation_context": {"$ref": "native-single-run.response.v1.schema.json#/properties/validation_context"},
+    "affected_channels": {"$ref": "native-single-run.response.v1.schema.json#/properties/affected_channels"},
+    "channels": {"$ref": "native-single-run.response.v1.schema.json#/properties/channels"},
+    "verification": {"$ref": "native-single-run.response.v1.schema.json#/properties/verification"},
+    "preservation": {"$ref": "native-single-run.response.v1.schema.json#/properties/preservation"},
+    "path_validation": {"$ref": "native-single-run.response.v1.schema.json#/properties/path_validation"},
+    "guide_validation": {"$ref": "native-single-run.response.v1.schema.json#/properties/guide_validation"},
+    "warnings": {"type": "array", "maxItems": 50, "items": {"$ref": "#/$defs/diagnostic"}},
+    "failure": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/diagnostic"}]},
+    "timings_ms": {"$ref": "native-single-run.response.v1.schema.json#/properties/timings_ms"},
+    "diagnostics": {"type": "object", "additionalProperties": false, "required": ["messages", "truncated"], "properties": {"messages": {"type": "array", "maxItems": 0}, "truncated": {"type": "boolean"}}}
+  },
+  "$defs": {
+    "diagnostic": {
+      "type": "object", "additionalProperties": false,
+      "required": ["domain", "phase", "code", "template", "scheduler_invoked", "probe", "fingerprint_category", "channel_number"],
+      "properties": {
+        "domain": {"enum": ["launcher", "worker_protocol", "isolation_probe", "worker_verification", "native_import", "native_preparation", "native_catalog", "native_scheduler", "native_preservation", "native_guide"]},
+        "phase": {"enum": ["launch", "response", "request", "probes", "snapshot", "seed", "native_import", "configuration", "catalog", "scheduler", "preservation", "guide"]},
+        "code": {"enum": ["launcher_failed", "launcher_timeout", "worker_response_missing", "worker_response_invalid", "worker_response_identity_mismatch", "worker_context_mismatch", "worker_channels_mismatch", "worker_exit_status_mismatch", "isolation_probe_failed", "original_configuration_verification_failed", "original_database_verification_failed", "media_manifest_verification_failed", "physical_transition_verification_failed", "projected_configuration_verification_failed", "working_database_verification_failed", "request_integrity_failed", "validation_context_failed", "timezone_verification_failed", "hash_seed_verification_failed", "effective_seed_verification_failed", "native_import_failed", "native_warning", "missing_attestation", "invalid_configuration", "protected_channel", "unknown_channel", "native_configuration", "unsupported_autobump", "staged_preparation", "sequence_restore_failure", "catalog_failure", "catalog_reconciliation", "native_system_exit", "scheduler_failure", "native_failure", "preservation_failure", "guide_loading_failed", "guide_validation_failed"]},
+        "template": {"type": "string", "minLength": 1, "maxLength": 160},
+        "scheduler_invoked": {"type": "boolean"},
+        "probe": {"oneOf": [{"type": "null"}, {"enum": ["environment_sanitized", "host_home_not_exposed", "host_run_not_exposed", "user_bus_not_exposed", "proc_private", "dev_private", "tmp_private", "project_mount_read_only", "media_mount_read_only", "staging_mount_writable", "ipv4_blocked", "ipv6_blocked", "loopback_4242_blocked", "af_unix_path_safe", "af_unix_round_trip", "staging_create", "staging_read", "staging_rename", "staging_delete"]}]},
+        "fingerprint_category": {"oneOf": [{"type": "null"}, {"enum": ["original_logical_configuration", "original_logical_database", "logical_media_manifest", "live_physical_configuration", "staged_source_physical_configuration", "projected_logical_configuration", "working_logical_database"]}]},
+        "channel_number": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 1, "maximum": 8}]}
+      }
+    }
+  }
+}

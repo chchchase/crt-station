@@ -27,10 +27,11 @@ VALIDATIONS_ROOT = PROJECT_ROOT / "runtime/director/validations"
 REPORT_SCHEMA_V1 = Path(__file__).with_name("schemas") / "validation-report.v1.schema.json"
 REPORT_SCHEMA_V2 = Path(__file__).with_name("schemas") / "validation-report.v2.schema.json"
 REPORT_SCHEMA_V3 = Path(__file__).with_name("schemas") / "validation-report.v3.schema.json"
-# New reports always use v3. The v1/v2 paths remain frozen for retained reports.
-REPORT_SCHEMA = REPORT_SCHEMA_V3
+REPORT_SCHEMA_V4 = Path(__file__).with_name("schemas") / "validation-report.v4.schema.json"
+# New reports always use v4. Older paths remain frozen for retained reports.
+REPORT_SCHEMA = REPORT_SCHEMA_V4
 LATEST_SCHEMA = Path(__file__).with_name("schemas") / "latest-validation-pointer.v1.schema.json"
-DUAL_RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v1.schema.json"
+DUAL_RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v2.schema.json"
 PROPOSAL_ID_RE = re.compile(r"p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}\Z")
 RUN_ID_RE = re.compile(r"v-[0-9]{8}T[0-9]{6}[0-9]{6}Z-[a-f0-9]{32}\Z")
 MAX_REPORT_JSON_BYTES = 512 * 1024
@@ -170,17 +171,37 @@ def _safe_identifier(value):
 
 
 def validate_report_document(report, *, retained=False):
-    """Validate a new v3 report or a retained immutable v1/v2/v3 report."""
+    """Validate a new v4 report or a retained immutable v1/v2/v3/v4 report."""
     if not isinstance(report, dict):
         raise ReportError("invalid_report", "validation report must be an object")
     version = report.get("schema_version")
-    if version == 3:
-        schema = REPORT_SCHEMA_V3
-    elif retained and version in (1, 2):
-        schema = REPORT_SCHEMA_V1 if version == 1 else REPORT_SCHEMA_V2
+    if version == 4:
+        schema = REPORT_SCHEMA_V4
+    elif retained and version in (1, 2, 3):
+        schema = {1: REPORT_SCHEMA_V1, 2: REPORT_SCHEMA_V2,
+                  3: REPORT_SCHEMA_V3}[version]
     else:
         raise ReportError("invalid_report_version", "unsupported validation report version")
     validate_document(report, schema)
+    if version == 4:
+        from station_director.c1_diagnostics import validate_diagnostic
+        for group in ("baseline_findings", "unexpected_differences", "warnings", "errors"):
+            for finding in report["findings"][group]:
+                if finding["template"] != DIAGNOSTIC_TEMPLATES.get(finding["code"]):
+                    raise ReportError("invalid_report", "report diagnostic template mismatch")
+                c1 = finding["c1_diagnostic"]
+                if finding["code"] == "c1_run_failed":
+                    try:
+                        validate_diagnostic(c1["detail"])
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ReportError("invalid_report", "invalid C1 report diagnostic") from exc
+                    if finding["phase"] != f"run_{c1['run']}":
+                        raise ReportError("invalid_report", "C1 report run/phase mismatch")
+                    if c1["detail"]["scheduler_invoked"] != report["validation"][
+                            "scheduler_invoked"][f"run_{c1['run']}"]:
+                        raise ReportError("invalid_report", "C1 scheduler state mismatch")
+                elif c1 is not None:
+                    raise ReportError("invalid_report", "unexpected C1 report diagnostic")
 
 
 def _structured_finding(value, default_code, default_phase):
@@ -229,6 +250,22 @@ def _structured_finding(value, default_code, default_phase):
     else:
         capture_run = None
         finalization_subphase = None
+    c1_diagnostic = None
+    if code == "c1_run_failed":
+        from station_director.c1_diagnostics import validate_diagnostic
+        wrapped = value.get("c1_diagnostic")
+        launcher = value.get("launcher_summary")
+        if (not isinstance(wrapped, dict) or wrapped.get("run") not in (1, 2)
+                or not isinstance(launcher, dict)):
+            raise ReportError("invalid_report_input", "C1 failure lacks safe diagnostics")
+        validate_diagnostic(wrapped.get("detail"))
+        c1_diagnostic = {
+            "run": wrapped["run"], "detail": dict(wrapped["detail"]),
+            "launcher_summary": {
+                key: launcher[key] for key in (
+                    "outcome", "stdout_bytes", "stderr_bytes",
+                    "stdout_truncated", "stderr_truncated")},
+        }
     finding = {
         "code": code,
         "phase": phase,
@@ -239,6 +276,7 @@ def _structured_finding(value, default_code, default_phase):
         "capture_failure_kind": capture_failure_kind,
         "capture_run": capture_run,
         "finalization_subphase": finalization_subphase,
+        "c1_diagnostic": c1_diagnostic,
     }
     digest_input = ({
         "code": finding["code"], "phase": finding["phase"],
@@ -246,7 +284,9 @@ def _structured_finding(value, default_code, default_phase):
         "capture_run": finding["capture_run"],
         "finalization_subphase": finding["finalization_subphase"],
         "template": finding["template"],
-    } if code == "source_capture_failed" or detailed_finalization else value)
+    } if code == "source_capture_failed" or detailed_finalization else (
+        {"code": code, "phase": phase, "template": finding["template"],
+         "c1_diagnostic": c1_diagnostic} if code == "c1_run_failed" else value))
     finding["diagnostic_digest"] = _diagnostic_digest(digest_input)
     return finding
 
@@ -387,9 +427,9 @@ def build_validation_report(proposal, c2_result, run_id, completed_at):
         "sequence_changes", "break_changes",
     )}
     report = {
-        "schema_version": 3,
+        "schema_version": 4,
         "report_type": "station_director_validation",
-        "software": {"director_version": __version__, "report_schema_version": 3},
+        "software": {"director_version": __version__, "report_schema_version": 4},
         "proposal": {"id": proposal["proposal_id"], "schema_version": proposal["schema_version"],
                      "digest": hashlib.sha256(_canonical_json(proposal)).hexdigest()},
         "validation": {

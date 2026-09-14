@@ -27,12 +27,17 @@ from station_director.single_run_protocol import (
     MAX_DOCUMENT_BYTES,
     ProtocolError,
     REQUEST_SCHEMA,
-    RESPONSE_SCHEMA,
+    RESPONSE_SCHEMA_V2 as RESPONSE_SCHEMA,
+    RESPONSE_SCHEMA_V1,
     bind_request,
     strict_json_loads,
     write_private_json_exclusive,
 )
-from station_director.single_run_worker import run_worker
+from station_director.single_run_worker import run_worker, _base_response
+from station_director.c1_diagnostics import (
+    DIAGNOSTIC_RULES, FINGERPRINT_CATEGORIES, PROBE_IDENTIFIERS,
+    make_diagnostic, validate_diagnostic,
+)
 from station_director.single_run import (
     FINALIZATION_SUBPHASES,
     SingleRunError,
@@ -367,7 +372,7 @@ class WorkerBoundaryTests(unittest.TestCase):
             ), patch("station_director.single_run_worker.importlib.import_module") as loader:
                 response = run_worker(request_path, output)
             self.assertNotIn(unittest.mock.call("station_director.native_single_run"), loader.mock_calls)
-            self.assertEqual(response["failure"]["code"], "attestation_failure")
+            self.assertEqual(response["failure"]["code"], "projected_configuration_verification_failed")
             self.assertEqual(response["phase_reached"], "snapshot")
             self.assertFalse(response["scheduler_invoked"])
 
@@ -405,7 +410,7 @@ class WorkerBoundaryTests(unittest.TestCase):
             request_path = self._write_request(root, request)
             from station_director.worker_bootstrap import BootstrapError
             with patch.dict(os.environ, {"TZ": "America/Los_Angeles", "PYTHONHASHSEED": "0"}), patch(
-                "station_director.single_run_worker.attest_before_native_import", side_effect=BootstrapError("seed mismatch", phase="seed")
+                "station_director.single_run_worker.attest_before_native_import", side_effect=BootstrapError("seed mismatch", phase="seed", code="effective_seed_verification_failed")
             ), patch("station_director.single_run_worker.importlib.import_module") as loader:
                 response = run_worker(request_path, root / "response.json")
             self.assertNotIn(unittest.mock.call("station_director.native_single_run"), loader.mock_calls)
@@ -457,8 +462,8 @@ class WorkerBoundaryTests(unittest.TestCase):
             request_path = self._write_request(root, request)
             from station_director.worker_bootstrap import BootstrapError
             with patch.dict(os.environ, {"TZ": "America/Los_Angeles", "PYTHONHASHSEED": "0"}), patch(
-                "station_director.single_run_worker.importlib.import_module"
-            ) as loader, patch("station_director.single_run_worker.attest_before_native_import", side_effect=BootstrapError("probe failed", phase="probes")):
+            "station_director.single_run_worker.importlib.import_module"
+            ) as loader, patch("station_director.single_run_worker.attest_before_native_import", side_effect=BootstrapError("probe failed", phase="probes", code="isolation_probe_failed", probe="environment_sanitized")):
                 response = run_worker(request_path, root / "response.json")
             self.assertNotIn(unittest.mock.call("station_director.native_single_run"), loader.mock_calls)
             self.assertEqual(response["phase_reached"], "probes")
@@ -1092,6 +1097,230 @@ class SyntheticNativeEngineTests(unittest.TestCase):
             self.assertTrue(caught.exception.scheduler_invoked)
 
 
+class VersionedDiagnosticTests(unittest.TestCase):
+    def _request_file(self, root):
+        media = root / "media"
+        media.mkdir()
+        request = request_for(root, media)
+        path = root / "request.json"
+        write_private_json_exclusive(path, request, REQUEST_SCHEMA)
+        return request, path
+
+    def _success_response(self, request):
+        return {
+            "schema_version": 2, "operation": "native_single_run",
+            "run_id": request["run_id"],
+            "proposal_id": request["proposal"]["proposal_id"],
+            "status": "success", "phase_reached": "complete",
+            "scheduler_invoked": True,
+            "validation_context": {key: request["validation_context"][key]
+                                   for key in ("input_fingerprint", "requested_seed",
+                                               "effective_seed")},
+            "affected_channels": request["affected_channels"],
+            "channels": [passing_channel()], "verification": passing_verification(),
+            "preservation": {"retained_history": "pass", "protected_channels": "pass",
+                             "sequence_tables_restored": "pass",
+                             "foreign_key_baseline": "pass"},
+            "path_validation": {"passed": True, "mapping_count": 0,
+                                "scheduled_path_checks": 0},
+            "guide_validation": passing_guide(), "warnings": [], "failure": None,
+            "timings_ms": {"prepare": 0, "catalog": 0, "scheduler": 1,
+                           "preservation": 0, "guide": 0, "total": 1},
+            "diagnostics": {"messages": [], "truncated": False},
+        }
+
+    def test_dependency_free_rules_are_strict_and_value_free(self):
+        source = (ROOT / "station_director/c1_diagnostics.py").read_text()
+        tree = ast.parse(source)
+        imports = {alias.name for node in ast.walk(tree)
+                   if isinstance(node, ast.Import) for alias in node.names}
+        imports.update(node.module for node in ast.walk(tree)
+                       if isinstance(node, ast.ImportFrom))
+        self.assertEqual(imports, set())
+        for code, (domain, phases, template) in DIAGNOSTIC_RULES.items():
+            item = make_diagnostic(code, phases[0])
+            validate_diagnostic(item)
+            self.assertEqual((item["domain"], item["template"]), (domain, template))
+            self.assertNotIn("/", item["template"])
+        with self.assertRaises(ValueError):
+            make_diagnostic("isolation_probe_failed", "probes", probe="not-a-probe")
+
+    def test_every_preimport_boundary_is_safe_and_prevents_import(self):
+        cases = [
+            ("isolation_probe_failed", "probes", "environment_sanitized", None),
+            ("original_configuration_verification_failed", "snapshot", None, "original_logical_configuration"),
+            ("original_database_verification_failed", "snapshot", None, "original_logical_database"),
+            ("media_manifest_verification_failed", "snapshot", None, "logical_media_manifest"),
+            ("physical_transition_verification_failed", "snapshot", None, "live_physical_configuration"),
+            ("projected_configuration_verification_failed", "snapshot", None, "projected_logical_configuration"),
+            ("working_database_verification_failed", "snapshot", None, "working_logical_database"),
+            ("validation_context_failed", "seed", None, None),
+            ("timezone_verification_failed", "seed", None, None),
+            ("hash_seed_verification_failed", "seed", None, None),
+            ("effective_seed_verification_failed", "seed", None, None),
+        ]
+        for code, phase, probe, category in cases:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                request, request_path = self._request_file(root)
+                error = BootstrapError(
+                    "password=hunter2 /etc/shadow", phase=phase, code=code,
+                    probe=probe, fingerprint_category=category)
+                with patch(
+                    "station_director.single_run_worker.attest_before_native_import",
+                    side_effect=error,
+                ), patch(
+                    "station_director.single_run_worker.importlib.import_module"
+                ) as loader:
+                    result = run_worker(request_path, root / "response.json")
+                loader.assert_not_called()
+                self.assertEqual(result["schema_version"], 2)
+                self.assertEqual(result["failure"]["code"], code)
+                self.assertEqual(result["failure"]["probe"], probe)
+                self.assertEqual(result["failure"]["fingerprint_category"], category)
+                self.assertNotIn("hunter2", json.dumps(result))
+                self.assertNotIn("/etc", json.dumps(result))
+
+    def test_native_import_and_execution_phases_are_classified(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request, request_path = self._request_file(root)
+            with patch(
+                "station_director.single_run_worker.attest_before_native_import",
+                return_value=(probes(request["run_id"]), test_attestation(request)),
+            ), patch(
+                "station_director.single_run_worker.importlib.import_module",
+                side_effect=RuntimeError("secret /var/private"),
+            ):
+                result = run_worker(request_path, root / "response.json")
+            self.assertEqual(result["failure"]["code"], "native_import_failed")
+            self.assertNotIn("private", json.dumps(result))
+
+        native_cases = (
+            ("invalid_configuration", "configuration", False),
+            ("catalog_failure", "catalog", False),
+            ("scheduler_failure", "scheduler", True),
+            ("preservation_failure", "preservation", True),
+            ("guide_loading_failed", "guide", True),
+        )
+        for code, phase, invoked in native_cases:
+            with self.subTest(code=code), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                request, request_path = self._request_file(root)
+                failure = type("Failure", (RuntimeError,), {
+                    "code": code, "phase": phase, "scheduler_invoked": invoked,
+                    "channel": "Action", "guide_validation": None,
+                })("token=secret /home/private")
+                fake = types.SimpleNamespace(
+                    execute_native_single_run=lambda *unused: (_ for _ in ()).throw(failure))
+                with patch(
+                    "station_director.single_run_worker.attest_before_native_import",
+                    return_value=(probes(request["run_id"]), test_attestation(request)),
+                ), patch(
+                    "station_director.single_run_worker.importlib.import_module",
+                    return_value=fake,
+                ):
+                    result = run_worker(request_path, root / "response.json")
+                self.assertEqual(result["failure"]["code"], code)
+                self.assertEqual(result["failure"]["scheduler_invoked"], invoked)
+                self.assertEqual(result["scheduler_invoked"], invoked)
+                self.assertNotIn("secret", json.dumps(result))
+
+    def test_held_request_integrity_failure_prevents_native_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request, request_path = self._request_file(root)
+            with patch(
+                "station_director.single_run_worker.attest_before_native_import",
+                return_value=(probes(request["run_id"]), test_attestation(request)),
+            ), patch.object(
+                HeldDocument, "assert_unchanged",
+                side_effect=ProtocolError("hostile /etc/passwd password=bad"),
+            ), patch(
+                "station_director.single_run_worker.importlib.import_module"
+            ) as loader:
+                result = run_worker(request_path, root / "response.json")
+            loader.assert_not_called()
+            self.assertEqual(result["failure"]["code"], "request_integrity_failed")
+            self.assertNotIn("passwd", json.dumps(result))
+
+    def test_v1_response_is_rejected_by_current_inspector(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request, unused = self._request_file(root)
+            lifecycle = SingleRunLifecycle(
+                ROOT, root, types.SimpleNamespace(closed=False), "token",
+                request["run_id"], "unit", request,
+                launcher_result=LaunchResult("unit", 1, "", ""))
+            response = _base_response(request)
+            response["schema_version"] = 1
+            response["failure"] = {
+                "phase": "probes", "channel": None, "code": "attestation_failure",
+                "type": "BootstrapError", "message": "old response"}
+            write_private_json_exclusive(root / "native-single-run.response.json",
+                                         response, RESPONSE_SCHEMA_V1)
+            with self.assertRaisesRegex(SingleRunError, "response is invalid") as caught:
+                inspect_single_run(lifecycle)
+            self.assertEqual(caught.exception.c1_diagnostic["code"],
+                             "worker_response_invalid")
+
+    def test_worker_cannot_claim_a_host_only_diagnostic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request, unused = self._request_file(root)
+            response = _base_response(request)
+            response["failure"] = make_diagnostic("launcher_failed", "launch")
+            with self.assertRaisesRegex(ProtocolError, "diagnostic is invalid"):
+                write_private_json_exclusive(root / "response.json", response,
+                                             RESPONSE_SCHEMA)
+
+    def test_host_classifies_every_response_acquisition_boundary(self):
+        variants = (
+            ("missing", "worker_response_missing"),
+            ("malformed", "worker_response_invalid"),
+            ("run", "worker_response_identity_mismatch"),
+            ("proposal", "worker_response_identity_mismatch"),
+            ("context", "worker_context_mismatch"),
+            ("channels", "worker_channels_mismatch"),
+            ("exit", "worker_exit_status_mismatch"),
+        )
+        for variant, code in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                request, unused = self._request_file(root)
+                lifecycle = SingleRunLifecycle(
+                    ROOT, root, types.SimpleNamespace(closed=False), "token",
+                    request["run_id"], "unit", request,
+                    launcher_result=LaunchResult("unit", 0, "secret", "/etc/shadow",
+                                                 stdout_bytes=6, stderr_bytes=11,
+                                                 stdout_truncated=True,
+                                                 stderr_truncated=True))
+                response_path = root / "native-single-run.response.json"
+                if variant == "malformed":
+                    response_path.write_text("{broken", encoding="utf-8")
+                    response_path.chmod(0o600)
+                elif variant != "missing":
+                    response = self._success_response(request)
+                    if variant == "run": response["run_id"] = "different-run"
+                    elif variant == "proposal": response["proposal_id"] = "p-20260913T120000Z-feedface"
+                    elif variant == "context": response["validation_context"]["effective_seed"] += 1
+                    elif variant == "channels":
+                        response["affected_channels"] = [
+                            {"number": 3, "name": "After School"}]
+                        response["channels"][0]["number"] = 3
+                        response["channels"][0]["name"] = "After School"
+                    elif variant == "exit": lifecycle.launcher_result.returncode = 1
+                    write_private_json_exclusive(response_path, response, RESPONSE_SCHEMA)
+                with self.assertRaises(SingleRunError) as caught:
+                    inspect_single_run(lifecycle)
+                self.assertEqual(caught.exception.c1_diagnostic["code"], code)
+                self.assertEqual(set(caught.exception.launcher_summary), {
+                    "outcome", "stdout_bytes", "stderr_bytes", "stdout_truncated",
+                    "stderr_truncated"})
+                self.assertNotIn("secret", json.dumps(caught.exception.launcher_summary))
+                self.assertNotIn("shadow", json.dumps(caught.exception.launcher_summary))
+
+
 class LifecycleTests(unittest.TestCase):
     class Lock:
         def __init__(self):
@@ -1454,7 +1683,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn("/project/station_director/single_run_worker.py", launcher.args[1])
             self.assertTrue(launcher.args[4])
             response = {
-                "schema_version": 1, "operation": "native_single_run",
+                "schema_version": 2, "operation": "native_single_run",
                 "run_id": request["run_id"], "proposal_id": request["proposal"]["proposal_id"],
                 "status": "success", "phase_reached": "complete", "scheduler_invoked": True,
                 "validation_context": {
@@ -1493,8 +1722,10 @@ class LifecycleTests(unittest.TestCase):
             lifecycle.launcher_result = LaunchResult(
                 lifecycle.unit_name, 124, "", "timeout", timed_out=True
             )
-            with self.assertRaisesRegex(SingleRunError, "timed out"):
+            with self.assertRaisesRegex(SingleRunError, "timed out") as caught:
                 inspect_single_run(lifecycle)
+            self.assertEqual(caught.exception.c1_diagnostic["code"], "launcher_timeout")
+            self.assertEqual(caught.exception.launcher_summary["outcome"], "timed_out")
 
     def test_malformed_result_and_cleanup_failure_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1507,7 +1738,7 @@ class LifecycleTests(unittest.TestCase):
             result = root / "native-single-run.response.json"
             result.write_text("{partial")
             os.chmod(result, 0o600)
-            with self.assertRaises(ProtocolError):
+            with self.assertRaisesRegex(SingleRunError, "response is invalid"):
                 inspect_single_run(lifecycle)
             with patch(
                 "station_director.single_run.cleanup_unit", return_value=(False, "unit remained")

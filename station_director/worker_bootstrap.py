@@ -20,6 +20,7 @@ from station_director.preservation import (
 )
 from station_director.validation import project_configuration
 from station_director.validation_context import (
+    derive_validation_context,
     logical_configuration_values_fingerprint,
     logical_media_manifest_fingerprint,
     logical_protected_configuration_fingerprint,
@@ -33,9 +34,28 @@ SCHEDULING_MAIN_CONFIG_KEYS = {
 
 
 class BootstrapError(RuntimeError):
-    def __init__(self, message, *, phase="snapshot"):
+    def __init__(self, message, *, phase="snapshot", code=None, probe=None,
+                 fingerprint_category=None):
         super().__init__(message)
         self.phase = phase
+        self.code = code
+        self.probe = probe
+        self.fingerprint_category = fingerprint_category
+
+
+def _classified(code, operation, *, phase="snapshot", fingerprint_category=None):
+    try:
+        return operation()
+    except BootstrapError as exc:
+        if exc.code is None:
+            exc.code = code
+            exc.phase = phase
+            exc.fingerprint_category = fingerprint_category
+        raise
+    except Exception as exc:
+        raise BootstrapError(
+            "classified worker verification failure", phase=phase, code=code,
+            fingerprint_category=fingerprint_category) from exc
 
 
 def scheduling_main_config(source_main):
@@ -191,9 +211,10 @@ def finalize_work_tree(request, stage_root, media_root, project_root):
     runtime = work / "runtime"
     confs.mkdir(mode=0o700, parents=True, exist_ok=False)
     runtime.mkdir(mode=0o700, exist_ok=False)
-    documents, affected, source_channels, mapping_count = projected_configuration_documents(
-        source, request, media_root, work
-    )
+    documents, affected, source_channels, mapping_count = _classified(
+        "projected_configuration_verification_failed",
+        lambda: projected_configuration_documents(source, request, media_root, work),
+        fingerprint_category="projected_logical_configuration")
     if not affected:
         raise BootstrapError("native scheduling requires at least one affected channel", phase="configuration")
     expected_channels = tuple(item["name"] for item in request["affected_channels"])
@@ -215,19 +236,32 @@ def finalize_work_tree(request, stage_root, media_root, project_root):
     finally:
         os.close(descriptor)
     working_database = runtime / "fs42_fluid.db"
-    cloned = fingerprint_and_clone_database(
-        source / "runtime/fs42_fluid.db", working_database
-    )
+    cloned = _classified(
+        "working_database_verification_failed",
+        lambda: fingerprint_and_clone_database(
+            source / "runtime/fs42_fluid.db", working_database),
+        fingerprint_category="working_logical_database")
     os.chmod(working_database, 0o600)
-    actual_projected = logical_protected_configuration_fingerprint(
-        {identity: work / identity for identity in documents}
-    )
+    actual_projected = _classified(
+        "projected_configuration_verification_failed",
+        lambda: logical_protected_configuration_fingerprint(
+            {identity: work / identity for identity in documents}),
+        fingerprint_category="projected_logical_configuration")
     expected_projected = logical_configuration_values_fingerprint(documents)
     if actual_projected != expected_projected:
-        raise BootstrapError("published projection differs from deterministic transformation")
-    source_database = fingerprint_database(source / "runtime/fs42_fluid.db")["logical"]
+        raise BootstrapError(
+            "published projection differs from deterministic transformation",
+            code="projected_configuration_verification_failed",
+            fingerprint_category="projected_logical_configuration")
+    source_database = _classified(
+        "original_database_verification_failed",
+        lambda: fingerprint_database(source / "runtime/fs42_fluid.db")["logical"],
+        fingerprint_category="original_logical_database")
     if cloned["logical"]["digest"] != source_database["digest"]:
-        raise BootstrapError("working database differs from verified source database")
+        raise BootstrapError(
+            "working database differs from verified source database",
+            code="working_database_verification_failed",
+            fingerprint_category="working_logical_database")
     held = HeldSchedulingInputs(
         [work / identity for identity in sorted(documents)] + [schema_target, working_database],
         working_database,
@@ -280,15 +314,38 @@ def verify_original_snapshot(request, stage_root, media_root, project_root):
             or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
         ):
             raise BootstrapError(f"staged {identity} is not a private regular file")
-    configuration = logical_protected_configuration_fingerprint(protected_json_paths(source))
-    database = fingerprint_database(source / "runtime/fs42_fluid.db")["logical"]
-    staged_physical = fingerprint_json_files(protected_json_paths(source))["digest"]
-    live_physical = fingerprint_json_files(protected_json_paths(project_root))["digest"]
-    manifest = capture_media_manifest(media_root, spool_directory=Path(stage_root))
+    configuration = _classified(
+        "original_configuration_verification_failed",
+        lambda: logical_protected_configuration_fingerprint(protected_json_paths(source)),
+        fingerprint_category="original_logical_configuration")
+    database = _classified(
+        "original_database_verification_failed",
+        lambda: fingerprint_database(source / "runtime/fs42_fluid.db")["logical"],
+        fingerprint_category="original_logical_database")
+    staged_physical = _classified(
+        "physical_transition_verification_failed",
+        lambda: fingerprint_json_files(protected_json_paths(source))["digest"],
+        fingerprint_category="staged_source_physical_configuration")
+    live_physical = _classified(
+        "physical_transition_verification_failed",
+        lambda: fingerprint_json_files(protected_json_paths(project_root))["digest"],
+        fingerprint_category="live_physical_configuration")
+    manifest = _classified(
+        "media_manifest_verification_failed",
+        lambda: capture_media_manifest(media_root, spool_directory=Path(stage_root)),
+        fingerprint_category="logical_media_manifest")
     try:
-        media = logical_media_manifest_fingerprint(manifest)
+        media = _classified(
+            "media_manifest_verification_failed",
+            lambda: logical_media_manifest_fingerprint(manifest),
+            fingerprint_category="logical_media_manifest")
     finally:
-        manifest.close()
+        try:
+            manifest.close()
+        except Exception as exc:
+            raise BootstrapError(
+                "media manifest verification failed", code="media_manifest_verification_failed",
+                fingerprint_category="logical_media_manifest") from exc
     actual = {
         "original_logical_configuration_fingerprint": configuration["digest"],
         "original_logical_database_fingerprint": database["digest"],
@@ -298,14 +355,24 @@ def verify_original_snapshot(request, stage_root, media_root, project_root):
     }
     if actual != request["input_fingerprints"]:
         changed = sorted(key for key in actual if actual[key] != request["input_fingerprints"].get(key))
-        raise BootstrapError("original snapshot fingerprint mismatch: " + ", ".join(changed))
+        categories = {
+            "original_logical_configuration_fingerprint": ("original_configuration_verification_failed", "original_logical_configuration"),
+            "original_logical_database_fingerprint": ("original_database_verification_failed", "original_logical_database"),
+            "logical_media_manifest_fingerprint": ("media_manifest_verification_failed", "logical_media_manifest"),
+            "live_physical_configuration_fingerprint": ("physical_transition_verification_failed", "live_physical_configuration"),
+            "staged_source_physical_configuration_fingerprint": ("physical_transition_verification_failed", "staged_source_physical_configuration"),
+        }
+        code, category = categories[changed[0]]
+        raise BootstrapError("original snapshot fingerprint mismatch", code=code,
+                             fingerprint_category=category)
     seed_actual = {
         "logical_protected_configuration_fingerprint": configuration["digest"],
         "logical_database_fingerprint": database["digest"],
         "logical_media_manifest_fingerprint": media["digest"],
     }
     if seed_actual != request["seed_inputs"]:
-        raise BootstrapError("seed inputs differ from verified original snapshot")
+        raise BootstrapError("seed inputs differ from verified original snapshot",
+                             phase="seed", code="effective_seed_verification_failed")
     return actual
 
 
@@ -313,27 +380,52 @@ def attest_before_native_import(request, stage_root, media_root, project_root):
     probes = build_probe_payload(request["run_id"], stage_root=stage_root, stage_tmp=True)
     normalized, probe_error = validate_probe_payload(probes, request["run_id"])
     if probe_error or not all(item["passed"] for item in normalized.values()):
+        failed = next((name for name in sorted(normalized)
+                       if not normalized[name]["passed"]), None)
         raise BootstrapError(
-            f"isolation probe attestation failed: {probe_error or 'probe failure'}",
-            phase="probes",
+            "isolation probe attestation failed", phase="probes",
+            code="isolation_probe_failed", probe=failed,
         )
     try:
-        original = verify_original_snapshot(request, stage_root, media_root, project_root)
-        projected, inputs = finalize_work_tree(request, stage_root, media_root, project_root)
+        original = _classified(
+            "original_configuration_verification_failed",
+            lambda: verify_original_snapshot(request, stage_root, media_root, project_root),
+            fingerprint_category="original_logical_configuration")
+        projected, inputs = _classified(
+            "projected_configuration_verification_failed",
+            lambda: finalize_work_tree(request, stage_root, media_root, project_root),
+            fingerprint_category="projected_logical_configuration")
     except BootstrapError:
         raise
     except Exception as exc:
-        raise BootstrapError(f"staged snapshot verification failed: {exc}") from exc
+        raise BootstrapError("staged snapshot verification failed",
+                             code="projected_configuration_verification_failed",
+                             fingerprint_category="projected_logical_configuration") from exc
     try:
-        verify_validation_context(
-            request["proposal"], request["policy"], request["seed_inputs"],
-            request["validation_context"],
-        )
+        try:
+            verify_validation_context(
+                request["proposal"], request["policy"], request["seed_inputs"],
+                request["validation_context"],
+            )
+        except Exception as exc:
+            try:
+                expected_context = derive_validation_context(
+                    request["proposal"], request["policy"], request["seed_inputs"])
+                code = ("effective_seed_verification_failed"
+                        if request["validation_context"].get("effective_seed")
+                        != expected_context.get("effective_seed")
+                        else "validation_context_failed")
+            except Exception:
+                code = "validation_context_failed"
+            raise BootstrapError("validation context verification failed", phase="seed",
+                                 code=code) from exc
         context = request["validation_context"]
         if os.environ.get("TZ") != context["timezone"]:
-            raise BootstrapError("worker timezone does not match validation context", phase="seed")
+            raise BootstrapError("worker timezone does not match validation context", phase="seed",
+                                 code="timezone_verification_failed")
         if os.environ.get("PYTHONHASHSEED") != context["python_hash_seed"]:
-            raise BootstrapError("worker hash seed does not match validation context", phase="seed")
+            raise BootstrapError("worker hash seed does not match validation context", phase="seed",
+                                 code="hash_seed_verification_failed")
     except Exception:
         inputs.close()
         raise

@@ -13,6 +13,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from station_director import validation_control
+from station_director.c1_diagnostics import (
+    DIAGNOSTIC_RULES, MAX_LAUNCH_BYTE_COUNT, validate_diagnostic,
+)
 
 
 TRUSTED_PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +75,18 @@ class CoordinatorOutcome:
     capture_failure_kind: str | None = None
     capture_run: int | None = None
     finalization_subphase: str | None = None
+    c1_run: int | None = None
+    c1_domain: str | None = None
+    c1_phase: str | None = None
+    c1_code: str | None = None
+    c1_probe: str | None = None
+    c1_fingerprint_category: str | None = None
+    c1_channel_number: int | None = None
+    c1_launcher_outcome: str | None = None
+    c1_stdout_bytes: int | None = None
+    c1_stderr_bytes: int | None = None
+    c1_stdout_truncated: bool | None = None
+    c1_stderr_truncated: bool | None = None
     scheduler_invoked: tuple = (False, False)
     report_published: bool = False
     report_durable: bool = False
@@ -93,6 +108,11 @@ class CoordinatorOutcome:
                 self.failure_code, self.scheduler_invoked != (False, False),
                 self.capture_failure_kind, self.capture_run,
                 self.finalization_subphase,
+                self.c1_run, self.c1_domain, self.c1_phase, self.c1_code,
+                self.c1_probe, self.c1_fingerprint_category,
+                self.c1_channel_number, self.c1_launcher_outcome,
+                self.c1_stdout_bytes, self.c1_stderr_bytes,
+                self.c1_stdout_truncated, self.c1_stderr_truncated,
                 self.report_published, self.report_durable, self.publication_code,
                 self.latest_status, self.latest_code, self.affected_channels,
                 self.changed_channels, self.cleanup_passed is not None,
@@ -142,6 +162,33 @@ class CoordinatorOutcome:
                       "invalid_report_input"}
         if self.failure_code not in safe_codes:
             raise ValueError("unsafe coordinator failure code")
+        c1_present = self.c1_run is not None
+        if (self.failure_code == "c1_run_failed") != c1_present:
+            raise ValueError("C1 outcome lacks a classified diagnostic")
+        if c1_present:
+            detail = {
+                "domain": self.c1_domain, "phase": self.c1_phase,
+                "code": self.c1_code,
+                "template": DIAGNOSTIC_RULES[self.c1_code][2],
+                "scheduler_invoked": self.scheduler_invoked[self.c1_run - 1],
+                "probe": self.c1_probe,
+                "fingerprint_category": self.c1_fingerprint_category,
+                "channel_number": self.c1_channel_number,
+            }
+            validate_diagnostic(detail)
+            if self.c1_launcher_outcome not in {
+                    "completed", "nonzero_exit", "timed_out", "launch_error"}:
+                raise ValueError("invalid C1 launcher outcome")
+            if (isinstance(self.c1_stdout_bytes, bool)
+                    or isinstance(self.c1_stderr_bytes, bool)
+                    or not isinstance(self.c1_stdout_bytes, int)
+                    or not isinstance(self.c1_stderr_bytes, int)
+                    or min(self.c1_stdout_bytes, self.c1_stderr_bytes) < 0
+                    or max(self.c1_stdout_bytes, self.c1_stderr_bytes)
+                    > MAX_LAUNCH_BYTE_COUNT
+                    or not isinstance(self.c1_stdout_truncated, bool)
+                    or not isinstance(self.c1_stderr_truncated, bool)):
+                raise ValueError("invalid C1 launcher counters")
         if ((self.failure_code == "source_capture_failed")
                 != (self.capture_failure_kind in CAPTURE_FAILURE_KINDS)):
             raise ValueError("source capture outcome lacks a classified kind")
@@ -408,6 +455,9 @@ def _outcome_from_result(proposal_id, run_id, result, publication=None,
     changed = (comparison.get("resulting_schedule_changes") or {}).get(
         "changed_channels", 0)
     failure = result.get("failure") or {}
+    c1 = failure.get("c1_diagnostic") or {}
+    c1_detail = c1.get("detail") or {}
+    c1_launcher = failure.get("launcher_summary") or {}
     if publication is not None:
         if (not isinstance(publication, dict)
                 or publication.get("publication_state") != "published_durable"
@@ -440,6 +490,25 @@ def _outcome_from_result(proposal_id, run_id, result, publication=None,
                               if failure_code == "source_capture_failed" else None),
         capture_run=failure.get("capture_run"),
         finalization_subphase=failure.get("finalization_subphase"),
+        c1_run=c1.get("run") if failure_code == "c1_run_failed" else None,
+        c1_domain=c1_detail.get("domain") if failure_code == "c1_run_failed" else None,
+        c1_phase=c1_detail.get("phase") if failure_code == "c1_run_failed" else None,
+        c1_code=c1_detail.get("code") if failure_code == "c1_run_failed" else None,
+        c1_probe=c1_detail.get("probe") if failure_code == "c1_run_failed" else None,
+        c1_fingerprint_category=(c1_detail.get("fingerprint_category")
+                                if failure_code == "c1_run_failed" else None),
+        c1_channel_number=(c1_detail.get("channel_number")
+                           if failure_code == "c1_run_failed" else None),
+        c1_launcher_outcome=(c1_launcher.get("outcome")
+                             if failure_code == "c1_run_failed" else None),
+        c1_stdout_bytes=(c1_launcher.get("stdout_bytes")
+                         if failure_code == "c1_run_failed" else None),
+        c1_stderr_bytes=(c1_launcher.get("stderr_bytes")
+                         if failure_code == "c1_run_failed" else None),
+        c1_stdout_truncated=(c1_launcher.get("stdout_truncated")
+                             if failure_code == "c1_run_failed" else None),
+        c1_stderr_truncated=(c1_launcher.get("stderr_truncated")
+                             if failure_code == "c1_run_failed" else None),
         report_published=published, report_durable=durable,
         publication_code=publication_code,
         latest_status=latest.get("status"), latest_code=latest.get("code"),
@@ -453,6 +522,10 @@ def _outcome_from_result(proposal_id, run_id, result, publication=None,
 def _outcome_without_report(proposal_id, run_id, result, code):
     schedulers = (result or {}).get("scheduler_invoked", {})
     cleanup = (result or {}).get("cleanup", [])
+    failure = ((result or {}).get("failure") or {})
+    c1 = failure.get("c1_diagnostic") or {}
+    detail = c1.get("detail") or {}
+    launcher = failure.get("launcher_summary") or {}
     return CoordinatorOutcome(
         state="interrupted" if code == "validation_interrupted" else "failed",
         proposal_id=proposal_id, run_id=run_id,
@@ -464,6 +537,25 @@ def _outcome_without_report(proposal_id, run_id, result, code):
         capture_run=((result or {}).get("failure") or {}).get("capture_run"),
         finalization_subphase=(
             ((result or {}).get("failure") or {}).get("finalization_subphase")),
+        c1_run=c1.get("run") if code == "c1_run_failed" else None,
+        c1_domain=detail.get("domain") if code == "c1_run_failed" else None,
+        c1_phase=detail.get("phase") if code == "c1_run_failed" else None,
+        c1_code=detail.get("code") if code == "c1_run_failed" else None,
+        c1_probe=detail.get("probe") if code == "c1_run_failed" else None,
+        c1_fingerprint_category=(detail.get("fingerprint_category")
+                                if code == "c1_run_failed" else None),
+        c1_channel_number=(detail.get("channel_number")
+                           if code == "c1_run_failed" else None),
+        c1_launcher_outcome=(launcher.get("outcome")
+                             if code == "c1_run_failed" else None),
+        c1_stdout_bytes=(launcher.get("stdout_bytes")
+                         if code == "c1_run_failed" else None),
+        c1_stderr_bytes=(launcher.get("stderr_bytes")
+                         if code == "c1_run_failed" else None),
+        c1_stdout_truncated=(launcher.get("stdout_truncated")
+                             if code == "c1_run_failed" else None),
+        c1_stderr_truncated=(launcher.get("stderr_truncated")
+                             if code == "c1_run_failed" else None),
         scheduler_invoked=(bool(schedulers.get("run_1")),
                            bool(schedulers.get("run_2"))),
         cleanup_passed=(all(item.get("passed") for item in cleanup)
@@ -605,6 +697,26 @@ def render_cli_outcome(outcome):
         if outcome.finalization_subphase is not None:
             lines.append(
                 f"Finalization subphase: {outcome.finalization_subphase}")
+        if outcome.c1_run is not None:
+            lines.append(f"C1 run: {outcome.c1_run}")
+            lines.append(f"C1 domain: {outcome.c1_domain}")
+            lines.append(f"C1 phase: {outcome.c1_phase}")
+            lines.append(f"C1 code: {outcome.c1_code}")
+            if outcome.c1_probe is not None:
+                lines.append(f"C1 probe: {outcome.c1_probe}")
+            if outcome.c1_fingerprint_category is not None:
+                lines.append(
+                    f"C1 fingerprint category: {outcome.c1_fingerprint_category}")
+            if outcome.c1_channel_number is not None:
+                lines.append(f"C1 channel: {outcome.c1_channel_number}")
+            lines.append(f"C1 launcher: {outcome.c1_launcher_outcome}")
+            lines.append(
+                f"C1 output bytes: stdout={outcome.c1_stdout_bytes} "
+                f"stderr={outcome.c1_stderr_bytes}")
+            lines.append(
+                "C1 output truncated: "
+                f"stdout={str(outcome.c1_stdout_truncated).lower()} "
+                f"stderr={str(outcome.c1_stderr_truncated).lower()}")
         if outcome.run_id is not None:
             lines.append(f"Run: {outcome.run_id}")
         if outcome.report_durable:

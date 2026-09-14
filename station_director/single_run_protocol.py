@@ -10,11 +10,15 @@ from station_director.validation_context import derive_request_digest
 
 
 PROTOCOL_VERSION = 1
+RESPONSE_PROTOCOL_VERSION = 2
 OPERATION = "native_single_run"
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 SCHEMA_DIR = Path(__file__).with_name("schemas")
 REQUEST_SCHEMA = SCHEMA_DIR / "native-single-run.request.v1.schema.json"
-RESPONSE_SCHEMA = SCHEMA_DIR / "native-single-run.response.v1.schema.json"
+RESPONSE_SCHEMA_V1 = SCHEMA_DIR / "native-single-run.response.v1.schema.json"
+# Compatibility name for callers that explicitly validate the frozen v1 shape.
+RESPONSE_SCHEMA = RESPONSE_SCHEMA_V1
+RESPONSE_SCHEMA_V2 = SCHEMA_DIR / "native-single-run.response.v2.schema.json"
 
 
 class ProtocolError(RuntimeError):
@@ -86,6 +90,25 @@ def validate_request_semantics(payload):
 
 
 def validate_response_semantics(payload):
+    if payload.get("schema_version") == RESPONSE_PROTOCOL_VERSION:
+        from station_director.c1_diagnostics import (
+            WORKER_DIAGNOSTIC_CODES, validate_diagnostic,
+        )
+        try:
+            for diagnostic in payload.get("warnings", []):
+                validate_diagnostic(diagnostic)
+                if diagnostic["code"] not in WORKER_DIAGNOSTIC_CODES:
+                    raise ValueError("host-only diagnostic")
+            if payload.get("failure") is not None:
+                validate_diagnostic(payload["failure"])
+                if payload["failure"]["code"] not in WORKER_DIAGNOSTIC_CODES:
+                    raise ValueError("host-only diagnostic")
+                if payload["failure"]["phase"] != payload["phase_reached"]:
+                    raise ValueError("phase mismatch")
+                if payload["failure"]["scheduler_invoked"] != payload["scheduler_invoked"]:
+                    raise ValueError("scheduler state mismatch")
+        except ValueError as exc:
+            raise ProtocolError("worker response diagnostic is invalid") from exc
     if payload["status"] == "success" and payload["failure"] is not None:
         raise ProtocolError("successful response contains a failure")
     if payload["status"] == "failed" and payload["failure"] is None:
@@ -140,6 +163,12 @@ def validate_document(payload, schema_path):
             "https://crt-station.invalid/schemas/proposal.v2.schema.json",
             Resource.from_contents(proposal),
         )
+        for candidate in SCHEMA_DIR.glob("*.schema.json"):
+            candidate_schema = json.loads(candidate.read_text(encoding="utf-8"))
+            identifier = candidate_schema.get("$id")
+            if identifier:
+                registry = registry.with_resource(
+                    identifier, Resource.from_contents(candidate_schema))
         validator = jsonschema.Draft7Validator(
             schema, registry=registry, format_checker=jsonschema.FormatChecker()
         )
@@ -184,7 +213,7 @@ class HeldDocument:
             validate_document(self.payload, schema_path)
             if Path(schema_path) == REQUEST_SCHEMA:
                 validate_request_semantics(self.payload)
-            elif Path(schema_path) == RESPONSE_SCHEMA:
+            elif Path(schema_path) in (RESPONSE_SCHEMA_V1, RESPONSE_SCHEMA_V2):
                 validate_response_semantics(self.payload)
             if expected_digest is not None and request_digest(self.payload) != expected_digest:
                 raise ProtocolError("request digest changed")
@@ -246,7 +275,7 @@ def write_private_json_exclusive(path, payload, schema_path):
     validate_document(payload, schema_path)
     if Path(schema_path) == REQUEST_SCHEMA:
         validate_request_semantics(payload)
-    elif Path(schema_path) == RESPONSE_SCHEMA:
+    elif Path(schema_path) in (RESPONSE_SCHEMA_V1, RESPONSE_SCHEMA_V2):
         validate_response_semantics(payload)
     path = Path(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

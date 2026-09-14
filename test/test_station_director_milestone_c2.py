@@ -20,6 +20,7 @@ from station_director.dual_run import (
     CAPTURE_FAILURE_KINDS,
     DualRunError,
     _assert_inputs_stable,
+    _base_result,
     _capture_step,
     _capture_shared_inputs,
     _prepare_scope,
@@ -28,6 +29,7 @@ from station_director.dual_run import (
     run_dual_comparison,
 )
 from station_director.isolation import LaunchResult
+from station_director.c1_diagnostics import make_diagnostic
 from station_director.isolation_probe import PROBE_RESULTS
 from station_director.isolation_probe import PROBE_RESULTS
 from station_director.policy import load_policy
@@ -250,6 +252,7 @@ def complete_worker_child_main(stage_text, media_text, project_text):
         "fs42_loaded": any(name == "fs42" or name.startswith("fs42.") for name in sys.modules),
         "cache_size": len(ShowCatalog._fluid_cache_scanned),
         "status": result["status"], "failure": result["failure"],
+        "response_schema_version": result["schema_version"],
         "guide_validation": result.get("guide_validation"),
         "catalog_paths": catalog_paths,
     }
@@ -1948,7 +1951,8 @@ class DualRunLifecycleTests(unittest.TestCase):
                         "week_start": "2026-09-14T00:00:00-07:00"
                     }, {}, "comparison")
                 self.assertEqual(result["failure"]["code"], "c1_run_failed")
-                self.assertEqual(result["failure"]["category"], "worker_timeout")
+                self.assertEqual(result["failure"]["category"], "launcher_failed")
+                self.assertEqual(result["failure"]["c1_diagnostic"]["run"], failed_index)
                 comparison.assert_not_called()
                 self.assertIn("cleanup", events)
 
@@ -1985,12 +1989,18 @@ class DualRunLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             scope = self._scope(root, [], cleanup_failure=True)
+            scope.lifecycles[0].launcher_result = LaunchResult(
+                "synthetic", 1, "", "", stdout_bytes=0, stderr_bytes=0)
+            failed_response = response("comparison.run-1")
+            failed_response.update(
+                status="failed", phase_reached="guide", scheduler_invoked=True,
+                channels=[], failure=make_diagnostic(
+                    "guide_validation_failed", "guide", scheduler_invoked=True))
             with patch("station_director.dual_run._prepare_scope", return_value=scope), \
                     patch("station_director.dual_run.launch_single_run"), \
-                    patch("station_director.dual_run.inspect_single_run", side_effect=DualRunError(
-                        "run_1", "c1_run_failed", "guide failed",
-                        category="guide_validation_failed",
-                    )), patch("station_director.dual_run._assert_inputs_stable", return_value={
+                    patch("station_director.dual_run.inspect_single_run",
+                          return_value=failed_response), \
+                    patch("station_director.dual_run._assert_inputs_stable", return_value={
                         "checkpoint": "before_success", "passed": True,
                         "changed_categories": [],
                     }):
@@ -2181,6 +2191,30 @@ class DualRunLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(DualRunError, "both schedulers"):
             _validate_result_semantics(result)
 
+    def test_semantic_validator_rejects_c1_run_phase_or_scheduler_mismatch(self):
+        for mutation in ("phase", "scheduler"):
+            with self.subTest(mutation=mutation):
+                result = _base_result("comparison")
+                result["phase_reached"] = "run_1"
+                result["failure"] = {
+                    "phase": "run_1", "code": "c1_run_failed",
+                    "category": "original_database_verification_failed",
+                    "message": "An isolated native scheduling run failed.",
+                    "c1_diagnostic": {"run": 1, "detail": make_diagnostic(
+                        "original_database_verification_failed", "snapshot",
+                        fingerprint_category="original_logical_database")},
+                    "launcher_summary": {"outcome": "nonzero_exit",
+                                         "stdout_bytes": 0, "stderr_bytes": 0,
+                                         "stdout_truncated": False,
+                                         "stderr_truncated": False},
+                }
+                if mutation == "phase":
+                    result["failure"]["phase"] = "run_2"
+                else:
+                    result["scheduler_invoked"]["run_1"] = True
+                with self.assertRaises(DualRunError):
+                    _validate_result_semantics(result)
+
     def test_public_modules_do_not_import_or_reference_c2(self):
         for relative in (
             "station_director/cli.py",
@@ -2354,6 +2388,8 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
             self.assertTrue(all(item["fs42_loaded"] for item in details))
             self.assertEqual([item["cache_size"] for item in details], [1, 1])
             self.assertTrue(all(item["guide_validation"]["status"] == "pass" for item in details))
+            self.assertEqual(result["schema_version"], 2)
+            self.assertEqual([item["response_schema_version"] for item in details], [2, 2])
 
     def test_complete_genuine_lifecycle_detects_selected_media_difference(self):
         with tempfile.TemporaryDirectory() as directory:

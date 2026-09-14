@@ -15,11 +15,12 @@ PROJECT_ROOT = Path("/project")
 from station_director.single_run_protocol import (
     HeldDocument,
     REQUEST_SCHEMA,
-    RESPONSE_SCHEMA,
+    RESPONSE_SCHEMA_V2 as RESPONSE_SCHEMA,
     ProtocolError,
     write_private_json_exclusive,
 )
 from station_director.worker_bootstrap import BootstrapError, attest_before_native_import
+from station_director.c1_diagnostics import make_diagnostic
 
 
 class _BoundedWarningHandler(logging.Handler):
@@ -35,33 +36,21 @@ class _BoundedWarningHandler(logging.Handler):
             return
         # Native warnings are classified without copying arbitrary config/media
         # values into the protocol response.
-        message = f"{record.name}: native warning emitted"[:1000]
-        self.items.append(
-            {
-                "phase": "native",
-                "channel": None,
-                "code": "native_warning",
-                "type": record.levelname,
-                "message": message or record.levelname,
-            }
-        )
+        self.items.append(make_diagnostic("native_warning", "configuration"))
 
 
-def _diagnostic(phase, code, exc, channel=None):
-    message = str(exc).replace("/mnt/t7/CRT-Media", "crt-media:")[:1000]
-    return {
-        "phase": phase,
-        "channel": channel,
-        "code": code,
-        "type": type(exc).__name__,
-        "message": message or type(exc).__name__,
-    }
+def _diagnostic(phase, code, *, scheduler_invoked=False, probe=None,
+                fingerprint_category=None, channel_number=None):
+    return make_diagnostic(
+        code, phase, scheduler_invoked=scheduler_invoked, probe=probe,
+        fingerprint_category=fingerprint_category,
+        channel_number=channel_number)
 
 
 def _base_response(request):
     context = request["validation_context"]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "operation": "native_single_run",
         "run_id": request["run_id"],
         "proposal_id": request["proposal"]["proposal_id"],
@@ -100,13 +89,21 @@ def run_worker(
             unused_probes, attestation = attest_before_native_import(
                 request, STAGE_ROOT, MEDIA_ROOT, PROJECT_ROOT
             )
-            response["phase_reached"] = "snapshot"
-            document.assert_unchanged()
+            response["phase_reached"] = "request"
+            try:
+                document.assert_unchanged()
+            except ProtocolError:
+                response["failure"] = _diagnostic("request", "request_integrity_failed")
+                raise
             response["phase_reached"] = "seed"
 
             # This is intentionally the first FieldStation42 import in this worker.
-            native = importlib.import_module("station_director.native_single_run")
             response["phase_reached"] = "native_import"
+            try:
+                native = importlib.import_module("station_director.native_single_run")
+            except Exception:
+                response["failure"] = _diagnostic("native_import", "native_import_failed")
+                raise
             warning_handler = _BoundedWarningHandler()
             logging.getLogger().addHandler(warning_handler)
             result = native.execute_native_single_run(
@@ -123,35 +120,49 @@ def run_worker(
                 phase_reached="complete",
                 status="success",
             )
-        except (BootstrapError, ProtocolError) as exc:
+        except BootstrapError as exc:
             response["phase_reached"] = getattr(
                 exc, "phase", response["phase_reached"]
             )
-            response["failure"] = _diagnostic(
-                response["phase_reached"], "attestation_failure", exc
-            )
+            if response["failure"] is None:
+                fallback = {
+                    "probes": "isolation_probe_failed",
+                    "snapshot": "projected_configuration_verification_failed",
+                    "seed": "validation_context_failed",
+                    "configuration": "invalid_configuration",
+                }.get(response["phase_reached"], "native_failure")
+                category = exc.fingerprint_category
+                if exc.code is None and response["phase_reached"] == "snapshot":
+                    category = "projected_logical_configuration"
+                response["failure"] = _diagnostic(
+                    response["phase_reached"], exc.code or fallback,
+                    probe=exc.probe, fingerprint_category=category)
+        except ProtocolError:
+            if response["failure"] is None:
+                response["phase_reached"] = "request"
+                response["failure"] = _diagnostic(
+                    "request", "request_integrity_failed")
         except SystemExit as exc:
             response["failure"] = _diagnostic(
-                response["phase_reached"], "native_system_exit", exc
+                response["phase_reached"], "native_system_exit",
+                scheduler_invoked=response["scheduler_invoked"]
             )
         except Exception as exc:
             response["phase_reached"] = getattr(exc, "phase", response["phase_reached"])
             response["scheduler_invoked"] = bool(
                 getattr(exc, "scheduler_invoked", False)
             )
-            response["failure"] = _diagnostic(
-                response["phase_reached"], getattr(exc, "code", "native_failure"),
-                exc, getattr(exc, "channel", None),
-            )
+            if response["failure"] is None:
+                channel_name = getattr(exc, "channel", None)
+                channel_number = next((item["number"] for item in request["affected_channels"]
+                                       if item["name"] == channel_name), None)
+                response["failure"] = _diagnostic(
+                    response["phase_reached"], getattr(exc, "code", "native_failure"),
+                    scheduler_invoked=response["scheduler_invoked"],
+                    channel_number=channel_number)
             guide_validation = getattr(exc, "guide_validation", None)
             if guide_validation is not None:
                 response["guide_validation"] = guide_validation
-            for label in ("original_failure", "restoration_failure"):
-                detail = getattr(exc, label, None)
-                if detail:
-                    response["diagnostics"]["messages"].append(
-                        f"{label}: {detail}"[:1000]
-                    )
         finally:
             if warning_handler is not None:
                 logging.getLogger().removeHandler(warning_handler)
@@ -159,7 +170,8 @@ def run_worker(
                 response["diagnostics"]["truncated"] = warning_handler.truncated
             if attestation is not None:
                 attestation.invalidate()
-        document.assert_unchanged()
+        if (response.get("failure") or {}).get("code") != "request_integrity_failed":
+            document.assert_unchanged()
         write_private_json_exclusive(response_path, response, RESPONSE_SCHEMA)
         return response
 

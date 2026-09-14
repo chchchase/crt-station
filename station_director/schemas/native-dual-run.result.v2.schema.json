@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crt-station.invalid/schemas/native-dual-run.result.v2.schema.json",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "operation", "comparison_id", "status", "phase_reached", "scheduler_invoked", "validation_context", "affected_channels", "source_checks", "runs", "reproducibility", "baseline_comparison", "failure", "cleanup", "timings_ms"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "operation": {"$ref": "native-dual-run.result.v1.schema.json#/properties/operation"},
+    "comparison_id": {"$ref": "native-dual-run.result.v1.schema.json#/properties/comparison_id"},
+    "status": {"$ref": "native-dual-run.result.v1.schema.json#/properties/status"},
+    "phase_reached": {"$ref": "native-dual-run.result.v1.schema.json#/properties/phase_reached"},
+    "scheduler_invoked": {"$ref": "native-dual-run.result.v1.schema.json#/properties/scheduler_invoked"},
+    "validation_context": {"$ref": "native-dual-run.result.v1.schema.json#/properties/validation_context"},
+    "affected_channels": {"$ref": "native-dual-run.result.v1.schema.json#/properties/affected_channels"},
+    "source_checks": {"$ref": "native-dual-run.result.v1.schema.json#/properties/source_checks"},
+    "runs": {"$ref": "native-dual-run.result.v1.schema.json#/properties/runs"},
+    "reproducibility": {"$ref": "native-dual-run.result.v1.schema.json#/properties/reproducibility"},
+    "baseline_comparison": {"$ref": "native-dual-run.result.v1.schema.json#/properties/baseline_comparison"},
+    "failure": {"oneOf": [{"type": "null"}, {"type": "object", "additionalProperties": false, "required": ["phase", "code", "category", "message"], "properties": {
+      "phase": {"$ref": "native-dual-run.result.v1.schema.json#/properties/failure/oneOf/1/properties/phase"},
+      "code": {"type": "string", "maxLength": 100}, "category": {"$ref": "native-dual-run.result.v1.schema.json#/properties/failure/oneOf/1/properties/category"}, "message": {"type": "string", "maxLength": 1000},
+      "capture_failure_kind": {"oneOf": [{"type": "null"}, {"$ref": "native-dual-run.result.v1.schema.json#/properties/failure/oneOf/1/properties/capture_failure_kind"}]},
+      "capture_run": {"oneOf": [{"type": "null"}, {"enum": [1,2]}]}, "finalization_subphase": {"oneOf": [{"type": "null"}, {"$ref": "native-dual-run.result.v1.schema.json#/properties/failure/oneOf/1/properties/finalization_subphase"}]},
+      "c1_diagnostic": {"oneOf": [{"type": "null"}, {"type": "object", "additionalProperties": false, "required": ["run", "detail"], "properties": {"run": {"enum": [1,2]}, "detail": {"$ref": "native-single-run.response.v2.schema.json#/$defs/diagnostic"}}}]},
+      "launcher_summary": {"oneOf": [{"type": "null"}, {"type": "object", "additionalProperties": false, "required": ["outcome", "stdout_bytes", "stderr_bytes", "stdout_truncated", "stderr_truncated"], "properties": {"outcome": {"enum": ["completed", "nonzero_exit", "timed_out", "launch_error"]}, "stdout_bytes": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}, "stderr_bytes": {"type": "integer", "minimum": 0, "maximum": 9223372036854775807}, "stdout_truncated": {"type": "boolean"}, "stderr_truncated": {"type": "boolean"}}}]}
+    }, "allOf": [{"if": {"properties": {"code": {"const": "c1_run_failed"}}, "required": ["code"]}, "then": {"required": ["c1_diagnostic", "launcher_summary"]}, "else": {"not": {"anyOf": [{"required": ["c1_diagnostic"]}, {"required": ["launcher_summary"]}]}}}] }]},
+    "cleanup": {"$ref": "native-dual-run.result.v1.schema.json#/properties/cleanup"},
+    "timings_ms": {"$ref": "native-dual-run.result.v1.schema.json#/properties/timings_ms"}
+  }
+}

@@ -19,6 +19,7 @@ from unittest.mock import patch
 from station_director.dual_run import (
     CAPTURE_FAILURE_KINDS, _base_result, _validate_result_semantics,
 )
+from station_director.c1_diagnostics import make_diagnostic
 import station_director.reporting as reporting
 from station_director.reporting import (
     LATEST_SCHEMA,
@@ -81,10 +82,12 @@ def retained_v2_from_v3(report):
         for finding in retained["findings"][group]:
             finding.pop("capture_run")
             finding.pop("finalization_subphase")
+            finding.pop("c1_diagnostic")
     for cleanup in retained["cleanup"].values():
         if cleanup and cleanup.get("diagnostic"):
             cleanup["diagnostic"].pop("capture_run")
             cleanup["diagnostic"].pop("finalization_subphase")
+            cleanup["diagnostic"].pop("c1_diagnostic")
     return retained
 
 
@@ -444,8 +447,8 @@ class ReportTests(unittest.TestCase):
         return parent
 
     def test_software_identity_schema_and_deterministic_text(self):
-        self.assertEqual(self.report["schema_version"], 3)
-        self.assertEqual(self.report["software"]["report_schema_version"], 3)
+        self.assertEqual(self.report["schema_version"], 4)
+        self.assertEqual(self.report["software"]["report_schema_version"], 4)
         self.assertTrue(self.report["software"]["director_version"])
         self.assertLessEqual(len(self.report["software"]["director_version"]), 100)
         validate_document(self.report, REPORT_SCHEMA)
@@ -456,7 +459,52 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(_canonical_json(self.report), _canonical_json(copy.deepcopy(self.report)))
         self.assertTrue(_canonical_json(self.report).endswith(b"\n"))
 
-    def test_capture_kind_survives_v3_projection_publication_latest_and_text(self):
+    def test_c1_diagnostic_propagates_to_v4_without_hostile_text(self):
+        result = _base_result("comparison")
+        result["phase_reached"] = "run_1"
+        result["source_checks"] = [{
+            "checkpoint": "after_capture", "passed": True,
+            "changed_categories": []}]
+        result["failure"] = {
+            "phase": "run_1", "code": "c1_run_failed",
+            "category": "original_database_verification_failed",
+            "message": "password=hunter2 /etc/shadow ENVIRONMENT=secret",
+            "c1_diagnostic": {"run": 1, "detail": make_diagnostic(
+                "original_database_verification_failed", "snapshot",
+                fingerprint_category="original_logical_database")},
+            "launcher_summary": {
+                "outcome": "nonzero_exit", "stdout_bytes": 123,
+                "stderr_bytes": 456, "stdout_truncated": True,
+                "stderr_truncated": True},
+        }
+        report = build_validation_report(
+            PROPOSAL, result, self.run_id, "2026-09-13T12:00:00Z")
+        finding = report["findings"]["errors"][0]
+        self.assertEqual(finding["c1_diagnostic"]["run"], 1)
+        self.assertEqual(finding["c1_diagnostic"]["detail"]["domain"],
+                         "worker_verification")
+        self.assertEqual(set(finding["c1_diagnostic"]["launcher_summary"]), {
+            "outcome", "stdout_bytes", "stderr_bytes", "stdout_truncated",
+            "stderr_truncated"})
+        serialized = _canonical_json(report)
+        for forbidden in (b"hunter2", b"/etc/shadow", b"ENVIRONMENT"):
+            self.assertNotIn(forbidden, serialized)
+        changed_message = copy.deepcopy(result)
+        changed_message["failure"]["message"] = "token=other /var/private"
+        second = build_validation_report(
+            PROPOSAL, changed_message, self.run_id,
+            "2026-09-13T12:00:00Z")
+        self.assertEqual(
+            finding["diagnostic_digest"],
+            second["findings"]["errors"][0]["diagnostic_digest"])
+        validate_report_document(report)
+        tampered = copy.deepcopy(report)
+        tampered["findings"]["errors"][0]["c1_diagnostic"]["detail"][
+            "template"] = "Different safe-looking template."
+        with self.assertRaisesRegex(ReportError, "invalid C1"):
+            validate_report_document(tampered)
+
+    def test_capture_kind_survives_v4_projection_publication_latest_and_text(self):
         run_id = "v-20260913T120002000001Z-" + "c" * 32
         report = None
         for kind in sorted(CAPTURE_FAILURE_KINDS):
@@ -625,7 +673,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(
             strict_json_loads((parent / "latest.json").read_bytes())["run_id"], new_run)
 
-    def test_retained_v2_pointer_target_is_valid_and_replaceable_by_v3(self):
+    def test_retained_v2_pointer_target_is_valid_and_replaceable_by_v4(self):
         result = _base_result("comparison")
         result["failure"] = {
             "phase": "capture", "code": "source_capture_failed",
@@ -662,6 +710,39 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(
             strict_json_loads((parent / "latest.json").read_bytes())["run_id"],
             new_run)
+
+    def test_retained_v3_pointer_target_is_replaceable_by_v4(self):
+        old_run = "v-20260913T110002000001Z-" + "1" * 32
+        retained = copy.deepcopy(self.report)
+        retained["schema_version"] = 3
+        retained["software"]["report_schema_version"] = 3
+        retained["validation"]["run_id"] = old_run
+        for group in ("baseline_findings", "unexpected_differences", "warnings", "errors"):
+            for finding in retained["findings"][group]:
+                finding.pop("c1_diagnostic")
+        for cleanup in retained["cleanup"].values():
+            if cleanup and cleanup.get("diagnostic"):
+                cleanup["diagnostic"].pop("c1_diagnostic")
+        validate_report_document(retained, retained=True)
+        parent = self._prepare_parent()
+        old_directory = parent / old_run
+        old_directory.mkdir(mode=0o700)
+        old_raw = _canonical_json(retained)
+        (old_directory / "validation.json").write_bytes(old_raw)
+        (old_directory / "validation.txt").write_bytes(b"retained v3\n")
+        for path in old_directory.iterdir():
+            path.chmod(0o600)
+        pointer = {"schema_version": 1, "proposal_id": PROPOSAL["proposal_id"],
+                   "run_id": old_run,
+                   "validation_json_digest": hashlib.sha256(old_raw).hexdigest()}
+        (parent / "latest.json").write_bytes(_canonical_json(pointer))
+        (parent / "latest.json").chmod(0o600)
+        new_run = "v-20260913T120005000001Z-" + "2" * 32
+        new_report = copy.deepcopy(self.report)
+        new_report["validation"]["run_id"] = new_run
+        publication = publish_validation_report(new_report)
+        self.assertEqual(publication["latest"]["status"], "updated")
+        self.assertEqual((old_directory / "validation.json").read_bytes(), old_raw)
 
     def test_immutable_two_file_publication_modes_and_latest(self):
         result = publish_validation_report(self.report)
