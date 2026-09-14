@@ -5,6 +5,7 @@ import io
 import json
 import os
 import signal
+import stat
 import time
 import sys
 import tempfile
@@ -260,6 +261,11 @@ class LockAndOutcomeTests(unittest.TestCase):
 
     def test_lock_is_persistent_private_and_recoverable(self):
         from station_director import validation_coordinator as coordinator
+        self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE((self.root / "runtime").stat().st_mode), 0o755)
+        self.assertEqual(
+            stat.S_IMODE((self.root / "runtime/director").stat().st_mode), 0o700
+        )
         with _validation_lock(secure_inputs):
             lock = self.root / "runtime/director" / coordinator.LOCK_NAME
             self.assertTrue(lock.is_file())
@@ -267,6 +273,34 @@ class LockAndOutcomeTests(unittest.TestCase):
         self.assertTrue(lock.exists())
         with _validation_lock(secure_inputs):
             pass
+
+    def test_mode_775_ancestors_fail_before_lock_creation(self):
+        from station_director import validation_coordinator as coordinator
+
+        runtime = self.root / "runtime"
+        director = runtime / "director"
+        lock = director / coordinator.LOCK_NAME
+        self.assertFalse(lock.exists())
+        for directory in (self.root, runtime, director):
+            directory.chmod(0o775)
+
+        with self.assertRaisesRegex(
+            secure_inputs.SecureInputError, "unsafe_directory"
+        ):
+            with _validation_lock(secure_inputs):
+                self.fail("unsafe lock unexpectedly acquired")
+        self.assertFalse(lock.exists())
+
+        with patch(
+            "station_director.isolation.check_invocation_context",
+            return_value=(True, "verified SSH"),
+        ):
+            outcome = coordinator.validate_saved_proposal(
+                VALID_PROPOSAL["proposal_id"]
+            )
+        self.assertEqual(outcome.state, "rejected")
+        self.assertEqual(outcome.failure_code, "validation_lock_unsafe")
+        self.assertFalse(lock.exists())
 
     def test_busy_lock_and_unsafe_lock_are_distinct(self):
         from station_director import validation_coordinator as coordinator
@@ -594,10 +628,12 @@ class GenuineGateEnabledIntegrationTests(unittest.TestCase):
 
 
 class StaticBoundaryTests(unittest.TestCase):
-    def test_master_control_is_dependency_free_and_false(self):
+    def test_master_control_is_dependency_free_and_enabled(self):
         source = Path("station_director/validation_control.py").read_text(encoding="utf-8")
         self.assertNotIn("import ", source)
-        self.assertIn("SCHEDULE_VALIDATION_ENABLED = False", source)
+        self.assertEqual(source.count("SCHEDULE_VALIDATION_ENABLED = "), 1)
+        self.assertIn("SCHEDULE_VALIDATION_ENABLED = True", source)
+        self.assertIs(validation_control.SCHEDULE_VALIDATION_ENABLED, True)
         self.assertEqual(validation_control.DISABLED_MESSAGE,
                          "Phase 3 validation is not yet enabled")
 

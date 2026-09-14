@@ -127,6 +127,16 @@ Signal handlers are installed only in the main thread after invocation, proposal
 
 C3b2 is deliberately limited to changing the master constant after C3b1 is committed and pushed, a fresh normal-SSH `./director isolation preflight --profile native-single-run` succeeds and its full report is reviewed, and the complete synthetic/static audit is repeated. The first real dry run should then be run inside `tmux` from a normal SSH session. Its immutable report must be reviewed before the enabled C3b2 commit is pushed. No real schedule validation should run during C3b1.
 
+Before the first production validation, remove group-write permission from the three trusted path ancestors with these non-recursive commands:
+
+```bash
+chmod 0755 -- /home/chaseanderegg/FieldStation42
+chmod 0755 -- /home/chaseanderegg/FieldStation42/runtime
+chmod 0700 -- /home/chaseanderegg/FieldStation42/runtime/director
+```
+
+The validation coordinator intentionally rejects group-writable trusted directories. These changes preserve owner access for `fs42.service`, which runs as `chaseanderegg`, while preventing path replacement by another group member. Do not apply this migration recursively; proposal, policy, report, and unrelated FieldStation42 paths must retain their individually reviewed permissions.
+
 The stage-backed C1 `/tmp` mount is a new isolation variant. The shared launcher first verifies the canonical, owned, mode-0700 `/tmp/fs42-i-*` stage, then exclusively creates `/stage/transient` beneath it as a mode-0700 directory before constructing the Bubblewrap command. It holds the transient directory's no-follow descriptor through the child run and verifies the same device/inode identity and permissions afterward. A missing source is created; any pre-existing file, symlink, or directory fails closed. The outer run lifecycle removes the entire stage after success or launch failure. The ordinary preflight retains its prior tmpfs behavior and does not create `transient`. `./director isolation preflight --profile native-single-run` exercises only the C1 probe and mount profile—never catalog or scheduling code—and must pass from an external SSH shell before the public validation gate may be removed. C1 performs a final native-semantics cross-channel exclusion check and fails closed on a collision; it does not retry, reseed, or relax exclusions, even when a future deterministic conflict-resolution design might find a valid schedule.
 
 There is deliberately no apply or rollback command. Archiving requires the exact proposal ID as confirmation and only moves Director-owned proposal files.
