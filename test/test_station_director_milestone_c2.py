@@ -31,7 +31,11 @@ from station_director.isolation import LaunchResult
 from station_director.isolation_probe import PROBE_RESULTS
 from station_director.isolation_probe import PROBE_RESULTS
 from station_director.policy import load_policy
-from station_director.single_run import SingleRunError
+from station_director.single_run import (
+    FINALIZATION_SUBPHASES,
+    SingleRunError,
+    SingleRunFinalizationError,
+)
 from station_director.preservation import (
     MAX_FOREIGN_KEY_FINDINGS,
     MAX_PROTECTED_JSON_FILE_BYTES,
@@ -544,7 +548,8 @@ class SharedSnapshotTests(unittest.TestCase):
                     patch(module + "create_staging_directory", side_effect=allocations), \
                     patch(module + "_capture_shared_inputs", return_value=capture), \
                     patch(module + "_finalize_prepared_single_run",
-                          side_effect=[first, RuntimeError("run two finalize failed")]), \
+                          side_effect=[first, SingleRunFinalizationError(
+                              "proposal_projection")]), \
                     patch(module + "cleanup_staging_directory",
                           side_effect=self._remove_test_stage):
                 result = run_dual_comparison(
@@ -552,6 +557,10 @@ class SharedSnapshotTests(unittest.TestCase):
             self.assertEqual(
                 result["failure"]["capture_failure_kind"],
                 "single_run_finalization")
+            self.assertEqual(result["failure"]["capture_run"], 2)
+            self.assertEqual(
+                result["failure"]["finalization_subphase"],
+                "proposal_projection")
             capture.close.assert_called_once_with()
             for lock in locks:
                 lock.close.assert_called_once_with()
@@ -627,7 +636,8 @@ class SharedSnapshotTests(unittest.TestCase):
                     return_value=capture), patch(
                     "station_director.dual_run._finalize_prepared_single_run",
                     side_effect=SingleRunError(
-                        "prepare", "duplicate_stage_file", "/tmp/private")), patch(
+                        "prepare", "duplicate_stage_file", "/tmp/private",
+                        finalization_subphase="request_publication")), patch(
                     "station_director.dual_run.cleanup_staging_directory",
                     side_effect=self._remove_test_stage):
                 result = run_dual_comparison(
@@ -638,11 +648,55 @@ class SharedSnapshotTests(unittest.TestCase):
                 result["failure"]["message"],
                 "A staged validation file already exists.")
             self.assertNotIn("capture_failure_kind", result["failure"])
+            self.assertEqual(result["failure"]["capture_run"], 1)
+            self.assertEqual(
+                result["failure"]["finalization_subphase"],
+                "request_publication")
             self.assertEqual([item["passed"] for item in result["cleanup"]],
                              [True, True])
             self.assertTrue(all(not stage.exists() for stage in stages))
 
-    def test_uncoded_real_finalization_call_site_is_classified_and_cleaned(self):
+    def test_finalizer_noop_defense_remains_distinct_through_c2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            capture = SimpleNamespace(
+                configuration_physical={"digest": "a" * 64},
+                configuration_digest="b" * 64, database_digest="c" * 64,
+                media_logical_digest="d" * 64, close=Mock(),
+            )
+            no_effect = SingleRunError(
+                "prepare", "proposal_has_no_effects",
+                "Proposal has no effects eligible for schedule validation.",
+                finalization_subphase="affected_channel_resolution",
+            )
+            with patch("station_director.dual_run.check_invocation_context",
+                       return_value=(True, "ok")), patch(
+                    "station_director.dual_run.create_staging_directory",
+                    side_effect=allocations), patch(
+                    "station_director.dual_run._capture_shared_inputs",
+                    return_value=capture), patch(
+                    "station_director.dual_run._finalize_prepared_single_run",
+                    side_effect=no_effect), patch(
+                    "station_director.dual_run.cleanup_staging_directory",
+                    side_effect=self._remove_test_stage):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+            self.assertEqual(result["failure"]["code"], "proposal_has_no_effects")
+            self.assertNotEqual(result["failure"]["code"], "source_capture_failed")
+            self.assertNotIn("capture_failure_kind", result["failure"])
+            self.assertEqual(result["failure"]["capture_run"], 1)
+            self.assertEqual(
+                result["failure"]["finalization_subphase"],
+                "affected_channel_resolution")
+            self.assertEqual(result["scheduler_invoked"], {
+                "run_1": False, "run_2": False})
+            self.assertEqual([item["passed"] for item in result["cleanup"]],
+                             [True, True])
+            capture.close.assert_called_once_with()
+            self.assertTrue(all(not stage.exists() for stage in stages))
+
+    def test_precise_finalization_failure_is_classified_and_cleaned(self):
         with tempfile.TemporaryDirectory() as directory:
             source, media, stages, locks, allocations = self._preparation_fixture(
                 Path(directory))
@@ -658,7 +712,8 @@ class SharedSnapshotTests(unittest.TestCase):
                     "station_director.dual_run._capture_shared_inputs",
                     return_value=capture), patch(
                     "station_director.dual_run._finalize_prepared_single_run",
-                    side_effect=RuntimeError("password=hunter2 /etc/shadow")), patch(
+                    side_effect=SingleRunFinalizationError(
+                        "staged_channel_configuration_loading")), patch(
                     "station_director.dual_run.cleanup_staging_directory",
                     side_effect=self._remove_test_stage):
                 result = run_dual_comparison(
@@ -667,12 +722,64 @@ class SharedSnapshotTests(unittest.TestCase):
             self.assertEqual(
                 result["failure"]["capture_failure_kind"],
                 "single_run_finalization")
+            self.assertEqual(result["failure"]["capture_run"], 1)
+            self.assertEqual(
+                result["failure"]["finalization_subphase"],
+                "staged_channel_configuration_loading")
             capture.close.assert_called_once_with()
             for lock in locks:
                 lock.close.assert_called_once_with()
             self.assertTrue(all(not stage.exists() for stage in stages))
             self.assertNotIn("hunter2", json.dumps(result))
             self.assertNotIn("/etc", json.dumps(result))
+
+    def test_every_finalization_subphase_identifies_run_and_cleans(self):
+        for subphase in sorted(FINALIZATION_SUBPHASES):
+            for failed_run in (1, 2):
+                with self.subTest(subphase=subphase, failed_run=failed_run), \
+                        tempfile.TemporaryDirectory() as directory:
+                    source, media, stages, locks, allocations = self._preparation_fixture(
+                        Path(directory))
+                    capture = SimpleNamespace(
+                        configuration_physical={"digest": "a" * 64},
+                        configuration_digest="b" * 64,
+                        database_digest="c" * 64,
+                        media_logical_digest="d" * 64,
+                        close=Mock(),
+                    )
+                    first = SimpleNamespace(request={"validation_context": {}})
+                    effects = [SingleRunFinalizationError(subphase)]
+                    if failed_run == 2:
+                        effects.insert(0, first)
+                    with patch(
+                            "station_director.dual_run.check_invocation_context",
+                            return_value=(True, "ok")), patch(
+                            "station_director.dual_run.create_staging_directory",
+                            side_effect=allocations), patch(
+                            "station_director.dual_run._capture_shared_inputs",
+                            return_value=capture), patch(
+                            "station_director.dual_run._finalize_prepared_single_run",
+                            side_effect=effects), patch(
+                            "station_director.dual_run.cleanup_staging_directory",
+                            side_effect=self._remove_test_stage):
+                        result = run_dual_comparison(
+                            source, source, media, {}, {}, "comparison")
+                    failure = result["failure"]
+                    self.assertEqual(failure["code"], "source_capture_failed")
+                    self.assertEqual(
+                        failure["capture_failure_kind"],
+                        "single_run_finalization")
+                    self.assertEqual(failure["capture_run"], failed_run)
+                    self.assertEqual(failure["finalization_subphase"], subphase)
+                    self.assertEqual(result["scheduler_invoked"], {
+                        "run_1": False, "run_2": False})
+                    self.assertEqual(
+                        [item["passed"] for item in result["cleanup"]],
+                        [True, True])
+                    capture.close.assert_called_once_with()
+                    for lock in locks:
+                        lock.close.assert_called_once_with()
+                    self.assertTrue(all(not stage.exists() for stage in stages))
 
     def test_post_preparation_context_failure_keeps_cleanup_owned(self):
         class OneReadContext(dict):
@@ -940,20 +1047,32 @@ class SharedSnapshotTests(unittest.TestCase):
     def test_c2_result_carries_kind_without_hostile_capture_detail(self):
         for kind in sorted(CAPTURE_FAILURE_KINDS):
             with self.subTest(kind=kind):
-                with self.assertRaises(DualRunError) as raised:
-                    _capture_step(kind, Mock(side_effect=RuntimeError(
-                        "password=hunter2 /etc/shadow SECRET_TOKEN=value")))
-                classified = raised.exception
+                if kind == "single_run_finalization":
+                    classified = DualRunError(
+                        "capture", "source_capture_failed", "Source capture failed.",
+                        capture_failure_kind=kind, capture_run=1,
+                        finalization_subphase="request_binding")
+                else:
+                    with self.assertRaises(DualRunError) as raised:
+                        _capture_step(kind, Mock(side_effect=RuntimeError(
+                            "password=hunter2 /etc/shadow SECRET_TOKEN=value")))
+                    classified = raised.exception
                 with patch("station_director.dual_run._prepare_scope",
                            side_effect=classified):
                     result = run_dual_comparison(
                         Path("synthetic"), Path("synthetic"), Path("synthetic"),
                         {}, {}, "comparison")
-                self.assertEqual(result["failure"], {
+                expected = {
                     "phase": "capture", "code": "source_capture_failed",
                     "category": None, "message": "Source capture failed.",
                     "capture_failure_kind": kind,
-                })
+                }
+                if kind == "single_run_finalization":
+                    expected.update({
+                        "capture_run": 1,
+                        "finalization_subphase": "request_binding",
+                    })
+                self.assertEqual(result["failure"], expected)
                 encoded = json.dumps(result, sort_keys=True)
                 self.assertNotIn("hunter2", encoded)
                 self.assertNotIn("/etc", encoded)

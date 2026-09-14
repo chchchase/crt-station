@@ -145,6 +145,21 @@
                 "capture_artifact_initialization", "single_run_finalization",
                 "context_consistency"
               ]
+            },
+            "capture_run": {"type": "integer", "enum": [1, 2]},
+            "finalization_subphase": {
+              "enum": [
+                "staged_physical_fingerprint",
+                "staged_logical_configuration_fingerprint",
+                "seed_input_construction",
+                "validation_context_derivation",
+                "staged_channel_configuration_loading",
+                "proposal_projection",
+                "affected_channel_resolution",
+                "request_binding",
+                "request_publication",
+                "lifecycle_construction"
+              ]
             }
           },
           "allOf": [
@@ -162,6 +177,42 @@
                 }
               },
               "else": {"not": {"required": ["capture_failure_kind"]}}
+            },
+            {
+              "if": {
+                "anyOf": [
+                  {
+                    "required": ["capture_failure_kind"],
+                    "properties": {
+                      "capture_failure_kind": {"const": "single_run_finalization"}
+                    }
+                  },
+                  {
+                    "required": ["code"],
+                    "properties": {
+                      "code": {
+                        "enum": [
+                          "proposal_has_no_effects",
+                          "source_changed",
+                          "duplicate_stage_file"
+                        ]
+                      }
+                    }
+                  }
+                ]
+              },
+              "then": {
+                "required": ["capture_run", "finalization_subphase"],
+                "properties": {"phase": {"const": "capture"}}
+              },
+              "else": {
+                "not": {
+                  "anyOf": [
+                    {"required": ["capture_run"]},
+                    {"required": ["finalization_subphase"]}
+                  ]
+                }
+              }
             }
           ]
         }

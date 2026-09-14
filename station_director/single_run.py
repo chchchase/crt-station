@@ -40,13 +40,58 @@ from station_director.validation import project_configuration
 REQUEST_NAME = "native-single-run.request.json"
 RESPONSE_NAME = "native-single-run.response.json"
 DEFAULT_TIMEOUT_SECONDS = 30 * 60
+FINALIZATION_SUBPHASES = frozenset({
+    "staged_physical_fingerprint",
+    "staged_logical_configuration_fingerprint",
+    "seed_input_construction",
+    "validation_context_derivation",
+    "staged_channel_configuration_loading",
+    "proposal_projection",
+    "affected_channel_resolution",
+    "request_binding",
+    "request_publication",
+    "lifecycle_construction",
+})
 
 
 class SingleRunError(RuntimeError):
-    def __init__(self, phase, code, message):
+    def __init__(self, phase, code, message, *, finalization_subphase=None):
         super().__init__(message)
         self.phase = phase
         self.code = code
+        if (finalization_subphase is not None
+                and finalization_subphase not in FINALIZATION_SUBPHASES):
+            raise ValueError("invalid finalization subphase")
+        self.finalization_subphase = finalization_subphase
+
+
+class SingleRunFinalizationError(SingleRunError):
+    """An uncoded finalization failure with no retained exception detail."""
+
+    def __init__(self, subphase):
+        super().__init__(
+            "prepare", "single_run_finalization_failed",
+            "Native single-run finalization failed.",
+            finalization_subphase=subphase,
+        )
+
+
+def _finalization_step(subphase, operation):
+    if subphase not in FINALIZATION_SUBPHASES:
+        raise ValueError("invalid finalization subphase")
+    try:
+        return operation()
+    except SingleRunError as exc:
+        # Preserve an already validated C1 code while attaching the precise
+        # finalization boundary at which it arose.  This is safe structured
+        # context, not exception text.
+        if exc.finalization_subphase is None:
+            exc.finalization_subphase = subphase
+        raise
+    except Exception as exc:
+        if getattr(exc, "is_validation_cancellation", False):
+            raise
+        raise SingleRunFinalizationError(subphase) from exc
 
 
 @dataclass
@@ -148,35 +193,71 @@ def _finalize_prepared_single_run(
     configuration_digest, database_digest, media_digest, live_physical_digest,
 ):
     """Bind a C1 request to an already-published immutable source snapshot."""
-    staged_source = Path(stage) / "source"
-    staged_physical = fingerprint_json_files(protected_json_paths(staged_source))
-    staged_configuration = logical_protected_configuration_fingerprint(
-        protected_json_paths(staged_source)
+    staged_source = _finalization_step(
+        "staged_physical_fingerprint", lambda: Path(stage) / "source")
+    staged_physical = _finalization_step(
+        "staged_physical_fingerprint",
+        lambda: fingerprint_json_files(protected_json_paths(staged_source)),
     )
-    if staged_configuration["digest"] != configuration_digest:
+    staged_configuration = _finalization_step(
+        "staged_logical_configuration_fingerprint",
+        lambda: logical_protected_configuration_fingerprint(
+            protected_json_paths(staged_source)),
+    )
+    def verify_staged_configuration():
+        if staged_configuration["digest"] != configuration_digest:
+            raise SingleRunError(
+                "prepare", "source_changed",
+                "staged configuration differs from captured source",
+            )
+
+    _finalization_step(
+        "staged_logical_configuration_fingerprint",
+        verify_staged_configuration,
+    )
+    seed_inputs = _finalization_step(
+        "seed_input_construction",
+        lambda: canonical_seed_inputs(
+            configuration_digest, database_digest, media_digest),
+    )
+    context = _finalization_step(
+        "validation_context_derivation",
+        lambda: derive_validation_context(proposal, policy, seed_inputs),
+    )
+
+    def load_channel_configs():
+        configs = {}
+        for identity, path in protected_json_paths(staged_source).items():
+            if not identity.startswith("confs/") or path.name == "main_config.json":
+                continue
+            value = json.loads(path.read_text(encoding="utf-8"))
+            configs[value["station_conf"]["network_name"]] = value
+        return configs
+
+    configs = _finalization_step(
+        "staged_channel_configuration_loading", load_channel_configs)
+    unused_projected, affected, unused_sources = _finalization_step(
+        "proposal_projection",
+        lambda: project_configuration(configs, proposal, policy),
+    )
+
+    def resolve_affected_channels():
+        by_name = {item["name"]: item["number"] for item in policy["channels"]}
+        return [
+            {"number": by_name[name], "name": name}
+            for name in sorted(affected, key=lambda name: by_name[name])
+        ]
+
+    affected_channels = _finalization_step(
+        "affected_channel_resolution", resolve_affected_channels)
+    if not affected_channels:
         raise SingleRunError(
-            "prepare", "source_changed", "staged configuration differs from captured source"
+            "prepare", "proposal_has_no_effects",
+            "Proposal has no effects eligible for schedule validation.",
+            finalization_subphase="affected_channel_resolution",
         )
-    seed_inputs = canonical_seed_inputs(
-        configuration_digest, database_digest, media_digest
-    )
-    context = derive_validation_context(proposal, policy, seed_inputs)
-    configs = {}
-    for identity, path in protected_json_paths(staged_source).items():
-        if not identity.startswith("confs/") or path.name == "main_config.json":
-            continue
-        value = json.loads(path.read_text(encoding="utf-8"))
-        configs[value["station_conf"]["network_name"]] = value
-    unused_projected, affected, unused_sources = project_configuration(
-        configs, proposal, policy
-    )
-    by_name = {item["name"]: item["number"] for item in policy["channels"]}
-    affected_channels = [
-        {"number": by_name[name], "name": name}
-        for name in sorted(affected, key=lambda name: by_name[name])
-    ]
-    request = bind_request(
-        {
+    def build_request():
+        request_payload = {
             "schema_version": 1,
             "operation": "native_single_run",
             "run_id": run_id,
@@ -193,11 +274,20 @@ def _finalize_prepared_single_run(
             "affected_channels": affected_channels,
             "validation_context": context,
         }
+        return bind_request(request_payload)
+
+    request = _finalization_step("request_binding", build_request)
+    _finalization_step(
+        "request_publication",
+        lambda: write_private_json_exclusive(
+            Path(stage) / REQUEST_NAME, request, REQUEST_SCHEMA),
     )
-    write_private_json_exclusive(Path(stage) / REQUEST_NAME, request, REQUEST_SCHEMA)
-    return SingleRunLifecycle(
-        Path(project_root), Path(stage), lock, token, run_id,
-        f"fs42-native-{token}.service", request,
+    return _finalization_step(
+        "lifecycle_construction",
+        lambda: SingleRunLifecycle(
+            Path(project_root), Path(stage), lock, token, run_id,
+            f"fs42-native-{token}.service", request,
+        ),
     )
 
 

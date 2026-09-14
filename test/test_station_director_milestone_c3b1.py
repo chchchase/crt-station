@@ -33,6 +33,10 @@ from test.test_station_director_milestone_c3a2 import (
 from test.test_station_director_schedule import base_proposal
 
 VALID_PROPOSAL = base_proposal()
+VALID_PROPOSAL["directives"] = [{
+    "type": "date_slot", "channel": 2, "date": "2026-09-15",
+    "hour": 20, "series": "Batman Beyond",
+}]
 RUN_ID = "v-20260913T120000000001Z-" + "a" * 32
 
 
@@ -417,6 +421,43 @@ class CoordinatorFlowTests(unittest.TestCase):
             code = cli.main(["schedule", "validate", VALID_PROPOSAL["proposal_id"]])
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def test_saved_migrated_noop_is_rejected_before_policy_run_or_report(self):
+        legacy = base_proposal(version=1)
+        proposal_path = self.root / "runtime/director/proposals" / legacy["proposal_id"] / "proposal.json"
+        private_json(proposal_path, legacy)
+        legacy_report = proposal_path.with_name("validation.json")
+        legacy_report.write_bytes(b'{"legacy":true}\n')
+        legacy_report.chmod(0o600)
+        before = {
+            proposal_path: (proposal_path.read_bytes(), proposal_path.stat()),
+            legacy_report: (legacy_report.read_bytes(), legacy_report.stat()),
+        }
+        validations = self.root / "runtime/director/validations"
+        with patch.object(secure_inputs, "load_canonical_policy") as policy, \
+                patch.object(self.reporting, "create_validation_run_id") as run_id, \
+                patch.object(self.coordinator, "_recover_stale_stages") as stale, \
+                patch("station_director.dual_run.run_dual_comparison") as dual, \
+                patch.object(self.reporting, "publish_validation_report") as publish:
+            outcome = self.coordinator.validate_saved_proposal(legacy["proposal_id"])
+        self.assertEqual(outcome.state, "rejected")
+        self.assertEqual(outcome.failure_code, "proposal_has_no_effects")
+        self.assertEqual(outcome.phase, "proposal")
+        self.assertEqual(outcome.scheduler_invoked, (False, False))
+        policy.assert_not_called()
+        run_id.assert_not_called()
+        stale.assert_not_called()
+        dual.assert_not_called()
+        publish.assert_not_called()
+        self.assertFalse(validations.exists())
+        for path, (raw, metadata) in before.items():
+            after = path.stat()
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(
+                (after.st_ino, after.st_size, after.st_mtime_ns, after.st_mode),
+                (metadata.st_ino, metadata.st_size, metadata.st_mtime_ns,
+                 metadata.st_mode),
+            )
+
     def test_success_publishes_immutable_report_and_latest(self):
         result = valid_success_result(Path(self.temp.name))
         code, stdout, stderr = self._run(result)
@@ -460,12 +501,47 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertNotIn("/", rendered)
         self.assertNotIn("password", rendered.casefold())
 
+        with self.assertRaises(ValueError):
+            CoordinatorOutcome(
+                state="failed", proposal_id=VALID_PROPOSAL["proposal_id"],
+                run_id=RUN_ID, validation_status="failed", phase="capture",
+                failure_code="source_capture_failed",
+                capture_failure_kind="single_run_finalization")
+
+    def test_finalization_run_and_subphase_reach_v3_report_text_and_cli(self):
+        result = self.coordinator._minimal_c2_failure(
+            RUN_ID, "source_capture_failed", "capture",
+            capture_failure_kind="single_run_finalization",
+            capture_run=2, finalization_subphase="proposal_projection")
+        code, stdout, stderr = self._run(result)
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "")
+        self.assertIn("Capture failure kind: single_run_finalization", stdout)
+        self.assertIn("Capture run: 2", stdout)
+        self.assertIn("Finalization subphase: proposal_projection", stdout)
+        report_directories = list((
+            self.root / "runtime/director/validations" /
+            VALID_PROPOSAL["proposal_id"]).glob("v-*"))
+        self.assertEqual(len(report_directories), 1)
+        document = json.loads(
+            (report_directories[0] / "validation.json").read_text(encoding="utf-8"))
+        self.assertEqual(document["schema_version"], 3)
+        finding = document["findings"]["errors"][0]
+        self.assertEqual(finding["capture_run"], 2)
+        self.assertEqual(finding["finalization_subphase"], "proposal_projection")
+        text = (report_directories[0] / "validation.txt").read_text(encoding="utf-8")
+        self.assertIn("single_run_finalization", text)
+        self.assertIn("proposal_projection", text)
+
     def test_explicit_single_run_preparation_code_reaches_bounded_cli(self):
         result = self.coordinator._minimal_c2_failure(
-            RUN_ID, "duplicate_stage_file", "capture")
+            RUN_ID, "duplicate_stage_file", "capture",
+            capture_run=1, finalization_subphase="request_publication")
         code, stdout, stderr = self._run(result)
         self.assertEqual(code, 1)
         self.assertIn("Failure: duplicate_stage_file", stdout)
+        self.assertIn("Capture run: 1", stdout)
+        self.assertIn("Finalization subphase: request_publication", stdout)
         self.assertNotIn("/etc", stdout)
         self.assertNotIn("password", stdout.casefold())
         self.assertEqual(stderr, "")

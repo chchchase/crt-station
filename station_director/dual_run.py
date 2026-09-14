@@ -38,7 +38,9 @@ from station_director.schedule_comparison import (
     compare_baseline_to_proposed,
 )
 from station_director.single_run import (
+    FINALIZATION_SUBPHASES,
     SingleRunError,
+    SingleRunFinalizationError,
     _finalize_prepared_single_run,
     inspect_single_run,
     launch_single_run,
@@ -70,13 +72,15 @@ CAPTURE_FAILURE_KINDS = frozenset({
 SOURCE_CAPTURE_FAILURE_MESSAGE = "Source capture failed."
 SINGLE_RUN_CAPTURE_MESSAGES = {
     "duplicate_stage_file": "A staged validation file already exists.",
+    "proposal_has_no_effects": "Proposal has no effects eligible for schedule validation.",
     "source_changed": "A staged scheduling input changed during preparation.",
 }
 
 
 class DualRunError(RuntimeError):
     def __init__(self, phase, code, message, *, category=None,
-                 capture_failure_kind=None):
+                 capture_failure_kind=None, capture_run=None,
+                 finalization_subphase=None):
         super().__init__(message)
         self.phase = phase
         self.code = code
@@ -86,6 +90,13 @@ class DualRunError(RuntimeError):
         if (code == "source_capture_failed") != (capture_failure_kind is not None):
             raise ValueError("source capture failures require exactly one classified kind")
         self.capture_failure_kind = capture_failure_kind
+        if capture_run not in (None, 1, 2):
+            raise ValueError("invalid capture run")
+        if (finalization_subphase is not None
+                and finalization_subphase not in FINALIZATION_SUBPHASES):
+            raise ValueError("invalid finalization subphase")
+        self.capture_run = capture_run
+        self.finalization_subphase = finalization_subphase
 
 
 def _raise_if_cancelled(exc):
@@ -108,6 +119,14 @@ def _capture_step(kind, operation):
         raise ValueError("invalid capture failure kind")
     try:
         return operation()
+    except SingleRunFinalizationError as exc:
+        if kind != "single_run_finalization":
+            raise
+        raise DualRunError(
+            "capture", "source_capture_failed", SOURCE_CAPTURE_FAILURE_MESSAGE,
+            capture_failure_kind=kind,
+            finalization_subphase=exc.finalization_subphase,
+        ) from exc
     except (DualRunError, SingleRunError):
         raise
     except Exception as exc:
@@ -569,18 +588,22 @@ def _prepare_scope(project_root, source_root, media_root, proposal, policy, comp
         )
         lifecycles = []
         for index, (token, stage, lock) in enumerate(created, 1):
-            lifecycle = _capture_step(
-                "single_run_finalization",
-                lambda index=index, token=token, stage=stage, lock=lock:
-                _finalize_prepared_single_run(
-                    project_root, stage, lock, token,
-                    f"{comparison_id}.run-{index}", proposal, policy,
-                    configuration_digest=capture.configuration_digest,
-                    database_digest=capture.database_digest,
-                    media_digest=capture.media_logical_digest,
-                    live_physical_digest=physical_live,
-                ),
-            )
+            try:
+                lifecycle = _capture_step(
+                    "single_run_finalization",
+                    lambda index=index, token=token, stage=stage, lock=lock:
+                    _finalize_prepared_single_run(
+                        project_root, stage, lock, token,
+                        f"{comparison_id}.run-{index}", proposal, policy,
+                        configuration_digest=capture.configuration_digest,
+                        database_digest=capture.database_digest,
+                        media_digest=capture.media_logical_digest,
+                        live_physical_digest=physical_live,
+                    ),
+                )
+            except (DualRunError, SingleRunError) as exc:
+                exc.capture_run = index
+                raise
             lifecycles.append(lifecycle)
 
         def verify_contexts():
@@ -639,6 +662,29 @@ def _run_preservation_summary(response):
 
 def _validate_result_semantics(result):
     """Enforce outcome relationships that JSON Schema cannot express safely."""
+    failure = result.get("failure")
+    if failure is not None:
+        capture_run = failure.get("capture_run")
+        subphase = failure.get("finalization_subphase")
+        finalization_failure = (
+            failure.get("capture_failure_kind") == "single_run_finalization"
+            or failure.get("code") in {
+                "proposal_has_no_effects", "source_changed",
+                "duplicate_stage_file",
+            }
+        )
+        if finalization_failure != (
+                capture_run in (1, 2)
+                and subphase in FINALIZATION_SUBPHASES
+                and failure.get("phase") == "capture"):
+            raise DualRunError(
+                "protocol", "invalid_result",
+                "incoherent finalization diagnostic fields")
+        if not finalization_failure and (
+                capture_run is not None or subphase is not None):
+            raise DualRunError(
+                "protocol", "invalid_result",
+                "unexpected finalization diagnostic fields")
     if result["status"] == "success":
         if result["phase_reached"] != "complete" or result["failure"] is not None:
             raise DualRunError("protocol", "invalid_result", "incoherent C2 success")
@@ -863,6 +909,8 @@ def run_dual_comparison(
         if code == "cleanup_failure":
             code = "cleanup_failed"
         capture_failure_kind = getattr(exc, "capture_failure_kind", None)
+        capture_run = getattr(exc, "capture_run", None)
+        finalization_subphase = getattr(exc, "finalization_subphase", None)
         safe_message = (
             SINGLE_RUN_CAPTURE_MESSAGES.get(code, "Native preparation failed.")
             if isinstance(exc, SingleRunError) and result["phase_reached"] == "capture"
@@ -878,6 +926,10 @@ def run_dual_comparison(
         }
         if capture_failure_kind is not None:
             result["failure"]["capture_failure_kind"] = capture_failure_kind
+        if capture_run is not None:
+            result["failure"]["capture_run"] = capture_run
+        if finalization_subphase is not None:
+            result["failure"]["finalization_subphase"] = finalization_subphase
         preparation_cleanup = getattr(exc, "preparation_cleanup", None)
         if preparation_cleanup is not None:
             result["cleanup"] = preparation_cleanup

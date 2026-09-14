@@ -31,6 +31,18 @@ CAPTURE_FAILURE_KINDS = frozenset({
     "capture_artifact_initialization", "single_run_finalization",
     "context_consistency",
 })
+FINALIZATION_SUBPHASES = frozenset({
+    "staged_physical_fingerprint",
+    "staged_logical_configuration_fingerprint",
+    "seed_input_construction",
+    "validation_context_derivation",
+    "staged_channel_configuration_loading",
+    "proposal_projection",
+    "affected_channel_resolution",
+    "request_binding",
+    "request_publication",
+    "lifecycle_construction",
+})
 
 
 class CoordinatorError(RuntimeError):
@@ -58,6 +70,8 @@ class CoordinatorOutcome:
     phase: str | None = None
     failure_code: str | None = None
     capture_failure_kind: str | None = None
+    capture_run: int | None = None
+    finalization_subphase: str | None = None
     scheduler_invoked: tuple = (False, False)
     report_published: bool = False
     report_durable: bool = False
@@ -77,7 +91,8 @@ class CoordinatorOutcome:
         if self.state == "disabled" and any((
                 self.proposal_id, self.run_id, self.validation_status, self.phase,
                 self.failure_code, self.scheduler_invoked != (False, False),
-                self.capture_failure_kind,
+                self.capture_failure_kind, self.capture_run,
+                self.finalization_subphase,
                 self.report_published, self.report_durable, self.publication_code,
                 self.latest_status, self.latest_code, self.affected_channels,
                 self.changed_channels, self.cleanup_passed is not None,
@@ -100,6 +115,7 @@ class CoordinatorOutcome:
                       "invalid_proposal_id", "validation_lock_busy",
                       "validation_lock_unsafe", "proposal_rejected",
                       "policy_rejected", "source_capture_failed",
+                      "proposal_has_no_effects",
                       "duplicate_stage_file", "source_changed",
                       "backup_mismatch", "context_mismatch",
                       "insufficient_space", "invalid_comparison_id",
@@ -132,6 +148,21 @@ class CoordinatorOutcome:
         if (self.capture_failure_kind is not None
                 and self.capture_failure_kind not in CAPTURE_FAILURE_KINDS):
             raise ValueError("unsafe capture failure kind")
+        detailed_finalization = (
+            self.capture_failure_kind == "single_run_finalization"
+            or (self.failure_code in {
+                "proposal_has_no_effects", "source_changed",
+                "duplicate_stage_file",
+            } and self.state != "rejected")
+        )
+        if detailed_finalization != (
+                self.capture_run in (1, 2)
+                and self.finalization_subphase in FINALIZATION_SUBPHASES):
+            raise ValueError("incoherent finalization diagnostic")
+        if not detailed_finalization and (
+                self.capture_run is not None
+                or self.finalization_subphase is not None):
+            raise ValueError("unexpected finalization diagnostic")
         if self.state in {"failed", "interrupted"} and self.failure_code is None:
             raise ValueError("failed outcome lacks failure code")
         if self.state == "interrupted" and self.failure_code != "validation_interrupted":
@@ -327,7 +358,8 @@ def _recover_stale_stages(isolation):
 
 
 def _minimal_c2_failure(run_id, code, phase="capture", source=None, *,
-                        capture_failure_kind=None):
+                        capture_failure_kind=None, capture_run=None,
+                        finalization_subphase=None):
     from station_director.dual_run import _base_result
     from station_director.single_run_protocol import validate_document
     from station_director.dual_run import RESULT_SCHEMA
@@ -356,6 +388,10 @@ def _minimal_c2_failure(run_id, code, phase="capture", source=None, *,
     }
     if capture_failure_kind is not None:
         result["failure"]["capture_failure_kind"] = capture_failure_kind
+    if capture_run is not None:
+        result["failure"]["capture_run"] = capture_run
+    if finalization_subphase is not None:
+        result["failure"]["finalization_subphase"] = finalization_subphase
     validate_document(result, RESULT_SCHEMA)
     return result
 
@@ -402,6 +438,8 @@ def _outcome_from_result(proposal_id, run_id, result, publication=None,
         failure_code=failure_code, scheduler_invoked=scheduler_tuple,
         capture_failure_kind=(failure.get("capture_failure_kind")
                               if failure_code == "source_capture_failed" else None),
+        capture_run=failure.get("capture_run"),
+        finalization_subphase=failure.get("finalization_subphase"),
         report_published=published, report_durable=durable,
         publication_code=publication_code,
         latest_status=latest.get("status"), latest_code=latest.get("code"),
@@ -423,6 +461,9 @@ def _outcome_without_report(proposal_id, run_id, result, code):
         capture_failure_kind=(
             ((result or {}).get("failure") or {}).get("capture_failure_kind")
             if code == "source_capture_failed" else None),
+        capture_run=((result or {}).get("failure") or {}).get("capture_run"),
+        finalization_subphase=(
+            ((result or {}).get("failure") or {}).get("finalization_subphase")),
         scheduler_invoked=(bool(schedulers.get("run_1")),
                            bool(schedulers.get("run_2"))),
         cleanup_passed=(all(item.get("passed") for item in cleanup)
@@ -453,6 +494,10 @@ def validate_saved_proposal(proposal_id):
                 proposal = secure_inputs.load_canonical_proposal(proposal_id)
             except secure_inputs.SecureInputError:
                 return _rejected("proposal_rejected", "proposal", proposal_id)
+            if not any(proposal[name] for name in (
+                    "assignment_changes", "directives", "exclusions")):
+                return _rejected(
+                    "proposal_has_no_effects", "proposal", proposal_id)
             try:
                 policy = secure_inputs.load_canonical_policy()
             except secure_inputs.SecureInputError:
@@ -555,6 +600,11 @@ def render_cli_outcome(outcome):
             lines.append(f"Failure: {outcome.failure_code}")
         if outcome.capture_failure_kind is not None:
             lines.append(f"Capture failure kind: {outcome.capture_failure_kind}")
+        if outcome.capture_run is not None:
+            lines.append(f"Capture run: {outcome.capture_run}")
+        if outcome.finalization_subphase is not None:
+            lines.append(
+                f"Finalization subphase: {outcome.finalization_subphase}")
         if outcome.run_id is not None:
             lines.append(f"Run: {outcome.run_id}")
         if outcome.report_durable:

@@ -12,7 +12,7 @@ import types
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from station_director.isolation_probe import PROBE_RESULTS, PROBE_SCHEMA_VERSION
 from station_director.policy import load_policy
@@ -34,8 +34,12 @@ from station_director.single_run_protocol import (
 )
 from station_director.single_run_worker import run_worker
 from station_director.single_run import (
+    FINALIZATION_SUBPHASES,
     SingleRunError,
+    SingleRunFinalizationError,
     SingleRunLifecycle,
+    _finalization_step,
+    _finalize_prepared_single_run,
     inspect_single_run,
     launch_single_run,
     prepare_single_run,
@@ -1111,6 +1115,138 @@ class LifecycleTests(unittest.TestCase):
                     ROOT, ROOT, ROOT, base_proposal(), load_policy(), "run",
                 )
         create.assert_not_called()
+
+    def test_finalization_steps_are_safe_precise_and_preserve_explicit_codes(self):
+        for subphase in sorted(FINALIZATION_SUBPHASES):
+            with self.subTest(subphase=subphase), self.assertRaises(
+                    SingleRunFinalizationError) as caught:
+                _finalization_step(
+                    subphase,
+                    lambda: (_ for _ in ()).throw(
+                        RuntimeError("password=hunter2 /etc/shadow")),
+                )
+            self.assertEqual(caught.exception.finalization_subphase, subphase)
+            self.assertEqual(caught.exception.code, "single_run_finalization_failed")
+            self.assertNotIn("hunter2", str(caught.exception))
+
+        explicit = SingleRunError("prepare", "duplicate_stage_file", "fixed")
+        with self.assertRaises(SingleRunError) as caught:
+            _finalization_step("request_publication", lambda: (_ for _ in ()).throw(explicit))
+        self.assertIs(caught.exception, explicit)
+        self.assertEqual(caught.exception.finalization_subphase, "request_publication")
+
+    def test_finalizer_rejects_empty_resolved_channels_before_request_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "fs42-i-123456abcdef"
+            source = stage / "source/confs"
+            source.mkdir(parents=True)
+            config = source / "action.json"
+            config.write_text(
+                json.dumps({"station_conf": {"network_name": "Action"}}),
+                encoding="utf-8",
+            )
+            proposal = base_proposal()
+            policy = {"channels": [{"number": 2, "name": "Action"}]}
+            with patch(
+                    "station_director.single_run.protected_json_paths",
+                    return_value={"confs/action.json": config}), patch(
+                    "station_director.single_run.fingerprint_json_files",
+                    return_value={"digest": "a" * 64}), patch(
+                    "station_director.single_run.logical_protected_configuration_fingerprint",
+                    return_value={"digest": "b" * 64}), patch(
+                    "station_director.single_run.canonical_seed_inputs",
+                    return_value={"configuration": "b" * 64}), patch(
+                    "station_director.single_run.derive_validation_context",
+                    return_value={"effective_seed": 1}), patch(
+                    "station_director.single_run.project_configuration",
+                    return_value=({}, set(), {})), patch(
+                    "station_director.single_run.bind_request") as bind:
+                with self.assertRaises(SingleRunError) as caught:
+                    _finalize_prepared_single_run(
+                        Path(directory), stage, object(), "123456abcdef", "run-1",
+                        proposal, policy, configuration_digest="b" * 64,
+                        database_digest="c" * 64, media_digest="d" * 64,
+                        live_physical_digest="e" * 64,
+                    )
+            self.assertEqual(caught.exception.code, "proposal_has_no_effects")
+            self.assertEqual(
+                caught.exception.finalization_subphase,
+                "affected_channel_resolution",
+            )
+            bind.assert_not_called()
+            self.assertFalse((stage / "native-single-run.request.json").exists())
+
+    def test_each_real_finalizer_operation_reports_its_exact_subphase(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "fs42-i-123456abcdef"
+            config = stage / "source/confs/action.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(
+                json.dumps({"station_conf": {"network_name": "Action"}}),
+                encoding="utf-8",
+            )
+            proposal = base_proposal()
+            proposal["directives"] = [{
+                "type": "date_slot", "channel": 2, "date": "2026-09-15",
+                "hour": 20, "series": "Batman Beyond",
+            }]
+            policy = {"channels": [{"number": 2, "name": "Action"}]}
+            for subphase in sorted(FINALIZATION_SUBPHASES):
+                protected = Mock(
+                    return_value={"confs/action.json": config})
+                physical = Mock(return_value={"digest": "a" * 64})
+                logical = Mock(return_value={"digest": "b" * 64})
+                seeds = Mock(return_value={"configuration": "b" * 64})
+                context = Mock(return_value={"effective_seed": 1})
+                project = Mock(return_value=({}, {"Action"}, {}))
+                bind = Mock(return_value={})
+                publish = Mock(return_value=None)
+                lifecycle = Mock(return_value=object())
+                failing = RuntimeError("token=secret /etc/shadow")
+                if subphase == "staged_physical_fingerprint":
+                    physical.side_effect = failing
+                elif subphase == "staged_logical_configuration_fingerprint":
+                    logical.side_effect = failing
+                elif subphase == "seed_input_construction":
+                    seeds.side_effect = failing
+                elif subphase == "validation_context_derivation":
+                    context.side_effect = failing
+                elif subphase == "staged_channel_configuration_loading":
+                    protected.side_effect = [
+                        {"confs/action.json": config},
+                        {"confs/action.json": config},
+                        failing,
+                    ]
+                elif subphase == "proposal_projection":
+                    project.side_effect = failing
+                elif subphase == "affected_channel_resolution":
+                    project.return_value = ({}, {"Unknown"}, {})
+                elif subphase == "request_binding":
+                    bind.side_effect = failing
+                elif subphase == "request_publication":
+                    publish.side_effect = failing
+                elif subphase == "lifecycle_construction":
+                    lifecycle.side_effect = failing
+                with self.subTest(subphase=subphase), patch(
+                        "station_director.single_run.protected_json_paths", protected), patch(
+                        "station_director.single_run.fingerprint_json_files", physical), patch(
+                        "station_director.single_run.logical_protected_configuration_fingerprint",
+                        logical), patch(
+                        "station_director.single_run.canonical_seed_inputs", seeds), patch(
+                        "station_director.single_run.derive_validation_context", context), patch(
+                        "station_director.single_run.project_configuration", project), patch(
+                        "station_director.single_run.bind_request", bind), patch(
+                        "station_director.single_run.write_private_json_exclusive", publish), patch(
+                        "station_director.single_run.SingleRunLifecycle", lifecycle):
+                    with self.assertRaises(SingleRunFinalizationError) as caught:
+                        _finalize_prepared_single_run(
+                            Path(directory), stage, object(), "123456abcdef", "run-1",
+                            proposal, policy, configuration_digest="b" * 64,
+                            database_digest="c" * 64, media_digest="d" * 64,
+                            live_physical_digest="e" * 64,
+                        )
+                self.assertEqual(caught.exception.finalization_subphase, subphase)
+                self.assertNotIn("secret", str(caught.exception))
 
     def test_c1_tmp_is_stage_backed_without_changing_default_launcher(self):
         with tempfile.TemporaryDirectory() as directory:

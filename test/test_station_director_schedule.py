@@ -286,7 +286,7 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(ProposalError, "cannot be safely migrated"):
             migrate_v1_to_v2(legacy)
 
-    def test_loading_v1_returns_v2_without_rewriting_saved_file(self):
+    def test_loading_saved_v1_noop_returns_v2_without_rewriting_saved_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             legacy = base_proposal(version=1)
@@ -298,6 +298,9 @@ class MigrationTests(unittest.TestCase):
             before = path.read_bytes()
             loaded, loaded_path = load_proposal(legacy["proposal_id"], root)
             self.assertEqual(loaded["schema_version"], 2)
+            self.assertEqual(loaded["assignment_changes"], [])
+            self.assertEqual(loaded["directives"], [])
+            self.assertEqual(loaded["exclusions"], [])
             self.assertEqual(loaded_path, path)
             self.assertEqual(path.read_bytes(), before)
 

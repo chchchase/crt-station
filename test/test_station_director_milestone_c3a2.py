@@ -24,6 +24,7 @@ from station_director.reporting import (
     LATEST_SCHEMA,
     REPORT_SCHEMA,
     REPORT_SCHEMA_V1,
+    REPORT_SCHEMA_V2,
     ReportError,
     build_validation_report,
     create_validation_run_id,
@@ -46,7 +47,9 @@ from station_director.schedule_comparison import (
     compare_baseline_summaries,
     compare_baseline_to_proposed,
 )
-from station_director.single_run_protocol import strict_json_loads, validate_document
+from station_director.single_run_protocol import (
+    ProtocolError, strict_json_loads, validate_document,
+)
 from test.test_station_director_milestone_c1 import passing_guide
 from test.test_station_director_milestone_b2 import (
     catalog_row,
@@ -68,6 +71,21 @@ CHANNEL = {"number": 2, "name": "Action",
            "channel_seed": 9,
            "regeneration_start": "2026-09-14 01:00:00.000001",
            "effective_horizon": "2026-09-14 04:00:00.000001"}
+
+
+def retained_v2_from_v3(report):
+    retained = copy.deepcopy(report)
+    retained["schema_version"] = 2
+    retained["software"]["report_schema_version"] = 2
+    for group in ("baseline_findings", "unexpected_differences", "warnings", "errors"):
+        for finding in retained["findings"][group]:
+            finding.pop("capture_run")
+            finding.pop("finalization_subphase")
+    for cleanup in retained["cleanup"].values():
+        if cleanup and cleanup.get("diagnostic"):
+            cleanup["diagnostic"].pop("capture_run")
+            cleanup["diagnostic"].pop("finalization_subphase")
+    return retained
 
 
 def add_catalog(connection, catalog_id, path, title="Show", **changes):
@@ -426,8 +444,8 @@ class ReportTests(unittest.TestCase):
         return parent
 
     def test_software_identity_schema_and_deterministic_text(self):
-        self.assertEqual(self.report["schema_version"], 2)
-        self.assertEqual(self.report["software"]["report_schema_version"], 2)
+        self.assertEqual(self.report["schema_version"], 3)
+        self.assertEqual(self.report["software"]["report_schema_version"], 3)
         self.assertTrue(self.report["software"]["director_version"])
         self.assertLessEqual(len(self.report["software"]["director_version"]), 100)
         validate_document(self.report, REPORT_SCHEMA)
@@ -438,7 +456,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(_canonical_json(self.report), _canonical_json(copy.deepcopy(self.report)))
         self.assertTrue(_canonical_json(self.report).endswith(b"\n"))
 
-    def test_capture_kind_survives_v2_projection_publication_latest_and_text(self):
+    def test_capture_kind_survives_v3_projection_publication_latest_and_text(self):
         run_id = "v-20260913T120002000001Z-" + "c" * 32
         report = None
         for kind in sorted(CAPTURE_FAILURE_KINDS):
@@ -448,6 +466,11 @@ class ReportTests(unittest.TestCase):
                 "category": None, "message": "Source capture failed.",
                 "capture_failure_kind": kind,
             }
+            if kind == "single_run_finalization":
+                result["failure"].update({
+                    "capture_run": 2,
+                    "finalization_subphase": "proposal_projection",
+                })
             captured_digest_inputs = []
             real_digest = reporting._diagnostic_digest
             def observe_digest(value):
@@ -459,9 +482,16 @@ class ReportTests(unittest.TestCase):
                     PROPOSAL, result, run_id, "2026-09-13T12:02:00Z")
                 finding = candidate["findings"]["errors"][0]
                 self.assertEqual(finding["capture_failure_kind"], kind)
+                self.assertEqual(
+                    finding["capture_run"],
+                    2 if kind == "single_run_finalization" else None)
                 self.assertIn({
                     "code": "source_capture_failed", "phase": "capture",
                     "capture_failure_kind": kind,
+                    "capture_run": (2 if kind == "single_run_finalization" else None),
+                    "finalization_subphase": (
+                        "proposal_projection"
+                        if kind == "single_run_finalization" else None),
                     "template": "Source capture failed.",
                 }, captured_digest_inputs)
                 validate_report_document(candidate)
@@ -488,12 +518,35 @@ class ReportTests(unittest.TestCase):
         latest = strict_json_loads((parent / "latest.json").read_bytes())
         self.assertEqual(latest["run_id"], run_id)
 
+    def test_v3_finalization_finding_requires_exact_run_and_subphase(self):
+        result = _base_result("comparison")
+        result["failure"] = {
+            "phase": "capture", "code": "source_capture_failed",
+            "category": None, "message": "Source capture failed.",
+            "capture_failure_kind": "single_run_finalization",
+            "capture_run": 1,
+            "finalization_subphase": "request_binding",
+        }
+        report = build_validation_report(
+            PROPOSAL, result, self.run_id, "2026-09-13T12:00:00Z")
+        for field in ("capture_run", "finalization_subphase"):
+            invalid = copy.deepcopy(report)
+            invalid["findings"]["errors"][0].pop(field)
+            with self.subTest(field=field), self.assertRaises(ProtocolError):
+                validate_report_document(invalid)
+        invalid = copy.deepcopy(report)
+        invalid["findings"]["errors"][0]["finalization_subphase"] = "unknown"
+        with self.assertRaises(ProtocolError):
+            validate_report_document(invalid)
+
     def test_explicit_capture_codes_survive_report_projection(self):
         for code, template in (
                 ("backup_mismatch",
                  "A staged database backup differs from its pinned source."),
                 ("duplicate_stage_file",
                  "A staged validation file already exists."),
+                ("proposal_has_no_effects",
+                 "Proposal has no effects eligible for schedule validation."),
                 ("source_changed",
                  "A staged scheduling input changed during preparation.")):
             result = _base_result("comparison")
@@ -501,6 +554,16 @@ class ReportTests(unittest.TestCase):
                 "phase": "capture", "code": code, "category": None,
                 "message": "password=hunter2 /etc/shadow",
             }
+            if code in {"duplicate_stage_file", "proposal_has_no_effects",
+                        "source_changed"}:
+                result["failure"].update({
+                    "capture_run": 1,
+                    "finalization_subphase": (
+                        "request_publication" if code == "duplicate_stage_file"
+                        else "affected_channel_resolution"
+                        if code == "proposal_has_no_effects"
+                        else "staged_logical_configuration_fingerprint"),
+                })
             with self.subTest(code=code):
                 report = build_validation_report(
                     PROPOSAL, result, self.run_id, "2026-09-13T12:00:00Z")
@@ -519,8 +582,12 @@ class ReportTests(unittest.TestCase):
             "capture_failure_kind": "database_snapshot",
         }
         old_run = "v-20260913T110000000001Z-" + "d" * 32
-        v2 = build_validation_report(
+        v3 = build_validation_report(
             PROPOSAL, result, old_run, "2026-09-13T11:00:00Z")
+        v2 = retained_v2_from_v3(v3)
+        validate_document(v2, REPORT_SCHEMA_V2)
+        validate_report_document(v2, retained=True)
+
         v1 = copy.deepcopy(v2)
         v1["schema_version"] = 1
         v1["software"]["report_schema_version"] = 1
@@ -557,6 +624,44 @@ class ReportTests(unittest.TestCase):
         self.assertEqual((old_directory / "validation.json").read_bytes(), old_raw)
         self.assertEqual(
             strict_json_loads((parent / "latest.json").read_bytes())["run_id"], new_run)
+
+    def test_retained_v2_pointer_target_is_valid_and_replaceable_by_v3(self):
+        result = _base_result("comparison")
+        result["failure"] = {
+            "phase": "capture", "code": "source_capture_failed",
+            "category": None, "message": "Source capture failed.",
+            "capture_failure_kind": "database_snapshot",
+        }
+        old_run = "v-20260913T110001000001Z-" + "f" * 32
+        v3 = build_validation_report(
+            PROPOSAL, result, old_run, "2026-09-13T11:00:01Z")
+        v2 = retained_v2_from_v3(v3)
+        validate_report_document(v2, retained=True)
+        parent = self._prepare_parent()
+        old_directory = parent / old_run
+        old_directory.mkdir(mode=0o700)
+        old_raw = _canonical_json(v2)
+        (old_directory / "validation.json").write_bytes(old_raw)
+        (old_directory / "validation.txt").write_bytes(b"retained v2 failure\n")
+        for path in old_directory.iterdir():
+            path.chmod(0o600)
+        pointer = {
+            "schema_version": 1, "proposal_id": PROPOSAL["proposal_id"],
+            "run_id": old_run,
+            "validation_json_digest": hashlib.sha256(old_raw).hexdigest(),
+        }
+        (parent / "latest.json").write_bytes(_canonical_json(pointer))
+        (parent / "latest.json").chmod(0o600)
+
+        new_run = "v-20260913T120004000001Z-" + "9" * 32
+        new_report = build_validation_report(
+            PROPOSAL, result, new_run, "2026-09-13T12:04:00Z")
+        publication = publish_validation_report(new_report)
+        self.assertEqual(publication["latest"]["status"], "updated")
+        self.assertEqual((old_directory / "validation.json").read_bytes(), old_raw)
+        self.assertEqual(
+            strict_json_loads((parent / "latest.json").read_bytes())["run_id"],
+            new_run)
 
     def test_immutable_two_file_publication_modes_and_latest(self):
         result = publish_validation_report(self.report)

@@ -26,8 +26,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VALIDATIONS_ROOT = PROJECT_ROOT / "runtime/director/validations"
 REPORT_SCHEMA_V1 = Path(__file__).with_name("schemas") / "validation-report.v1.schema.json"
 REPORT_SCHEMA_V2 = Path(__file__).with_name("schemas") / "validation-report.v2.schema.json"
-# New reports always use v2. The v1 path remains frozen for retained reports.
-REPORT_SCHEMA = REPORT_SCHEMA_V2
+REPORT_SCHEMA_V3 = Path(__file__).with_name("schemas") / "validation-report.v3.schema.json"
+# New reports always use v3. The v1/v2 paths remain frozen for retained reports.
+REPORT_SCHEMA = REPORT_SCHEMA_V3
 LATEST_SCHEMA = Path(__file__).with_name("schemas") / "latest-validation-pointer.v1.schema.json"
 DUAL_RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v1.schema.json"
 PROPOSAL_ID_RE = re.compile(r"p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}\Z")
@@ -50,6 +51,7 @@ DIAGNOSTIC_TEMPLATES = {
     "proposal_created_gap": "The proposed schedule introduces a coverage gap.",
     "proposal_created_overlap": "The proposed schedule introduces overlapping blocks.",
     "source_capture_failed": "Source capture failed.",
+    "proposal_has_no_effects": "Proposal has no effects eligible for schedule validation.",
     "duplicate_stage_file": "A staged validation file already exists.",
     "source_changed": "A staged scheduling input changed during preparation.",
     "backup_mismatch": "A staged database backup differs from its pinned source.",
@@ -88,6 +90,18 @@ CAPTURE_FAILURE_KINDS = frozenset({
     "media_logical_fingerprint", "post_capture_stability",
     "capture_artifact_initialization", "single_run_finalization",
     "context_consistency",
+})
+FINALIZATION_SUBPHASES = frozenset({
+    "staged_physical_fingerprint",
+    "staged_logical_configuration_fingerprint",
+    "seed_input_construction",
+    "validation_context_derivation",
+    "staged_channel_configuration_loading",
+    "proposal_projection",
+    "affected_channel_resolution",
+    "request_binding",
+    "request_publication",
+    "lifecycle_construction",
 })
 SAFE_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,99}\Z")
 SAFE_EXCEPTION_CLASSES = {
@@ -156,14 +170,14 @@ def _safe_identifier(value):
 
 
 def validate_report_document(report, *, retained=False):
-    """Validate a new v2 report or a retained immutable v1/v2 report."""
+    """Validate a new v3 report or a retained immutable v1/v2/v3 report."""
     if not isinstance(report, dict):
         raise ReportError("invalid_report", "validation report must be an object")
     version = report.get("schema_version")
-    if version == 2:
-        schema = REPORT_SCHEMA_V2
-    elif retained and version == 1:
-        schema = REPORT_SCHEMA_V1
+    if version == 3:
+        schema = REPORT_SCHEMA_V3
+    elif retained and version in (1, 2):
+        schema = REPORT_SCHEMA_V1 if version == 1 else REPORT_SCHEMA_V2
     else:
         raise ReportError("invalid_report_version", "unsupported validation report version")
     validate_document(report, schema)
@@ -199,6 +213,22 @@ def _structured_finding(value, default_code, default_phase):
         exception_class = None
     else:
         capture_failure_kind = None
+    capture_run = value.get("capture_run")
+    finalization_subphase = _safe_identifier(value.get("finalization_subphase"))
+    detailed_finalization = (
+        capture_failure_kind == "single_run_finalization"
+        or code in {"proposal_has_no_effects", "source_changed",
+                    "duplicate_stage_file"}
+    )
+    if detailed_finalization:
+        if (capture_run not in (1, 2)
+                or finalization_subphase not in FINALIZATION_SUBPHASES):
+            raise ReportError(
+                "invalid_report_input",
+                "finalization failure lacks safe run and subphase")
+    else:
+        capture_run = None
+        finalization_subphase = None
     finding = {
         "code": code,
         "phase": phase,
@@ -207,12 +237,16 @@ def _structured_finding(value, default_code, default_phase):
         "count": count,
         "exception_class": exception_class,
         "capture_failure_kind": capture_failure_kind,
+        "capture_run": capture_run,
+        "finalization_subphase": finalization_subphase,
     }
     digest_input = ({
         "code": finding["code"], "phase": finding["phase"],
         "capture_failure_kind": finding["capture_failure_kind"],
+        "capture_run": finding["capture_run"],
+        "finalization_subphase": finding["finalization_subphase"],
         "template": finding["template"],
-    } if code == "source_capture_failed" else value)
+    } if code == "source_capture_failed" or detailed_finalization else value)
     finding["diagnostic_digest"] = _diagnostic_digest(digest_input)
     return finding
 
@@ -353,9 +387,9 @@ def build_validation_report(proposal, c2_result, run_id, completed_at):
         "sequence_changes", "break_changes",
     )}
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "report_type": "station_director_validation",
-        "software": {"director_version": __version__, "report_schema_version": 2},
+        "software": {"director_version": __version__, "report_schema_version": 3},
         "proposal": {"id": proposal["proposal_id"], "schema_version": proposal["schema_version"],
                      "digest": hashlib.sha256(_canonical_json(proposal)).hexdigest()},
         "validation": {
