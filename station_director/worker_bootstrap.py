@@ -79,14 +79,29 @@ def scheduling_main_config(source_main):
     return main
 
 
-def _load_json(path):
+def _load_json(path, expected_identity=None):
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or expected_identity is not None
+            and (before.st_dev, before.st_ino) != expected_identity
+        ):
             raise BootstrapError(f"input is not a single-link regular file: {path}")
         with os.fdopen(os.dup(descriptor), "r", encoding="utf-8") as handle:
-            return json.load(handle)
+            value = json.load(handle)
+        after = os.fstat(descriptor)
+        current = Path(path).lstat()
+        if (
+            (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+             before.st_ctime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                after.st_ctime_ns)
+            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise BootstrapError(f"input changed while it was being read: {path}")
+        return value
     finally:
         os.close(descriptor)
 
@@ -107,24 +122,53 @@ def _write_private_json(path, value):
         os.close(descriptor)
 
 
-def _source_configurations(source):
+def _configuration_inventory(source):
+    """Inspect configuration names and identities once without following links."""
+    confs = Path(source) / "confs"
+    inventory = {}
+    folded = {}
+    with os.scandir(confs) as entries:
+        for entry in entries:
+            name = entry.name
+            folded_name = name.casefold()
+            if folded_name == "main_config.json" and name != "main_config.json":
+                raise BootstrapError("main_config.json has a case-confusable name")
+            if not name.endswith(".json"):
+                continue
+            if folded_name in folded:
+                raise BootstrapError("configuration inventory has case-confusable names")
+            info = entry.stat(follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise BootstrapError(
+                    f"configuration is not a single-link regular file: {name}"
+                )
+            folded[folded_name] = name
+            inventory[name] = (confs / name, (info.st_dev, info.st_ino))
+    return inventory
+
+
+def _source_configurations(source, inventory=None):
+    if inventory is None:
+        inventory = _configuration_inventory(source)
     configs = {}
     filenames = {}
-    for path in sorted((Path(source) / "confs").glob("*.json")):
-        if path.name == "main_config.json":
+    for filename in sorted(inventory):
+        if filename == "main_config.json":
             continue
-        value = _load_json(path)
+        path, identity = inventory[filename]
+        value = _load_json(path, identity)
         name = value.get("station_conf", {}).get("network_name")
         if not isinstance(name, str) or not name or name in configs:
-            raise BootstrapError(f"invalid or duplicate station in {path.name}")
+            raise BootstrapError(f"invalid or duplicate station in {filename}")
         configs[name] = value
-        filenames[name] = path.name
+        filenames[name] = filename
     return configs, filenames
 
 
 def projected_configuration_documents(source, request, media_root, work):
     """Derive the exact JSON documents native StationManager will read."""
-    original, filenames = _source_configurations(source)
+    inventory = _configuration_inventory(source)
+    original, filenames = _source_configurations(source, inventory)
     projected, affected, source_channels = project_configuration(
         original, request["proposal"], request["policy"]
     )
@@ -141,9 +185,12 @@ def projected_configuration_documents(source, request, media_root, work):
         )
         documents[f"confs/{filenames[name]}"] = mapped
         mappings.extend(rows)
-    documents["confs/main_config.json"] = scheduling_main_config(
-        _load_json(Path(source) / "confs/main_config.json")
-    )
+    main_entry = inventory.get("main_config.json")
+    if main_entry is not None:
+        main_path, main_identity = main_entry
+        documents["confs/main_config.json"] = scheduling_main_config(
+            _load_json(main_path, main_identity)
+        )
     return documents, tuple(sorted(affected, key=lambda item: by_name[item])), source_channels, len(mappings)
 
 

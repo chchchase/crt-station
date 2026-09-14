@@ -60,10 +60,18 @@ from station_director.validation_context import (
     canonical_seed_inputs,
     derive_channel_seed,
     derive_validation_context,
+    logical_configuration_values_fingerprint,
     logical_media_manifest_fingerprint,
     logical_protected_configuration_fingerprint,
 )
-from station_director.worker_bootstrap import HeldSchedulingInputs, VerifiedWorkerAttestation, BootstrapError
+from station_director.worker_bootstrap import (
+    BootstrapError,
+    HeldSchedulingInputs,
+    VerifiedWorkerAttestation,
+    _configuration_inventory,
+    finalize_work_tree,
+    projected_configuration_documents,
+)
 from test.test_station_director_schedule import base_proposal
 from test.test_station_director_milestone_b2 import (
     catalog_row,
@@ -526,6 +534,184 @@ class WorkerBoundaryTests(unittest.TestCase):
 
 
 class NativePolicyTests(unittest.TestCase):
+    def _projected_configuration_fixture(self, root, *, main_config=None):
+        source = root / "stage/source"
+        (source / "confs").mkdir(parents=True)
+        (source / "runtime").mkdir()
+        media = root / "media"
+        (media / "shared").mkdir(parents=True)
+        policy = load_policy()
+        for channel in policy["channels"]:
+            filename = channel["name"].lower().replace(" ", "_") + ".json"
+            (source / "confs" / filename).write_text(json.dumps({
+                "station_conf": {
+                    "network_name": channel["name"],
+                    "channel_number": channel["number"],
+                    "content_dir": "catalog/crt_media/shared",
+                },
+            }) + "\n", encoding="utf-8")
+        if main_config is not None:
+            (source / "confs/main_config.json").write_text(
+                main_config, encoding="utf-8")
+        (source / "runtime/watch_in_order_state.json").write_text(
+            "{}\n", encoding="utf-8")
+        sqlite3.connect(source / "runtime/fs42_fluid.db").close()
+        proposal = base_proposal()
+        proposal["directives"] = [{
+            "type": "date_slot", "channel": 2, "date": "2026-09-14",
+            "hour": 0, "series": "Synthetic",
+        }]
+        request = {
+            "proposal": proposal,
+            "policy": policy,
+            "affected_channels": [{"number": 2, "name": "Action"}],
+        }
+        return source, media, request
+
+    def test_missing_optional_main_config_uses_native_defaults_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, media, request = self._projected_configuration_fixture(root)
+            work = root / "stage/work"
+            documents, affected, unused_sources, unused_mappings = (
+                projected_configuration_documents(source, request, media, work)
+            )
+            self.assertEqual(len(documents), 8)
+            self.assertEqual(affected, ("Action",))
+            self.assertNotIn("confs/main_config.json", documents)
+            serialized = json.loads(json.dumps(documents, sort_keys=True))
+            self.assertEqual(
+                logical_configuration_values_fingerprint(documents),
+                logical_configuration_values_fingerprint(serialized),
+            )
+
+            project = root / "project"
+            (project / "fs42").mkdir(parents=True)
+            shutil.copy(
+                ROOT / "fs42/station_config_schema.json",
+                project / "fs42/station_config_schema.json",
+            )
+            snapshot, held = finalize_work_tree(
+                request, root / "stage", media, project)
+            try:
+                self.assertFalse((work / "confs/main_config.json").exists())
+                self.assertEqual(
+                    snapshot["projected_configuration_fingerprint"],
+                    logical_configuration_values_fingerprint(documents)["digest"],
+                )
+            finally:
+                held.close()
+
+    def test_exact_main_config_is_filtered_and_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, media, request = self._projected_configuration_fixture(
+                root,
+                main_config=json.dumps({
+                    "normalize_titles": False,
+                    "tmdb_api_key": "must-not-be-staged",
+                }),
+            )
+            documents, unused_affected, unused_sources, unused_mappings = (
+                projected_configuration_documents(
+                    source, request, media, root / "stage/work")
+            )
+            main = documents["confs/main_config.json"]
+            self.assertEqual(main, {
+                "normalize_titles": False,
+                "db_path": "runtime/fs42_fluid.db",
+            })
+            self.assertNotIn("must-not-be-staged", json.dumps(documents))
+
+            project = root / "project"
+            (project / "fs42").mkdir(parents=True)
+            shutil.copy(
+                ROOT / "fs42/station_config_schema.json",
+                project / "fs42/station_config_schema.json",
+            )
+            unused_snapshot, held = finalize_work_tree(
+                request, root / "stage", media, project)
+            try:
+                published = json.loads(
+                    (root / "stage/work/confs/main_config.json").read_text(
+                        encoding="utf-8"))
+                self.assertEqual(published, main)
+            finally:
+                held.close()
+
+    def test_optional_main_config_inventory_failures_are_closed(self):
+        cases = (
+            "malformed", "symlink", "hard_link", "directory",
+            "case_confusable", "disappearing", "replacement", "unreadable",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, media, request = self._projected_configuration_fixture(root)
+                main = source / "confs/main_config.json"
+                if case == "malformed":
+                    main.write_text("{", encoding="utf-8")
+                elif case == "symlink":
+                    target = root / "main-target.json"
+                    target.write_text("{}", encoding="utf-8")
+                    main.symlink_to(target)
+                elif case == "hard_link":
+                    target = root / "main-target.json"
+                    target.write_text("{}", encoding="utf-8")
+                    os.link(target, main)
+                elif case == "directory":
+                    main.mkdir()
+                elif case == "case_confusable":
+                    main = source / "confs/Main_Config.json"
+                    main.write_text("{}", encoding="utf-8")
+                else:
+                    main.write_text("{}", encoding="utf-8")
+
+                if case in {"disappearing", "replacement"}:
+                    original_inventory = _configuration_inventory
+
+                    def changed_inventory(value):
+                        result = original_inventory(value)
+                        if case == "disappearing":
+                            main.unlink()
+                        else:
+                            replacement = root / "replacement.json"
+                            replacement.write_text("{}", encoding="utf-8")
+                            os.replace(replacement, main)
+                        return result
+
+                    context = patch(
+                        "station_director.worker_bootstrap._configuration_inventory",
+                        side_effect=changed_inventory,
+                    )
+                elif case == "unreadable":
+                    original_open = os.open
+
+                    def denied_open(path, flags, *args, **kwargs):
+                        if Path(path) == main:
+                            raise PermissionError("synthetic denial")
+                        return original_open(path, flags, *args, **kwargs)
+
+                    context = patch(
+                        "station_director.worker_bootstrap.os.open",
+                        side_effect=denied_open,
+                    )
+                else:
+                    context = ExitStack()
+                expected = {
+                    "malformed": json.JSONDecodeError,
+                    "symlink": BootstrapError,
+                    "hard_link": BootstrapError,
+                    "directory": BootstrapError,
+                    "case_confusable": BootstrapError,
+                    "disappearing": FileNotFoundError,
+                    "replacement": BootstrapError,
+                    "unreadable": PermissionError,
+                }[case]
+                with context, self.assertRaises(expected):
+                    projected_configuration_documents(
+                        source, request, media, root / "stage/work")
+
     def test_autobump_is_detected_structurally_before_scheduling(self):
         from station_director.native_single_run import _autobump_fields
 
@@ -603,9 +789,6 @@ class SyntheticNativeEngineTests(unittest.TestCase):
             (root / "fs42").mkdir()
             shutil.move(root / "fs42-schema.json", root / "fs42/station_config_schema.json")
             create_database(root / "runtime/fs42_fluid.db").close()
-            (root / "confs/main_config.json").write_text(
-                json.dumps({"db_path": "runtime/fs42_fluid.db"})
-            )
             (root / "confs/synthetic.json").write_text(json.dumps({"station_conf": {
                 "network_name": "Synthetic Loop", "channel_number": 2,
                 "network_type": "loop", "content_dir": str(media),
@@ -627,7 +810,11 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                     datetime.datetime(2026, 9, 15), 7,
                 )
                 with activate_validation_context(context):
-                    config = StationManager().station_by_name("Synthetic Loop")
+                    manager = StationManager()
+                    self.assertEqual(manager.server_conf["db_path"], "runtime/fs42_fluid.db")
+                    self.assertTrue(manager.server_conf["start_mpv"])
+                    self.assertEqual(manager.server_conf["custom_holidays"], {})
+                    config = manager.station_by_name("Synthetic Loop")
                     self.assertIsNotNone(config)
                     ShowCatalog(config, rebuild_catalog=True, load=False)
                     schedule = LiquidSchedule(config)

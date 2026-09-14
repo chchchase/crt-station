@@ -249,6 +249,7 @@ def complete_worker_child_main(stage_text, media_text, project_text):
         "pid": os.getpid(), "stage": str(stage),
         "database": str(stage / "work/runtime/fs42_fluid.db"),
         "request": str(request_path), "response": str(response_path),
+        "staged_main_config": (stage / "work/confs/main_config.json").exists(),
         "fs42_loaded": any(name == "fs42" or name.startswith("fs42.") for name in sys.modules),
         "cache_size": len(ShowCatalog._fluid_cache_scanned),
         "status": result["status"], "failure": result["failure"],
@@ -265,7 +266,6 @@ def synthetic_project(root, media):
     project = root / "project"
     (project / "confs").mkdir(parents=True)
     (project / "runtime").mkdir()
-    (project / "confs/main_config.json").write_text("{}\n", encoding="utf-8")
     station_conf = {
         "network_name": "Action", "channel_number": 2,
         "network_type": "standard", "schedule_increment": 60,
@@ -2386,6 +2386,7 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
             for field in ("stage", "database", "request", "response"):
                 self.assertNotEqual(details[0][field], details[1][field])
             self.assertTrue(all(item["fs42_loaded"] for item in details))
+            self.assertTrue(all(not item["staged_main_config"] for item in details))
             self.assertEqual([item["cache_size"] for item in details], [1, 1])
             self.assertTrue(all(item["guide_validation"]["status"] == "pass" for item in details))
             self.assertEqual(result["schema_version"], 2)
