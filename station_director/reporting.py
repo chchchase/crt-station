@@ -57,6 +57,11 @@ DIAGNOSTIC_TEMPLATES = {
     "unexpected_schedule_difference": "The proposal introduced an unauthorized schedule difference.",
     "input_changed": "A validated source input changed during validation.",
     "cleanup_failed": "Validation cleanup failed.",
+    "validation_interrupted": "Validation was interrupted.",
+    "stale_stage_cleanup_failed": "A verified stale Director stage could not be cleaned.",
+    "stale_unit_not_absent": "A stale Director transient unit could not be proven absent.",
+    "stale_stage_scan_limit": "The stale-stage scan exceeded its safety limit.",
+    "stale_stage_ambiguous": "Stale Director stage identities are ambiguous.",
     "guide_loading_failed": "Read-only guide loading failed.",
     "guide_validation_failed": "Guide validation failed.",
     "internal_error": "An internal validation error occurred.",
@@ -81,6 +86,11 @@ class ReportError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.publication_state = publication_state
+
+
+def _raise_if_cancelled(exc):
+    if isinstance(exc, KeyboardInterrupt) or getattr(exc, "is_validation_cancellation", False):
+        raise exc
 
 
 def create_validation_run_id():
@@ -666,6 +676,7 @@ def _publish_latest(parent_fd, proposal_id, run_id, digest):
             if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
                 raise ReportError("report_path_replaced", "latest pointer changed")
         except Exception as exc:
+            _raise_if_cancelled(exc)
             if isinstance(exc, ReportError):
                 raise
             raise ReportError("invalid_latest", "existing latest.json is invalid") from exc
@@ -679,10 +690,12 @@ def _publish_latest(parent_fd, proposal_id, run_id, digest):
         created = False
         replaced = True
         os.fsync(parent_fd)
-    except Exception as exc:
+    except BaseException as exc:
         state = "latest_replaced_not_durable" if replaced else "latest_not_replaced"
-        raise ReportError("latest_publication_failed", state,
-                          publication_state=state) from exc
+        code = ("validation_interrupted" if isinstance(exc, KeyboardInterrupt)
+                or getattr(exc, "is_validation_cancellation", False)
+                else "latest_publication_failed")
+        raise ReportError(code, state, publication_state=state) from exc
     finally:
         if created:
             try: os.unlink(temp, dir_fd=parent_fd)
@@ -703,6 +716,7 @@ def publish_validation_report(report):
     parent_fd = temp_fd = None
     temp_name = ".tmp-" + secrets.token_hex(16)
     published = False
+    durable = False
     temp_created = False
     try:
         parent_fd = _open_report_parent(proposal_id)
@@ -728,6 +742,7 @@ def publish_validation_report(report):
         published = True
         try:
             os.fsync(parent_fd)
+            durable = True
         except OSError as exc:
             raise ReportError("publication_durability_failed",
                               "immutable report published but parent fsync failed",
@@ -742,17 +757,24 @@ def publish_validation_report(report):
                      else exc.publication_state)
             latest = {"status": "warning", "code": exc.code,
                       "publication_state": state}
-        except Exception:
+        except Exception as exc:
+            _raise_if_cancelled(exc)
             latest = {"status": "warning", "code": "internal_error",
                       "publication_state": "latest_not_replaced"}
         return {"publication_state": "published_durable", "proposal_id": proposal_id,
                 "run_id": run_id, "validation_json_digest": digest, "latest": latest}
     except ReportError:
         raise
-    except Exception as exc:
-        raise ReportError("publication_failed", type(exc).__name__,
-                          publication_state=("published_not_durable" if published
-                                             else "not_published")) from exc
+    except BaseException as exc:
+        interrupted = (isinstance(exc, KeyboardInterrupt)
+                       or getattr(exc, "is_validation_cancellation", False))
+        state = ("published_durable" if durable else
+                 "published_not_durable" if published else "not_published")
+        raise ReportError(
+            "validation_interrupted" if interrupted else "publication_failed",
+            "report publication interrupted" if interrupted else type(exc).__name__,
+            publication_state=state,
+        ) from exc
     finally:
         if temp_fd is not None: os.close(temp_fd)
         if parent_fd is not None:

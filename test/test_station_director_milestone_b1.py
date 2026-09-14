@@ -270,109 +270,26 @@ class WorkerTests(unittest.TestCase):
 
 
 class CoordinatorTests(unittest.TestCase):
-    def test_codex_rejection_occurs_before_staging_or_checks(self):
-        with patch.object(
-            validation, "check_invocation_context", return_value=(False, "Codex detected")
-        ), patch.object(validation, "create_staging_directory") as create_stage, patch.object(
-            validation, "_static_validation_checks"
-        ) as static_checks:
+    def test_compatibility_entry_point_is_disabled_before_any_side_effect(self):
+        with patch.object(validation, "check_invocation_context") as invocation, patch.object(validation, "create_staging_directory") as create_stage, patch.object(validation, "_static_validation_checks") as checks:
             report = validation.validate_proposal(proposal(), "/unused", {})
         self.assertFalse(report["valid"])
-        self.assertEqual(report["failures"][0], validation.PHASE_3_DISABLED)
-        self.assertIn("before staging", report["failures"][1])
+        self.assertEqual(report["failures"], [validation.PHASE_3_DISABLED])
+        self.assertFalse(report["scheduler_invoked"])
+        invocation.assert_not_called()
         create_stage.assert_not_called()
-        static_checks.assert_not_called()
+        checks.assert_not_called()
 
-    def test_mocked_launcher_route_attests_cleans_and_remains_disabled(self):
+    def test_compatibility_entry_point_never_launches_reads_or_writes(self):
         with tempfile.TemporaryDirectory() as directory:
-            parent = Path(directory)
-            launches = []
-
-            class FakeLauncher:
-                def __init__(self, root):
-                    self.root = root
-
-                def run(self, stage, argv, unit_name, timeout):
-                    if not isolation._staging_is_locked(stage):
-                        raise AssertionError("validation stage lock was not held during launch")
-                    launches.append((Path(stage), list(argv), unit_name, timeout))
-                    request = json.loads((Path(stage) / validation.VALIDATION_REQUEST).read_text())
-                    result = {
-                        "schema_version": 1,
-                        "run_id": request["run_id"],
-                        "proposal_id": request["proposal"]["proposal_id"],
-                        "status": "disabled",
-                        "failure": validation.PHASE_3_DISABLED,
-                        "scheduler_invoked": False,
-                        "probe_attestation": passing_probes(request["run_id"]),
-                        "path_validation": {
-                            "passed": True,
-                            "mapping_count": 0,
-                            "mappings": [],
-                            "affected_channels": [],
-                        },
-                        "b2_preparation": {
-                            "schema_tables": [],
-                            "channels": [],
-                            "scheduler_gate": "disabled",
-                        },
-                        "validation_context": request["validation_context"],
-                    }
-                    (Path(stage) / validation.VALIDATION_RESULT).write_text(json.dumps(result))
-                    return LaunchResult(unit_name, 0, "", "")
-
-            media_manifest = Mock()
-            media_manifest.summary = {"digest": "same"}
-            with patch.object(isolation, "STAGING_PARENT", parent), patch.object(
-                validation, "check_invocation_context", return_value=(True, "verified SSH")
-            ), patch.object(validation, "_static_validation_checks", return_value=(["static failure"], [])), patch.object(
-                validation, "cleanup_stale_directories", return_value=(True, [])
-            ), patch.object(validation, "IsolationLauncher", FakeLauncher), patch.object(
-                validation, "sandbox_python", return_value="/project/env/bin/python3"
-            ), patch.object(validation, "cleanup_unit", return_value=(True, "removed")), patch.object(
-                validation, "protected_json_paths", return_value={}
-            ), patch.object(
-                validation,
-                "fingerprint_json_files",
-                return_value={"digest": "same", "files": {}, "file_count": 0},
-            ), patch.object(
-                validation,
-                "fingerprint_and_clone_database",
-                return_value={"logical": {"digest": "same"}, "raw_metadata": {}},
-            ), patch.object(
-                validation,
-                "fingerprint_database",
-                return_value={"logical": {"digest": "same"}, "raw_metadata": {}},
-            ), patch.object(
-                validation, "capture_media_manifest", return_value=media_manifest
-            ), patch.object(
-                validation,
-                "logical_media_manifest_fingerprint",
-                return_value={"digest": "same", "entry_count": 0},
-            ), patch.object(
-                validation, "compare_json_fingerprints", return_value={"preserved": True}
-            ), patch.object(
-                validation, "compare_database_fingerprints", return_value={"preserved": True}
-            ), patch.object(
-                validation, "compare_media_manifests", return_value={"preserved": True}
-            ):
-                report = validation.validate_proposal(proposal(), parent, {})
-
-            self.assertEqual(len(launches), 1)
-            stage, argv, unit_name, unused_timeout = launches[0]
-            self.assertRegex(stage.name, r"^fs42-i-[0-9a-f]{12}$")
-            self.assertIn("/project/station_director/stage_runner.py", argv)
-            self.assertTrue(unit_name.startswith("fs42-validation-"))
-            self.assertFalse(stage.exists())
-            self.assertFalse(report["valid"])
-            self.assertEqual(report["failures"][0], validation.PHASE_3_DISABLED)
-            self.assertIn("static failure", report["failures"])
-            self.assertEqual(report["isolation"]["launcher"], "IsolationLauncher")
-            self.assertTrue(report["path_validation"]["passed"])
-            self.assertTrue(report["preservation"]["preserved"])
-            self.assertEqual(
-                report["schedule_preparation"]["scheduler_gate"], "disabled"
-            )
+            root = Path(directory)
+            with patch.object(validation, "check_invocation_context") as invocation, patch.object(validation, "create_staging_directory") as create_stage, patch.object(validation, "IsolationLauncher") as launcher, patch.object(validation, "load_proposal", create=True) as load_proposal, patch.object(validation, "load_policy", create=True) as load_policy:
+                report = validation.validate_proposal(proposal(), root, {})
+            self.assertEqual(report["failures"], [validation.PHASE_3_DISABLED])
+            self.assertFalse(report["scheduler_invoked"])
+            for mocked in (invocation, create_stage, launcher, load_proposal, load_policy):
+                mocked.assert_not_called()
+            self.assertEqual(list(root.iterdir()), [])
 
     def test_validation_module_has_no_direct_subprocess_runner(self):
         source = (Path(__file__).parents[1] / "station_director/validation.py").read_text()

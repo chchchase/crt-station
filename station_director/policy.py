@@ -9,7 +9,13 @@ DEFAULT_POLICY = ROOT / "director_conf" / "channel_identities.v2.json"
 def load_policy(path=DEFAULT_POLICY):
     with Path(path).open(encoding="utf-8") as handle:
         policy = json.load(handle)
+    return validate_policy_document(policy)
 
+
+def validate_policy_document(policy):
+    """Validate an already-loaded policy without performing file access."""
+    if not isinstance(policy, dict):
+        raise ValueError("Channel identity policy must be an object")
     if policy.get("schema_version") not in (1, 2):
         raise ValueError("Unsupported channel identity policy version")
 

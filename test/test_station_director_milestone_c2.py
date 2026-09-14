@@ -1305,6 +1305,92 @@ class DualRunLifecycleTests(unittest.TestCase):
                     )
                 self.assertEqual(result["failure"]["code"], expected)
 
+    def test_cancellation_across_dual_run_phases_preserves_cleanup(self):
+        class Cancelled(Exception):
+            is_validation_cancellation = True
+
+        cases = ("run_1", "between_runs", "run_2", "normalization",
+                 "comparison", "baseline_comparison", "before_success")
+        for target in cases:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                events = []
+                scope = self._scope(root, events)
+                launches = [None, None]
+                if target == "run_1": launches[0] = Cancelled()
+                if target == "run_2": launches[1] = Cancelled()
+
+                def launch(unused_lifecycle, timeout):
+                    outcome = launches.pop(0)
+                    if outcome is not None:
+                        raise outcome
+
+                stability_calls = []
+                def stable(unused_source, unused_media, unused_capture, checkpoint):
+                    stability_calls.append(checkpoint)
+                    if checkpoint == target:
+                        raise Cancelled()
+                    return {"checkpoint": checkpoint, "passed": True,
+                            "changed_categories": []}
+
+                normal = SimpleNamespace(digest="a" * 64, record_count=1,
+                                         provisional_count=0)
+                normalize_effect = Cancelled() if target == "normalization" else [normal, normal]
+                comparison = {
+                    "passed": True, "run_1_digest": "a" * 64,
+                    "run_2_digest": "a" * 64, "run_1_record_count": 1,
+                    "run_2_record_count": 1, "changed_records": 0,
+                    "added_records": 0, "removed_records": 0,
+                    "differences": [], "differences_truncated": False,
+                }
+                compare_effect = Cancelled() if target == "comparison" else None
+                baseline_effect = Cancelled() if target == "baseline_comparison" else self.baseline_summary
+                with patch("station_director.dual_run._prepare_scope", return_value=scope),                         patch("station_director.dual_run.launch_single_run", side_effect=launch),                         patch("station_director.dual_run.inspect_single_run", side_effect=[
+                            response("comparison.run-1"), response("comparison.run-2")]),                         patch("station_director.dual_run._assert_inputs_stable", side_effect=stable),                         patch("station_director.dual_run.normalize_completed_run",
+                              side_effect=normalize_effect),                         patch("station_director.dual_run.compare_normalized_runs",
+                              side_effect=compare_effect, return_value=comparison),                         patch("station_director.dual_run.compare_baseline_to_proposed",
+                              side_effect=baseline_effect if isinstance(baseline_effect, Exception) else None,
+                              return_value=None if isinstance(baseline_effect, Exception) else baseline_effect):
+                    result = run_dual_comparison(
+                        root, root, root,
+                        {"week_start": "2026-09-14T00:00:00-07:00"}, {}, "comparison",
+                    )
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["failure"]["code"], "validation_interrupted")
+                self.assertIn("cleanup", events)
+
+    def test_cancellation_during_stage_cleanup_remains_interrupted(self):
+        class Cancelled(Exception):
+            is_validation_cancellation = True
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = []
+            scope = self._scope(root, events)
+            def cleanup():
+                scope.cleanup_results = [
+                    {"run": 2, "passed": False, "quarantined": True, "detail": "interrupted"},
+                    {"run": 1, "passed": True, "quarantined": False, "detail": "clean"},
+                ]
+                events.append("cleanup")
+                raise Cancelled()
+            scope.cleanup_stages = cleanup
+            normal = SimpleNamespace(digest="a" * 64, record_count=1, provisional_count=0)
+            comparison = {
+                "passed": True, "run_1_digest": "a" * 64, "run_2_digest": "a" * 64,
+                "run_1_record_count": 1, "run_2_record_count": 1,
+                "changed_records": 0, "added_records": 0, "removed_records": 0,
+                "differences": [], "differences_truncated": False,
+            }
+            with patch("station_director.dual_run._prepare_scope", return_value=scope),                     patch("station_director.dual_run.launch_single_run"),                     patch("station_director.dual_run.inspect_single_run", side_effect=[
+                        response("comparison.run-1"), response("comparison.run-2")]),                     patch("station_director.dual_run._assert_inputs_stable", side_effect=lambda a,b,c,name: {
+                        "checkpoint": name, "passed": True, "changed_categories": []}),                     patch("station_director.dual_run.normalize_completed_run", side_effect=[normal, normal]),                     patch("station_director.dual_run.compare_normalized_runs", return_value=comparison):
+                result = run_dual_comparison(
+                    root, root, root,
+                    {"week_start": "2026-09-14T00:00:00-07:00"}, {}, "comparison",
+                )
+            self.assertEqual(result["failure"]["code"], "validation_interrupted")
+            self.assertTrue(result["cleanup"][0]["quarantined"])
+
     def test_semantic_validator_rejects_contradictory_success(self):
         result = {
             "status": "success", "phase_reached": "complete", "failure": None,
@@ -1350,7 +1436,7 @@ class DualRunLifecycleTests(unittest.TestCase):
 
 
 class NativeTwoProcessIntegrationTests(unittest.TestCase):
-    def _complete_dual_run(self, root, *, alter_second=False, alter_guide_second=False):
+    def _complete_dual_run(self, root, *, alter_second=False, alter_guide_second=False, execute=None):
         media = root / "media"
         content = media / "synthetic" / "Synthetic"
         content.mkdir(parents=True)
@@ -1470,9 +1556,9 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
                 patch("station_director.dual_run.launch_single_run", side_effect=transport), \
                 patch("station_director.schedule_normalization.canonical_media_mapping", side_effect=normalize_media_mapping), \
                 patch("station_director.single_run.cleanup_unit", return_value=(True, "test unit absent")):
-            result = run_dual_comparison(
+            result = (run_dual_comparison(
                 project, project, media, proposal, policy, "native-integration"
-            )
+            ) if execute is None else execute(project, media, proposal, policy))
         return result, details
 
     def test_complete_genuine_two_run_lifecycle_succeeds_identically(self):

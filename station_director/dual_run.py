@@ -66,6 +66,11 @@ class DualRunError(RuntimeError):
         self.category = category
 
 
+def _raise_if_cancelled(exc):
+    if isinstance(exc, KeyboardInterrupt) or getattr(exc, "is_validation_cancellation", False):
+        raise exc
+
+
 def _bounded_detail(value, *private_paths):
     text = str(value)
     for path in private_paths:
@@ -266,7 +271,7 @@ def _capture_shared_inputs(source_root, media_root, stages):
             logical_media, required, Path(stages[0]),
         )
         _assert_inputs_stable(source_root, media_root, capture, "after_capture")
-    except Exception:
+    except BaseException:
         manifest.close()
         raise
     return capture
@@ -383,7 +388,7 @@ def _prepare_scope(project_root, source_root, media_root, proposal, policy, comp
         if contexts[0] != contexts[1]:
             raise DualRunError("capture", "context_mismatch", "run contexts differ")
         return DualRunScope(lifecycles, capture, [])
-    except Exception as primary:
+    except BaseException as primary:
         cleanup_failures = []
         if capture is not None:
             try:
@@ -514,6 +519,7 @@ def run_dual_comparison(
                 )
                 response = inspect_single_run(lifecycle)
             except Exception as exc:
+                _raise_if_cancelled(exc)
                 raise DualRunError(
                     f"run_{index}", "c1_run_failed",
                     f"C1 run {index} failed ({type(exc).__name__})",
@@ -530,6 +536,7 @@ def run_dual_comparison(
             try:
                 lifecycle.settle_unit()
             except Exception as exc:
+                _raise_if_cancelled(exc)
                 raise DualRunError(
                     "cleanup", "cleanup_failed",
                     f"run {index} unit could not be proven absent",
@@ -551,6 +558,7 @@ def run_dual_comparison(
                     proposal_boundary_to_db(proposal["week_start"], "week_start"),
                 )
             except Exception as exc:
+                _raise_if_cancelled(exc)
                 raise DualRunError(
                     "normalization", "normalization_failed",
                     f"run {index} normalization failed ({type(exc).__name__})",
@@ -567,6 +575,7 @@ def run_dual_comparison(
                     proposal,
                 ))
             except Exception as exc:
+                _raise_if_cancelled(exc)
                 raise DualRunError(
                     "baseline_comparison", "baseline_comparison_failed",
                     f"run {index} baseline comparison failed ({type(exc).__name__})",
@@ -594,6 +603,7 @@ def run_dual_comparison(
         try:
             comparison = compare_normalized_runs(normalized[0], normalized[1])
         except Exception as exc:
+            _raise_if_cancelled(exc)
             raise DualRunError(
                 "comparison", "comparison_failed",
                 f"structural comparison failed ({type(exc).__name__})",
@@ -635,7 +645,7 @@ def run_dual_comparison(
                 "proposed schedule introduced a new coverage defect",
             )
         comparison_succeeded = True
-    except Exception as exc:
+    except BaseException as exc:
         result["status"] = "failed"
         result["phase_reached"] = getattr(exc, "phase", result["phase_reached"])
         fallback_code = {
@@ -647,7 +657,9 @@ def run_dual_comparison(
             "baseline_comparison": "baseline_comparison_failed",
             "cleanup": "cleanup_failed",
         }.get(result["phase_reached"], "comparison_failed")
-        code = getattr(exc, "code", fallback_code)
+        code = ("validation_interrupted" if isinstance(exc, KeyboardInterrupt)
+                or getattr(exc, "is_validation_cancellation", False)
+                else getattr(exc, "code", fallback_code))
         if code == "cleanup_failure":
             code = "cleanup_failed"
         result["failure"] = {
@@ -660,10 +672,13 @@ def run_dual_comparison(
         if scope is not None:
             try:
                 scope.cleanup_stages()
-            except Exception as cleanup_error:
+            except BaseException as cleanup_error:
                 if result["failure"] is None:
+                    interrupted = (isinstance(cleanup_error, KeyboardInterrupt)
+                                   or getattr(cleanup_error, "is_validation_cancellation", False))
                     result["failure"] = {
-                        "phase": "cleanup", "code": "cleanup_failed",
+                        "phase": "cleanup",
+                        "code": "validation_interrupted" if interrupted else "cleanup_failed",
                         "category": None,
                         "message": f"stage cleanup failed ({type(cleanup_error).__name__})",
                     }
@@ -676,15 +691,18 @@ def run_dual_comparison(
                     source_root, media_root, scope.capture, "before_success"
                 )
                 result["source_checks"].append(final_check)
-            except Exception as final_error:
+            except BaseException as final_error:
                 categories = getattr(final_error, "category", None) or []
                 result["source_checks"].append({
                     "checkpoint": "before_success", "passed": False,
                     "changed_categories": categories,
                 })
                 if result["failure"] is None:
+                    interrupted = (isinstance(final_error, KeyboardInterrupt)
+                                   or getattr(final_error, "is_validation_cancellation", False))
                     result["failure"] = {
-                        "phase": "before_success", "code": "input_changed",
+                        "phase": "before_success",
+                        "code": "validation_interrupted" if interrupted else "input_changed",
                         "category": categories,
                         "message": _bounded_detail(
                             final_error, project_root, source_root, media_root
@@ -693,10 +711,13 @@ def run_dual_comparison(
                 result["status"] = "failed"
             try:
                 scope.close_capture()
-            except Exception as cleanup_error:
+            except BaseException as cleanup_error:
                 if result["failure"] is None:
+                    interrupted = (isinstance(cleanup_error, KeyboardInterrupt)
+                                   or getattr(cleanup_error, "is_validation_cancellation", False))
                     result["failure"] = {
-                        "phase": "cleanup", "code": "cleanup_failed",
+                        "phase": "cleanup",
+                        "code": "validation_interrupted" if interrupted else "cleanup_failed",
                         "category": None,
                         "message": f"capture cleanup failed ({type(cleanup_error).__name__})",
                     }

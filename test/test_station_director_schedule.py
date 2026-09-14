@@ -491,21 +491,23 @@ class ExistingScheduleHelperTests(unittest.TestCase):
             self.assertTrue(report["channels"]["2"]["gaps"])
             self.assertTrue(report["channels"]["2"]["overlaps"])
 
-    def test_rejected_context_precedes_stale_checks_and_staging(self):
+    def test_compatibility_validation_is_permanently_side_effect_free(self):
         from station_director.validation import validate_proposal
 
-        with patch(
-            "station_director.validation.check_invocation_context",
-            return_value=(False, "Codex detected"),
-        ), patch("station_director.validation.stale_sources") as stale, patch(
-            "station_director.validation.create_staging_directory"
-        ) as create_stage:
-            report = validate_proposal(base_proposal(), Path("/does/not/matter"), load_policy())
+        with tempfile.TemporaryDirectory() as directory, patch("station_director.validation.check_invocation_context") as invocation, patch("station_director.validation.stale_sources") as stale, patch("station_director.validation.create_staging_directory") as create_stage, patch("station_director.validation.IsolationLauncher") as launcher, patch("station_director.validation.load_proposal", create=True) as load_proposal_mock, patch("station_director.validation.load_policy", create=True) as load_policy_mock:
+            root = Path(directory)
+            report = validate_proposal(base_proposal(), root, {"sentinel": True})
+            contents = list(root.iterdir())
         self.assertFalse(report["valid"])
-        self.assertEqual(report["failures"][0], "Phase 3 validation is not yet enabled")
-        self.assertIn("before staging", report["failures"][1])
+        self.assertEqual(report["failures"], ["Phase 3 validation is not yet enabled"])
+        self.assertFalse(report["scheduler_invoked"])
+        invocation.assert_not_called()
         stale.assert_not_called()
         create_stage.assert_not_called()
+        launcher.assert_not_called()
+        load_proposal_mock.assert_not_called()
+        load_policy_mock.assert_not_called()
+        self.assertEqual(contents, [])
 
     def test_archive_requires_exact_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:

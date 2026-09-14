@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -18,7 +19,7 @@ from station_director.proposals import (
 )
 from station_director.readers import station_status, watch_in_order_status
 from station_director.recommend import configured_tags, recommend_shows
-from station_director.validation import validate_proposal
+from station_director import validation_control
 
 
 MEDIA_ROOT = Path("/mnt/t7/CRT-Media")
@@ -144,6 +145,21 @@ def main(argv=None):
             print(f"Text: {text_path.relative_to(ROOT)}")
             return 0 if report["result"] == "PASS" else 1
 
+        if args.command == "schedule" and args.schedule_command == "validate":
+            if not validation_control.SCHEDULE_VALIDATION_ENABLED:
+                print(validation_control.DISABLED_MESSAGE)
+                return 1
+            supplied_policy = os.path.abspath(os.fspath(args.policy))
+            if args.policy != DEFAULT_POLICY or supplied_policy != os.fspath(DEFAULT_POLICY):
+                print("error: schedule validate requires the canonical policy", file=sys.stderr)
+                return 2
+            from station_director.validation_coordinator import (
+                render_cli_outcome, validate_saved_proposal,
+            )
+            outcome = validate_saved_proposal(args.proposal_id)
+            sys.stdout.write(render_cli_outcome(outcome))
+            return 0 if outcome.state == "passed" else 1
+
         policy = load_policy(args.policy)
         if args.command == "status":
             report = station_status(ROOT, policy)
@@ -195,16 +211,6 @@ def main(argv=None):
                 print_json({"proposals": [path.name for path in proposal_dirs(ROOT)]}); return 0
             proposal, path = load_proposal(args.proposal_id, ROOT)
             if args.schedule_command == "show": print_json(proposal); return 0
-            if args.schedule_command == "validate":
-                report = validate_proposal(proposal, ROOT, policy)
-                report_path = path.parent / "validation.json"
-                if report_path.exists() and report.get("valid"):
-                    previous = json.loads(report_path.read_text())
-                    if previous.get("schedule_digest") and previous.get("seed") == report.get("seed") and previous["schedule_digest"] != report.get("schedule_digest"):
-                        report["valid"] = False
-                        report["failures"].append("Reproducibility failure: identical seed and sources produced a different schedule digest")
-                report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-                _print_validation(report); return 0 if report["valid"] else 1
             if args.schedule_command == "compare":
                 report_path = path.parent / "validation.json"
                 if not report_path.exists(): raise ProposalError("Validate the proposal before comparing it")
