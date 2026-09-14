@@ -712,14 +712,15 @@ class NativePolicyTests(unittest.TestCase):
                     projected_configuration_documents(
                         source, request, media, root / "stage/work")
 
-    def test_autobump_is_detected_structurally_before_scheduling(self):
-        from station_director.native_single_run import _autobump_fields
-
-        self.assertEqual(
-            _autobump_fields({"off_air_autobump": {"title": "x"}}),
-            ["station_conf.off_air_autobump"],
-        )
-        self.assertEqual(_autobump_fields({"other": {"title": "x"}}), [])
+    def test_host_staged_schedule_has_no_fs42_descriptor_dependency(self):
+        tree = ast.parse((ROOT / "station_director/staged_schedule.py").read_text())
+        imported = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
+        self.assertNotIn("fs42.autobump_descriptor", imported)
 
     def test_main_config_allowlist_excludes_secrets_and_runtime_controls(self):
         from station_director.worker_bootstrap import (
@@ -772,6 +773,420 @@ class NativePolicyTests(unittest.TestCase):
 
 
 class SyntheticNativeEngineTests(unittest.TestCase):
+    def _verify_paths_only(self, native, connection, history, media):
+        with patch.object(native, "restore_sequence_state"), patch.object(
+            native, "_validate_final_cross_channel_exclusions"
+        ), patch.object(native, "assert_retained_history"), patch.object(
+            native, "coverage_report", return_value={}
+        ), patch.object(native, "assert_protected_state"), patch.object(
+            native, "canonical_foreign_key_findings", return_value=[]
+        ):
+            return native._verify_final_preservation(
+                connection, {}, {history.channel: history},
+                [{"name": history.channel}], {}, [], media,
+            )
+
+    def test_generated_playback_descriptor_forms_and_retained_seam(self):
+        from station_director import native_single_run as native
+        from station_director.staged_schedule import (
+            StagedScheduleError,
+            capture_channel_history,
+            validate_all_catalog_reference_shapes,
+        )
+
+        marker = ":autobump:="
+        tag = ":autobump:"
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "fixture.db"
+            connection = create_database(database)
+            ordinary = catalog_row("Action", "/media/ordinary.mp4", "Ordinary", "show")
+            connection.execute(
+                "INSERT INTO catalog_entries "
+                "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (1, *[ordinary[key] for key in ordinary]),
+            )
+            connection.execute(
+                "INSERT INTO catalog_entries "
+                "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (2, "Action", marker + "catalog", "opaque-title", 7, tag, 0,
+                 None, None, None, None, "feature", "video"),
+            )
+            insert_block(
+                connection, "Action", "2026-09-14 05:00:00",
+                "2026-09-14 07:00:00", 1, marker + "retained",
+            )
+            connection.execute(
+                "UPDATE liquid_blocks SET liquid_type='LiquidWebBlock',content_json='null' "
+                "WHERE station='Action' AND start_time='2026-09-14 05:00:00'"
+            )
+            connection.commit()
+            self.assertEqual(validate_all_catalog_reference_shapes(connection), 1)
+            history = capture_channel_history(
+                connection, "Action", "2026-09-14 06:00:00",
+                "2026-09-15 06:00:00",
+            )
+            retained_before = connection.execute(
+                "SELECT * FROM liquid_blocks WHERE start_time<? ORDER BY id",
+                (history.proposal_boundary,),
+            ).fetchall()
+            insert_block(
+                connection, "Action", "2026-09-14 07:00:00",
+                "2026-09-15 06:00:00", 1, "/media/ordinary.mp4",
+            )
+            connection.commit()
+            native._inspect_generated_playback(connection, history, "Action")
+            retained_after = connection.execute(
+                "SELECT * FROM liquid_blocks WHERE start_time<? ORDER BY id",
+                (history.proposal_boundary,),
+            ).fetchall()
+            self.assertEqual(retained_after, retained_before)
+
+            autobump_plan = {
+                "path": marker + "opaque", "skip": 0, "duration": 7,
+                "is_stream": False, "content_type": "bump", "media_type": "video",
+            }
+            ordinary_plan = {
+                "path": "/media/ordinary.mp4", "skip": 0, "duration": 7,
+                "is_stream": False, "content_type": "feature", "media_type": "video",
+            }
+            for position in range(3):
+                plan = [dict(ordinary_plan) for unused in range(3)]
+                plan[position] = autobump_plan
+                connection.execute(
+                    "UPDATE liquid_blocks SET plan_json=? WHERE start_time>=?",
+                    (json.dumps(plan), history.proposal_boundary),
+                )
+                with self.assertRaises(native.NativeRunError) as caught:
+                    native._inspect_generated_playback(connection, history, "Action")
+                self.assertEqual(caught.exception.code, "autobump_selected")
+                self.assertTrue(caught.exception.scheduler_invoked)
+                self.assertNotIn("opaque", str(caught.exception))
+
+            invalid = json.dumps([{
+                "path": marker + "poison", "skip": 0, "duration": 7,
+                "is_stream": False, "content_type": "feature", "media_type": "video",
+            }])
+            connection.execute(
+                "UPDATE liquid_blocks SET plan_json=? WHERE start_time>=?",
+                (invalid, history.proposal_boundary),
+            )
+            with self.assertRaises(native.NativeRunError) as caught:
+                native._inspect_generated_playback(connection, history, "Action")
+            self.assertEqual(caught.exception.code, "invalid_playback_descriptor")
+            self.assertNotIn("poison", str(caught.exception))
+
+            connection.execute(
+                "UPDATE liquid_blocks SET liquid_type='LiquidWebBlock',content_json='null',plan_json=? "
+                "WHERE start_time>=?",
+                (json.dumps([dict(autobump_plan, content_type="feature")]),
+                 history.proposal_boundary),
+            )
+            with self.assertRaises(native.NativeRunError) as caught:
+                native._inspect_generated_playback(connection, history, "Action")
+            self.assertEqual(caught.exception.code, "autobump_selected")
+
+            for reference in (json.dumps(2), json.dumps([1, 2])):
+                connection.execute(
+                    "UPDATE liquid_blocks SET liquid_type='LiquidBlock',content_json=?,plan_json=? "
+                    "WHERE start_time>=?",
+                    (reference, json.dumps([ordinary_plan]), history.proposal_boundary),
+                )
+                with self.assertRaises(native.NativeRunError) as caught:
+                    native._inspect_generated_playback(connection, history, "Action")
+                self.assertEqual(caught.exception.code, "autobump_selected")
+            connection.execute(
+                "UPDATE liquid_blocks SET liquid_type='LiquidBlock',content_json='null' "
+                "WHERE start_time>=?",
+                (history.regeneration_start,),
+            )
+            with self.assertRaises(StagedScheduleError):
+                native._inspect_generated_playback(connection, history, "Action")
+            connection.close()
+
+    def test_final_preservation_is_provenance_aware_for_retained_autobump(self):
+        from station_director import native_single_run as native
+        from station_director.staged_schedule import (
+            generated_playback_representations,
+            retained_playback_representations,
+        )
+
+        marker = ":autobump:="
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "media"
+            media.mkdir()
+            (media / "ordinary.mp4").write_bytes(b"ordinary")
+            connection = create_database(root / "fixture.db")
+            ordinary = catalog_row(
+                "Action", "/media/ordinary.mp4", "Ordinary", "show"
+            )
+            connection.execute(
+                "INSERT INTO catalog_entries "
+                "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (1, *[ordinary[key] for key in ordinary]),
+            )
+            connection.execute(
+                "INSERT INTO catalog_entries "
+                "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                "VALUES (2,'Action',?,'retained',7,':autobump:',0,NULL,NULL,NULL,NULL,'feature','video')",
+                (marker + "catalog",),
+            )
+            for start, end in (
+                ("2026-09-14 04:00:00", "2026-09-14 05:00:00"),
+                ("2026-09-14 05:00:00", "2026-09-14 07:00:00"),
+            ):
+                insert_block(connection, "Action", start, end, 1, marker + "retained")
+                connection.execute(
+                    "UPDATE liquid_blocks SET liquid_type='LiquidWebBlock',content_json='null' "
+                    "WHERE station='Action' AND start_time=?",
+                    (start,),
+                )
+            insert_block(
+                connection, "Action", "2026-09-14 06:30:00",
+                "2026-09-14 06:45:00", 2, "/media/ordinary.mp4",
+            )
+            insert_block(
+                connection, "Action", "2026-09-14 07:00:00",
+                "2026-09-14 09:00:00", 1, "/media/ordinary.mp4",
+            )
+            connection.commit()
+            history = types.SimpleNamespace(
+                channel="Action", proposal_boundary="2026-09-14 06:00:00",
+                regeneration_start="2026-09-14 07:00:00",
+                effective_horizon="2026-09-14 09:00:00",
+            )
+            before = connection.execute(
+                "SELECT * FROM liquid_blocks ORDER BY id"
+            ).fetchall()
+            native._inspect_generated_playback(connection, history, "Action")
+            between_id = connection.execute(
+                "SELECT id FROM liquid_blocks WHERE start_time='2026-09-14 06:30:00'"
+            ).fetchone()[0]
+            retained_ids = {
+                block["block_id"]
+                for block in retained_playback_representations(connection, history)
+            }
+            generated_ids = {
+                block["block_id"]
+                for block in generated_playback_representations(connection, history)
+            }
+            self.assertIn(between_id, retained_ids)
+            self.assertNotIn(between_id, generated_ids)
+            self.assertGreater(
+                self._verify_paths_only(native, connection, history, media), 0
+            )
+            self.assertEqual(
+                connection.execute("SELECT * FROM liquid_blocks ORDER BY id").fetchall(),
+                before,
+            )
+            connection.close()
+
+    def test_shared_autobump_catalog_generated_use_fails_at_seam(self):
+        from station_director import native_single_run as native
+
+        marker = ":autobump:="
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "media"
+            media.mkdir()
+            (media / "ordinary.mp4").write_bytes(b"ordinary")
+            connection = create_database(root / "fixture.db")
+            connection.execute(
+                "INSERT INTO catalog_entries "
+                "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                "VALUES (2,'Action',?,'shared',7,':autobump:',0,NULL,NULL,NULL,NULL,'feature','video')",
+                (marker + "shared",),
+            )
+            for start, end in (
+                ("2026-09-14 05:00:00", "2026-09-14 07:00:00"),
+                ("2026-09-14 07:00:00", "2026-09-14 09:00:00"),
+            ):
+                insert_block(connection, "Action", start, end, 2, "/media/ordinary.mp4")
+            connection.commit()
+            history = types.SimpleNamespace(
+                channel="Action", regeneration_start="2026-09-14 07:00:00",
+                effective_horizon="2026-09-14 09:00:00",
+            )
+            with self.assertRaises(native.NativeRunError) as caught:
+                self._verify_paths_only(native, connection, history, media)
+            self.assertEqual(caught.exception.code, "autobump_selected")
+            connection.close()
+
+    def test_malformed_retained_and_generated_descriptors_fail_closed(self):
+        from station_director import native_single_run as native
+
+        marker = ":autobump:="
+        for provenance, start in (
+            ("retained", "2026-09-14 05:00:00"),
+            ("generated", "2026-09-14 07:00:00"),
+        ):
+            with self.subTest(provenance=provenance), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                media = root / "media"
+                media.mkdir()
+                connection = create_database(root / "fixture.db")
+                ordinary = catalog_row(
+                    "Action", "/media/ordinary.mp4", "Ordinary", "show"
+                )
+                connection.execute(
+                    "INSERT INTO catalog_entries "
+                    "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (1, *[ordinary[key] for key in ordinary]),
+                )
+                insert_block(
+                    connection, "Action", start, "2026-09-14 09:00:00",
+                    1, marker + "malformed",
+                )
+                connection.commit()
+                history = types.SimpleNamespace(
+                    channel="Action", regeneration_start="2026-09-14 07:00:00",
+                    effective_horizon="2026-09-14 09:00:00",
+                )
+                with self.assertRaises(native.NativeRunError) as caught:
+                    self._verify_paths_only(native, connection, history, media)
+                self.assertEqual(caught.exception.code, "invalid_playback_descriptor")
+                connection.close()
+
+    def test_final_preservation_confines_ordinary_retained_and_generated_media(self):
+        from station_director import native_single_run as native
+
+        for provenance, start in (
+            ("retained", "2026-09-14 05:00:00"),
+            ("generated", "2026-09-14 07:00:00"),
+        ):
+            with self.subTest(provenance=provenance), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                media = root / "media"
+                media.mkdir()
+                connection = create_database(root / "fixture.db")
+                missing = catalog_row(
+                    "Action", "/media/missing.mp4", "Missing", "show"
+                )
+                connection.execute(
+                    "INSERT INTO catalog_entries "
+                    "(id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (1, *[missing[key] for key in missing]),
+                )
+                insert_block(
+                    connection, "Action", start, "2026-09-14 09:00:00",
+                    1, "/media/missing.mp4",
+                )
+                connection.commit()
+                history = types.SimpleNamespace(
+                    channel="Action", regeneration_start="2026-09-14 07:00:00",
+                    effective_horizon="2026-09-14 09:00:00",
+                )
+                with self.assertRaises(Exception):
+                    self._verify_paths_only(native, connection, history, media)
+                connection.close()
+
+    def test_exact_descriptor_contract_covers_offair_and_rejects_partial_markers(self):
+        from fs42 import autobump_descriptor as descriptor
+
+        base = {
+            "path": descriptor.AUTOBUMP_PATH_PREFIX + "opaque",
+            "skip": 0, "duration": 7, "is_stream": False,
+            "content_type": "feature", "media_type": "video",
+        }
+        self.assertEqual(
+            descriptor.classify_plan_entry(
+                base, liquid_type="LiquidWebBlock", plan_size=1,
+                content_missing=True,
+            ),
+            descriptor.DESCRIPTOR_SELECTED,
+        )
+        self.assertEqual(
+            descriptor.classify_plan_entry(
+                base, liquid_type="LiquidBlock", plan_size=1,
+                content_missing=False,
+            ),
+            descriptor.DESCRIPTOR_INVALID,
+        )
+        ordinary = dict(base, path="/media/title-with-autobump-text.mp4")
+        self.assertEqual(
+            descriptor.classify_plan_entry(
+                ordinary, liquid_type="LiquidBlock", plan_size=1,
+                content_missing=False,
+            ),
+            descriptor.DESCRIPTOR_NONE,
+        )
+        catalog = {
+            "path": descriptor.AUTOBUMP_PATH_PREFIX + "opaque",
+            "realpath": None, "tag": descriptor.AUTOBUMP_CATALOG_TAG,
+            "duration": 7, "content_type": "feature", "media_type": "video",
+        }
+        self.assertEqual(
+            descriptor.classify_catalog_entry(catalog),
+            descriptor.DESCRIPTOR_SELECTED,
+        )
+        for mutation in (
+            {"tag": "ordinary"},
+            {"path": "/media/ordinary.mp4"},
+            {"realpath": "/media/ordinary.mp4"},
+            {"content_type": "bump"},
+            {"media_type": "audio"},
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertEqual(
+                    descriptor.classify_catalog_entry(dict(catalog, **mutation)),
+                    descriptor.DESCRIPTOR_INVALID,
+                )
+        self.assertEqual(
+            descriptor.classify_catalog_entry({
+                "path": "/media/autobump-title.mp4", "realpath": None,
+                "tag": "ordinary-autobump-text", "duration": 7,
+                "content_type": "feature", "media_type": "video",
+                "title": descriptor.AUTOBUMP_PATH_PREFIX + "ignored",
+            }),
+            descriptor.DESCRIPTOR_NONE,
+        )
+
+    def test_diagnostic_codes_have_exact_scheduler_state_contract(self):
+        cases = (
+            ("autobump_subprocess_required", "configuration", False),
+            ("autobump_subprocess_blocked", "scheduler", True),
+            ("autobump_selected", "scheduler", True),
+            ("invalid_playback_descriptor", "scheduler", True),
+        )
+        for code, phase, invoked in cases:
+            diagnostic = make_diagnostic(
+                code, phase, scheduler_invoked=invoked, channel_number=2
+            )
+            validate_diagnostic(diagnostic)
+            self.assertEqual(diagnostic["scheduler_invoked"], invoked)
+
+    def test_static_native_autobump_reachability_excludes_presentation(self):
+        files = (
+            ROOT / "station_director/native_single_run.py",
+            ROOT / "station_director/staged_schedule.py",
+            ROOT / "fs42/autobump_descriptor.py",
+        )
+        forbidden = {
+            "fs42.station_player", "fs42.webrender", "requests", "socket",
+            "urllib.request", "http.client", "multiprocessing",
+        }
+        for path in files:
+            tree = ast.parse(path.read_text())
+            imported = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imported.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imported.add(node.module)
+            self.assertFalse(imported & forbidden, path)
+        descriptor_tree = ast.parse(
+            (ROOT / "fs42/autobump_descriptor.py").read_text()
+        )
+        self.assertFalse(any(
+            isinstance(node, (ast.Import, ast.ImportFrom))
+            for node in ast.walk(descriptor_tree)
+        ))
+
     def test_genuine_native_loop_catalog_and_scheduler_on_temporary_fixture(self):
         import datetime
         from fs42.catalog import ShowCatalog
@@ -793,6 +1208,7 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                 "network_name": "Synthetic Loop", "channel_number": 2,
                 "network_type": "loop", "content_dir": str(media),
                 "commercial_free": True, "shuffle_loop": False,
+                "autobump": {"title": "Synthetic", "duration": 7},
             }}))
             subprocess.run(
                 ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i",
@@ -1174,6 +1590,139 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                 self.assertEqual(result["preservation"]["sequence_tables_restored"], "pass")
         self.assertEqual(results[0], results[1])
 
+    def test_autobump_probe_requirement_rejects_before_scheduler_entry(self):
+        from station_director import native_single_run as native
+
+        with tempfile.TemporaryDirectory() as directory:
+            work, media, request, projected = self._fixture(Path(directory))
+            projected["Action"]["station_conf"]["autobump"] = {
+                "title": "Synthetic", "bg_video": "opaque"
+            }
+            catalog = Mock()
+            schedule = Mock()
+            with patch.object(
+                native, "_verified_work_tree",
+                return_value=(work, projected, ["Action"], {"Action": 2}, 0),
+            ), patch.object(
+                native, "_native_station_config",
+                side_effect=lambda channel, unused_context: projected[channel]["station_conf"],
+            ), patch.object(native, "MEDIA_ROOT", media), patch.object(
+                native, "ShowCatalog", catalog
+            ), patch.object(native, "LiquidSchedule", schedule):
+                with self.assertRaises(native.NativeRunError) as caught:
+                    native.execute_native_single_run(request, test_attestation(request))
+            self.assertEqual(caught.exception.code, "autobump_subprocess_required")
+            self.assertEqual(caught.exception.channel, "Action")
+            self.assertFalse(caught.exception.scheduler_invoked)
+            catalog.assert_not_called()
+            schedule.assert_not_called()
+
+    def test_native_validation_defense_maps_blocked_probe_after_scheduler_entry(self):
+        from fs42.autobump_agent import AutoBumpAgent
+        from station_director import native_single_run as native
+
+        class Catalog:
+            def __init__(self, *unused, **unused_kwargs):
+                pass
+
+        class Schedule:
+            def __init__(self, unused_config):
+                self.catalog = types.SimpleNamespace(clip_index={})
+                AutoBumpAgent.get_bg_video_duration("opaque")
+
+        with tempfile.TemporaryDirectory() as directory:
+            work, media, request, projected = self._fixture(Path(directory))
+            projected["Action"]["station_conf"]["autobump"] = {
+                "title": "Synthetic", "duration": 7
+            }
+            with patch.object(
+                native, "_verified_work_tree",
+                return_value=(work, projected, ["Action"], {"Action": 2}, 0),
+            ), patch.object(
+                native, "_native_station_config",
+                side_effect=lambda channel, unused_context: projected[channel]["station_conf"],
+            ), patch.object(native, "MEDIA_ROOT", media), patch.object(
+                native, "ShowCatalog", Catalog
+            ), patch.object(native, "LiquidSchedule", Schedule), patch(
+                "fs42.autobump_agent.subprocess.run"
+            ) as runner:
+                with self.assertRaises(native.NativeRunError) as caught:
+                    native.execute_native_single_run(request, test_attestation(request))
+            self.assertEqual(caught.exception.code, "autobump_subprocess_blocked")
+            self.assertEqual(caught.exception.channel, "Action")
+            self.assertTrue(caught.exception.scheduler_invoked)
+            runner.assert_not_called()
+
+    def test_malformed_autobump_remains_native_configuration_error(self):
+        from station_director import native_single_run as native
+
+        with tempfile.TemporaryDirectory() as directory:
+            work, media, request, projected = self._fixture(Path(directory))
+            projected["Action"]["station_conf"]["autobump"] = "malformed"
+            with patch.object(
+                native, "_verified_work_tree",
+                return_value=(work, projected, ["Action"], {"Action": 2}, 0),
+            ), patch.object(
+                native, "_native_station_config",
+                side_effect=lambda channel, unused_context: projected[channel]["station_conf"],
+            ), patch.object(native, "MEDIA_ROOT", media), patch.object(
+                native, "ShowCatalog"
+            ) as catalog, patch.object(native, "LiquidSchedule") as schedule:
+                with self.assertRaises(native.NativeRunError) as caught:
+                    native.execute_native_single_run(request, test_attestation(request))
+            self.assertEqual(caught.exception.code, "native_configuration")
+            self.assertFalse(caught.exception.scheduler_invoked)
+            catalog.assert_not_called()
+            schedule.assert_not_called()
+
+    def test_selected_autobump_rejects_after_scheduler_before_media_validation(self):
+        from station_director import native_single_run as native
+
+        class Catalog:
+            def __init__(self, *unused, **unused_kwargs):
+                pass
+
+        class Schedule:
+            def __init__(self, unused_config):
+                self.catalog = types.SimpleNamespace(clip_index={})
+
+            def generate_validation_range(self, start, end, unused_context):
+                connection = sqlite3.connect("runtime/fs42_fluid.db")
+                insert_block(connection, "Action", str(start), str(end), 1, "/media/a.mp4")
+                connection.execute(
+                    "UPDATE liquid_blocks SET plan_json=? WHERE station='Action' AND start_time>=?",
+                    (json.dumps([{
+                        "path": ":autobump:=opaque", "skip": 0, "duration": 7,
+                        "is_stream": False, "content_type": "bump",
+                        "media_type": "video",
+                    }]), str(start)),
+                )
+                connection.commit()
+                connection.close()
+
+        with tempfile.TemporaryDirectory() as directory:
+            work, media, request, projected = self._fixture(Path(directory))
+            projected["Action"]["station_conf"]["autobump"] = {
+                "title": "Synthetic", "duration": 7
+            }
+            with patch.object(
+                native, "_verified_work_tree",
+                return_value=(work, projected, ["Action"], {"Action": 2}, 0),
+            ), patch.object(
+                native, "_native_station_config",
+                side_effect=lambda channel, unused_context: projected[channel]["station_conf"],
+            ), patch.object(native, "MEDIA_ROOT", media), patch.object(
+                native, "ShowCatalog", Catalog
+            ), patch.object(native, "LiquidSchedule", Schedule), patch.object(
+                native, "_verify_final_preservation"
+            ) as media_validation:
+                with self.assertRaises(native.NativeRunError) as caught:
+                    native.execute_native_single_run(request, test_attestation(request))
+            self.assertEqual(caught.exception.code, "autobump_selected")
+            self.assertTrue(caught.exception.scheduler_invoked)
+            self.assertNotIn("opaque", str(caught.exception))
+            media_validation.assert_not_called()
+
     def test_catalog_scheduler_and_preservation_failures_keep_phase_and_channel(self):
         from station_director import native_single_run as native
 
@@ -1385,8 +1934,12 @@ class VersionedDiagnosticTests(unittest.TestCase):
 
         native_cases = (
             ("invalid_configuration", "configuration", False),
+            ("autobump_subprocess_required", "configuration", False),
             ("catalog_failure", "catalog", False),
             ("scheduler_failure", "scheduler", True),
+            ("autobump_subprocess_blocked", "scheduler", True),
+            ("autobump_selected", "scheduler", True),
+            ("invalid_playback_descriptor", "scheduler", True),
             ("preservation_failure", "preservation", True),
             ("guide_loading_failed", "guide", True),
         )

@@ -504,6 +504,53 @@ class ReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ReportError, "invalid C1"):
             validate_report_document(tampered)
 
+    def test_autobump_diagnostics_are_value_free_through_report_digest_and_text(self):
+        for code, phase, invoked in (
+            ("autobump_subprocess_required", "configuration", False),
+            ("autobump_subprocess_blocked", "scheduler", True),
+            ("autobump_selected", "scheduler", True),
+            ("invalid_playback_descriptor", "scheduler", True),
+        ):
+            digests = []
+            for poison in (
+                "descriptor-one-private-value", "descriptor-two-private-value"
+            ):
+                result = _base_result("comparison")
+                result["phase_reached"] = "run_1"
+                result["scheduler_invoked"]["run_1"] = invoked
+                result["source_checks"] = [{
+                    "checkpoint": "after_capture", "passed": True,
+                    "changed_categories": [],
+                }]
+                result["failure"] = {
+                    "phase": "run_1", "code": "c1_run_failed",
+                    "category": code, "message": poison,
+                    "c1_diagnostic": {"run": 1, "detail": make_diagnostic(
+                        code, phase, scheduler_invoked=invoked,
+                        channel_number=2,
+                    )},
+                    "launcher_summary": {
+                        "outcome": "nonzero_exit", "stdout_bytes": 0,
+                        "stderr_bytes": 0, "stdout_truncated": False,
+                        "stderr_truncated": False,
+                    },
+                }
+                report = build_validation_report(
+                    PROPOSAL, result, self.run_id, "2026-09-13T12:00:00Z"
+                )
+                raw = _canonical_json(report)
+                rendered = render_validation_text(report)
+                self.assertNotIn(poison.encode(), raw)
+                self.assertNotIn(poison.encode(), rendered)
+                self.assertEqual(
+                    report["findings"]["errors"][0]["c1_diagnostic"]["detail"]["code"],
+                    code,
+                )
+                digests.append(
+                    report["findings"]["errors"][0]["diagnostic_digest"]
+                )
+            self.assertEqual(digests[0], digests[1])
+
     def test_capture_kind_survives_v4_projection_publication_latest_and_text(self):
         run_id = "v-20260913T120002000001Z-" + "c" * 32
         report = None

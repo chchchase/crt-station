@@ -1,10 +1,125 @@
-import pytest
 import urllib.parse
-from fs42.autobump_agent import AutoBumpAgent
+import datetime
+import unittest
+from unittest.mock import patch
+
+from fs42.autobump_agent import (
+    AutoBumpAgent,
+    AutoBumpConfigurationError,
+    AutoBumpValidationSubprocessBlocked,
+)
 from fs42.catalog_entry import CatalogEntry
+from fs42.scheduling_context import ValidationSchedulingContext, activate_validation_context
 
 
-class TestAutoBumpAgent:
+class TestAutoBumpAgent(unittest.TestCase):
+
+    def test_validation_subprocess_preflight_matches_native_truth(self):
+        for autobump, required in (
+            ({"bg_video": "opaque"}, True),
+            ({"duration": 0, "bg_video": "opaque"}, True),
+            ({"duration": None, "bg_video": "opaque"}, True),
+            ({"duration": 7, "bg_video": "opaque"}, False),
+            ({"duration": 7}, False),
+            ({"bg_video": ""}, False),
+            ({}, False),
+        ):
+            with self.subTest(autobump=autobump):
+                assert AutoBumpAgent.validation_subprocess_required(
+                    {"autobump": autobump}
+                ) is required
+
+    def test_validation_subprocess_preflight_distinguishes_absent_and_malformed(self):
+        assert AutoBumpAgent.validation_subprocess_required({}) is False
+        assert AutoBumpAgent.validation_subprocess_required(
+            {"off_air_autobump": {"bg_video": "opaque"}}
+        ) is False
+        with self.assertRaises(AutoBumpConfigurationError):
+            AutoBumpAgent.validation_subprocess_required({"autobump": "invalid"})
+
+    def test_explicit_duration_without_background_never_uses_subprocess(self):
+        config = {
+            "autobump": {"title": "Synthetic", "duration": 7},
+            "network_name": "Synthetic",
+        }
+        with patch("fs42.autobump_agent.subprocess.run") as runner:
+            result = AutoBumpAgent.gen_bumps(config)
+        runner.assert_not_called()
+        assert result["message_bump"] is not None
+        assert result["next_bump"] is not None
+
+    def test_validation_defense_precedes_path_resolution_and_subprocess(self):
+        context = ValidationSchedulingContext(
+            datetime.datetime(2026, 9, 14),
+            datetime.datetime(2026, 9, 14),
+            datetime.datetime(2026, 9, 15),
+            42,
+        )
+        with patch.object(AutoBumpAgent, "resolve_bg_video_path") as resolver, patch(
+            "fs42.autobump_agent.subprocess.run"
+        ) as runner, activate_validation_context(context), self.assertRaises(
+            AutoBumpValidationSubprocessBlocked
+        ):
+            AutoBumpAgent.get_bg_video_duration("opaque")
+        resolver.assert_not_called()
+        runner.assert_not_called()
+
+    def test_validation_descriptor_avoids_presentation_generation(self):
+        context = ValidationSchedulingContext(
+            datetime.datetime(2026, 9, 14),
+            datetime.datetime(2026, 9, 14),
+            datetime.datetime(2026, 9, 15),
+            42,
+        )
+        config = {
+            "autobump": {"title": "private", "duration": 7},
+            "network_name": "private-network",
+        }
+        with activate_validation_context(context), patch.object(
+            AutoBumpAgent, "generate_bump_query"
+        ) as generate_query, patch.object(
+            AutoBumpAgent, "resolve_bg_video_url"
+        ) as resolve_url:
+            result = AutoBumpAgent.gen_bumps(config)
+        generate_query.assert_not_called()
+        resolve_url.assert_not_called()
+        self.assertEqual(
+            result["message_bump"].path, result["next_bump"].path
+        )
+        self.assertTrue(AutoBumpAgent.is_autobump_url(result["message_bump"].path))
+
+    def test_ordinary_duration_probe_arguments_and_result_are_unchanged(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": "2.5\n"})()
+        with patch.object(
+            AutoBumpAgent, "resolve_bg_video_path", return_value="relative-video"
+        ), patch("fs42.autobump_agent.os.path.exists", return_value=True), patch(
+            "fs42.autobump_agent.subprocess.run", return_value=completed
+        ) as runner:
+            assert AutoBumpAgent.get_bg_video_duration("opaque") == 2.5
+        runner.assert_called_once_with(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", "relative-video",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_fill_break_uses_repeatable_validation_rng(self):
+        config = {"autobump": {"fill_break": 0.5}}
+
+        def decisions():
+            context = ValidationSchedulingContext(
+                datetime.datetime(2026, 9, 14),
+                datetime.datetime(2026, 9, 14),
+                datetime.datetime(2026, 9, 15),
+                99,
+            )
+            with activate_validation_context(context):
+                return [AutoBumpAgent.do_fill(config) for unused in range(12)]
+
+        assert decisions() == decisions()
 
     def test_generate_bump_query_basic(self):
         """Test basic query generation with required title only."""
@@ -55,7 +170,7 @@ class TestAutoBumpAgent:
     def test_generate_bump_query_missing_title(self):
         """Test that missing title raises ValueError."""
         config = {'subtitle': 'Field Station Television'}
-        with pytest.raises(ValueError, match="title is required"):
+        with self.assertRaisesRegex(ValueError, "title is required"):
             AutoBumpAgent.generate_bump_query(config)
 
     def test_generate_bump_query_none_values_excluded(self):

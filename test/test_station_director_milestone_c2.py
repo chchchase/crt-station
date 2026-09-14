@@ -272,6 +272,7 @@ def synthetic_project(root, media):
         "break_strategy": "end", "clip_shows": [],
         "content_dir": "/mnt/t7/CRT-Media/synthetic",
         "commercial_free": True, "shuffle_loop": False,
+        "autobump": {"title": "Synthetic", "duration": 7},
     }
     slots = {str(hour): {"tags": "Synthetic"} for hour in range(24)}
     for day in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"):
@@ -1898,6 +1899,62 @@ class DualRunLifecycleTests(unittest.TestCase):
                 {"run": 1, "passed": True, "quarantined": False, "detail": "run 1"},
             ])
 
+    def test_run_one_selected_autobump_prevents_run_two_and_cleans_both_stages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = []
+            scope = self._scope(root, events, cleanup_failure=True)
+            scope.lifecycles[0].launcher_result = LaunchResult(
+                "synthetic", 1, "", "", stdout_bytes=0, stderr_bytes=0
+            )
+            failed = response("comparison.run-1")
+            failed.update(
+                status="failed", phase_reached="scheduler",
+                scheduler_invoked=True, channels=[], verification={},
+                preservation={}, path_validation={}, guide_validation={},
+                failure=make_diagnostic(
+                    "autobump_selected", "scheduler",
+                    scheduler_invoked=True, channel_number=2,
+                ),
+            )
+
+            def launch(lifecycle, timeout):
+                events.append(f"launch-{lifecycle.run_id[-1]}")
+
+            with patch("station_director.dual_run._prepare_scope", return_value=scope), patch(
+                "station_director.dual_run.launch_single_run", side_effect=launch
+            ), patch(
+                "station_director.dual_run.inspect_single_run", return_value=failed
+            ), patch(
+                "station_director.dual_run._assert_inputs_stable",
+                return_value={
+                    "checkpoint": "before_success", "passed": True,
+                    "changed_categories": [],
+                },
+            ):
+                result = run_dual_comparison(
+                    root, root, root,
+                    {"week_start": "2026-09-14T00:00:00-07:00"},
+                    {}, "comparison",
+                )
+            self.assertEqual(events.count("launch-1"), 1)
+            self.assertNotIn("launch-2", events)
+            self.assertIn("cleanup", events)
+            self.assertEqual(
+                [item["run"] for item in result["cleanup"]], [2, 1]
+            )
+            self.assertEqual(
+                result["scheduler_invoked"], {"run_1": True, "run_2": False}
+            )
+            self.assertEqual(
+                result["failure"]["c1_diagnostic"]["detail"]["code"],
+                "autobump_selected",
+            )
+            self.assertTrue(any(
+                not item["passed"] and item["quarantined"]
+                for item in result["cleanup"]
+            ))
+
     def test_input_change_between_runs_is_not_nondeterminism(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2240,6 +2297,30 @@ class DualRunLifecycleTests(unittest.TestCase):
             cwd=ROOT, check=False, capture_output=True, text=True,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+        completed = subprocess.run(
+            [sys.executable, "-c", (
+                "import sys; "
+                "import station_director.cli; "
+                "import station_director.validation; "
+                "import station_director.validation_coordinator; "
+                "import station_director.dual_run; "
+                "import station_director.staged_schedule; "
+                "assert not any(n == 'fs42' or n.startswith('fs42.') for n in sys.modules)"
+            )],
+            cwd=ROOT, check=False, capture_output=True, text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        for relative in (
+            "station_director/cli.py", "station_director/validation.py",
+            "station_director/validation_coordinator.py",
+            "station_director/dual_run.py", "station_director/single_run.py",
+            "station_director/staged_schedule.py", "station_director/reporting.py",
+        ):
+            self.assertNotIn(
+                "fs42.autobump_descriptor",
+                (ROOT / relative).read_text(encoding="utf-8"),
+                relative,
+            )
         from station_director.validation import _disabled_report
 
         public = _disabled_report({"proposal_id": "synthetic"})
@@ -2375,7 +2456,7 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
             ) if execute is None else execute(project, media, proposal, policy))
         return result, details
 
-    def test_complete_genuine_two_run_lifecycle_succeeds_identically(self):
+    def test_complete_genuine_two_run_configured_unused_autobump_succeeds_identically(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             result, details = self._complete_dual_run(root)

@@ -89,6 +89,18 @@ def parse_catalog_references(raw):
     return tuple(values)
 
 
+def _playback_catalog_references(raw, liquid_type):
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise StagedScheduleError(f"unsupported content_json: {exc}") from exc
+    if value is None:
+        if liquid_type == "LiquidWebBlock":
+            return (), True
+        raise StagedScheduleError("unsupported content_json shape: NoneType")
+    return parse_catalog_references(raw), False
+
+
 def validate_plan_json(raw):
     try:
         value = json.loads(raw)
@@ -107,17 +119,71 @@ def validate_plan_json(raw):
 
 def validate_all_catalog_reference_shapes(connection):
     checked = 0
-    for block_id, content_json in connection.execute(
-        "SELECT id,content_json FROM liquid_blocks ORDER BY id"
+    for block_id, liquid_type, content_json in connection.execute(
+        "SELECT id,liquid_type,content_json FROM liquid_blocks ORDER BY id"
     ):
         try:
-            parse_catalog_references(content_json)
+            _playback_catalog_references(content_json, liquid_type)
         except StagedScheduleError as exc:
             raise StagedScheduleError(
                 f"block {block_id} has an unsupported catalog reference: {exc}"
             ) from exc
         checked += 1
     return checked
+
+
+def _playback_representations(connection, rows):
+    for block_id, liquid_type, content_json, plan_json in rows:
+        plan = validate_plan_json(plan_json)
+        references, content_missing = _playback_catalog_references(
+            content_json, liquid_type
+        )
+        catalog = []
+        if references:
+            placeholders = ",".join("?" for unused in references)
+            catalog = [
+                {
+                    "id": row[0], "path": row[1], "realpath": row[2],
+                    "tag": row[3], "duration": row[4],
+                    "content_type": row[5], "media_type": row[6],
+                }
+                for row in connection.execute(
+                    "SELECT id,path,realpath,tag,duration,content_type,media_type "
+                    f"FROM catalog_entries WHERE id IN ({placeholders}) ORDER BY id",
+                    references,
+                )
+            ]
+            if len({entry["id"] for entry in catalog}) != len(set(references)):
+                raise StagedScheduleError(
+                    f"block {block_id} has unresolved catalog references"
+                )
+        yield {
+            "block_id": block_id,
+            "liquid_type": liquid_type,
+            "content_missing": content_missing,
+            "plan": plan,
+            "catalog": catalog,
+        }
+
+
+def generated_playback_representations(connection, history):
+    """Yield exact post-seam playback data for the native worker."""
+    rows = connection.execute(
+        "SELECT id,liquid_type,content_json,plan_json FROM liquid_blocks "
+        "WHERE station=? AND start_time>=? AND start_time<? ORDER BY start_time,id",
+        (history.channel, history.regeneration_start, history.effective_horizon),
+    )
+    yield from _playback_representations(connection, rows)
+
+
+def retained_playback_representations(connection, history):
+    """Yield exact pre-seam playback data for worker-side classification."""
+    rows = connection.execute(
+        "SELECT id,liquid_type,content_json,plan_json FROM liquid_blocks "
+        "WHERE station=? AND start_time<? ORDER BY start_time,id",
+        (history.channel, history.regeneration_start),
+    )
+    yield from _playback_representations(connection, rows)
 
 
 def _rows(connection, table, where="", parameters=()):
@@ -197,7 +263,10 @@ def capture_channel_history(connection, channel, proposal_boundary, proposal_end
         regeneration_start = max(crossing, key=lambda row: _parse_time(row["end_time"], "block end"))["end_time"]
     references = set()
     for row in by_name:
-        references.update(parse_catalog_references(row["content_json"]))
+        block_references, unused_missing = _playback_catalog_references(
+            row["content_json"], row["liquid_type"]
+        )
+        references.update(block_references)
         validate_plan_json(row["plan_json"])
     retained_catalog_rows = {}
     if references:
@@ -619,22 +688,26 @@ def validate_scheduled_paths(connection, histories, sandbox_media_root):
     checked = 0
     for history in histories:
         rows = connection.execute(
-            "SELECT id,content_json,plan_json FROM liquid_blocks "
+            "SELECT id,liquid_type,start_time,content_json,plan_json FROM liquid_blocks "
             "WHERE station=? AND start_time<? ORDER BY start_time,id",
             (history.channel, history.effective_horizon),
         )
-        for block_id, content_json, plan_json in rows:
-            references = parse_catalog_references(content_json)
-            placeholders = ",".join("?" for unused in references)
-            catalog_rows = connection.execute(
-                f"SELECT id,COALESCE(realpath,path) FROM catalog_entries "
-                f"WHERE id IN ({placeholders})",
-                references,
-            ).fetchall()
-            if len({row[0] for row in catalog_rows}) != len(set(references)):
-                raise StagedScheduleError(
-                    f"block {block_id} has unresolved catalog references"
-                )
+        for block_id, liquid_type, unused_start_time, content_json, plan_json in rows:
+            references, unused_missing = _playback_catalog_references(
+                content_json, liquid_type
+            )
+            catalog_rows = []
+            if references:
+                placeholders = ",".join("?" for unused in references)
+                catalog_rows = connection.execute(
+                    f"SELECT id,COALESCE(realpath,path) FROM catalog_entries "
+                    f"WHERE id IN ({placeholders})",
+                    references,
+                ).fetchall()
+                if len({row[0] for row in catalog_rows}) != len(set(references)):
+                    raise StagedScheduleError(
+                        f"block {block_id} has unresolved catalog references"
+                    )
             for unused_catalog_id, path in catalog_rows:
                 mapping = canonical_media_mapping(
                     path, "scheduled catalog path", allow_sandbox=True

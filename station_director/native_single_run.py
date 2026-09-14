@@ -1,5 +1,6 @@
 """One staged native schedule run. Import this module only after attestation."""
 
+import importlib
 import json
 import os
 import sqlite3
@@ -26,7 +27,7 @@ from station_director.native_config_checks import (
     newly_unresolved_source_slots,
     validate_processed_configurations,
 )
-from station_director.path_safety import canonical_media_mapping
+from station_director.path_safety import canonical_media_mapping, validate_scheduled_media
 from station_director.preservation import canonical_foreign_key_findings
 from station_director.staged_schedule import (
     StagedScheduleError,
@@ -38,10 +39,11 @@ from station_director.staged_schedule import (
     capture_channel_history,
     capture_protected_state,
     coverage_report,
+    generated_playback_representations,
     inspect_required_schema,
     reconcile_catalog,
+    retained_playback_representations,
     restore_sequence_state,
-    validate_scheduled_paths,
     validate_all_catalog_reference_shapes,
 )
 from station_director.validation import _db_time
@@ -126,18 +128,97 @@ def _verified_work_tree(request, attestation):
     return work, projected, affected, by_name, attestation.snapshot["mapping_count"]
 
 
-def _autobump_fields(value, location="station_conf"):
-    found = []
-    if isinstance(value, dict):
-        for key, child in value.items():
-            field = f"{location}.{key}"
-            if key in ("autobump", "off_air_autobump"):
-                found.append(field)
-            found.extend(_autobump_fields(child, field))
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            found.extend(_autobump_fields(child, f"{location}[{index}]"))
-    return found
+def _native_autobump_contract():
+    """Load the fixed FS42 contract only inside the attested native worker."""
+    descriptor = importlib.import_module("fs42.autobump_descriptor")
+    runtime = importlib.import_module("fs42.autobump_agent")
+    return descriptor, runtime
+
+
+def _playback_descriptor_failure(channel, generated, invalid):
+    if invalid:
+        raise NativeRunError(
+            "invalid_playback_descriptor",
+            "Playback descriptor is invalid.",
+            phase="scheduler", channel=channel, scheduler_invoked=True,
+        )
+    if generated:
+        raise NativeRunError(
+            "autobump_selected", "AutoBump content was selected.",
+            phase="scheduler", channel=channel, scheduler_invoked=True,
+        )
+
+
+def _validate_playback_representations(
+        descriptor, representations, channel, *, generated, media_root=None):
+    checked = 0
+    for block in representations:
+        plan = block["plan"]
+        for item in plan:
+            classification = descriptor.classify_plan_entry(
+                item,
+                liquid_type=block["liquid_type"],
+                plan_size=len(plan),
+                content_missing=block["content_missing"],
+            )
+            if classification == descriptor.DESCRIPTOR_INVALID:
+                _playback_descriptor_failure(channel, generated, True)
+            if classification == descriptor.DESCRIPTOR_SELECTED:
+                _playback_descriptor_failure(channel, generated, False)
+                continue
+            if media_root is not None:
+                if item["is_stream"]:
+                    raise StagedScheduleError(
+                        f"block {block['block_id']} contains stream content "
+                        "instead of confined media"
+                    )
+                mapping = canonical_media_mapping(
+                    item["path"], "scheduled plan path", allow_sandbox=True
+                )
+                validate_scheduled_media(
+                    mapping.sandbox_path, sandbox_media_root=media_root
+                )
+                checked += 1
+        for entry in block["catalog"]:
+            classification = descriptor.classify_catalog_entry(entry)
+            if classification == descriptor.DESCRIPTOR_INVALID:
+                _playback_descriptor_failure(channel, generated, True)
+            if classification == descriptor.DESCRIPTOR_SELECTED:
+                _playback_descriptor_failure(channel, generated, False)
+                continue
+            if media_root is not None:
+                mapping = canonical_media_mapping(
+                    entry["realpath"] or entry["path"],
+                    "scheduled catalog path", allow_sandbox=True,
+                )
+                validate_scheduled_media(
+                    mapping.sandbox_path, sandbox_media_root=media_root
+                )
+                checked += 1
+    return checked
+
+
+def _inspect_generated_playback(connection, history, channel):
+    descriptor, unused_runtime = _native_autobump_contract()
+    _validate_playback_representations(
+        descriptor, generated_playback_representations(connection, history),
+        channel, generated=True,
+    )
+
+
+def _validate_scheduled_playback(connection, histories, media_root):
+    descriptor, unused_runtime = _native_autobump_contract()
+    checked = 0
+    for channel, history in histories.items():
+        checked += _validate_playback_representations(
+            descriptor, retained_playback_representations(connection, history),
+            channel, generated=False, media_root=media_root,
+        )
+        checked += _validate_playback_representations(
+            descriptor, generated_playback_representations(connection, history),
+            channel, generated=True, media_root=media_root,
+        )
+    return checked
 
 
 def _rows_as_dicts(columns, rows):
@@ -297,7 +378,7 @@ def _verify_final_preservation(connection, projected, histories, channel_results
     assert_protected_state(connection, protected)
     if canonical_foreign_key_findings(connection) != baseline_foreign_keys:
         raise StagedScheduleError("foreign-key findings changed from baseline")
-    return validate_scheduled_paths(connection, list(histories.values()), media_root)
+    return _validate_scheduled_playback(connection, histories, media_root)
 
 
 def _final_input_verification(attestation, request):
@@ -420,15 +501,6 @@ def _execute_native_single_run(request, attestation, restoration):
     effective_seed = request["validation_context"]["effective_seed"]
     reference_clock = datetime.fromisoformat(request["validation_context"]["reference_clock"])
 
-    for channel in affected:
-        fields = _autobump_fields(projected[channel]["station_conf"])
-        if fields:
-            raise NativeRunError(
-                "unsupported_autobump",
-                "AutoBump is unsupported in isolated validation: " + ", ".join(fields[:8]),
-                phase="configuration", channel=channel,
-            )
-
     connection = sqlite3.connect(database)
     try:
         try:
@@ -465,6 +537,8 @@ def _execute_native_single_run(request, attestation, restoration):
 
     channel_results = []
     scheduler_entered = False
+    channel_inputs = {}
+    unused_descriptor, autobump_runtime = _native_autobump_contract()
     for channel in affected:
         attestation.verify(request)
         history = histories[channel]
@@ -485,6 +559,25 @@ def _execute_native_single_run(request, attestation, restoration):
                 "native_system_exit", f"native configuration exited with {exc.code!r}",
                 phase="configuration", channel=channel,
             ) from exc
+        try:
+            subprocess_required = autobump_runtime.AutoBumpAgent.validation_subprocess_required(
+                native_config
+            )
+        except autobump_runtime.AutoBumpConfigurationError as exc:
+            raise NativeRunError(
+                "native_configuration", "Native AutoBump configuration is invalid.",
+                phase="configuration", channel=channel,
+            ) from exc
+        if subprocess_required:
+            raise NativeRunError(
+                "autobump_subprocess_required",
+                "AutoBump configuration requires a blocked subprocess.",
+                phase="configuration", channel=channel,
+            )
+        channel_inputs[channel] = (history, context, native_config)
+
+    for channel in affected:
+        history, context, native_config = channel_inputs[channel]
         attestation.verify(request)
         allocation_connection = sqlite3.connect(database)
         try:
@@ -554,6 +647,12 @@ def _execute_native_single_run(request, attestation, restoration):
             )
             attestation.verify(request)
             scheduler_seconds += time.monotonic() - scheduler_started
+        except autobump_runtime.AutoBumpValidationSubprocessBlocked as exc:
+            raise NativeRunError(
+                "autobump_subprocess_blocked",
+                "AutoBump attempted a blocked subprocess.",
+                phase="scheduler", channel=channel, scheduler_invoked=True,
+            ) from exc
         except SystemExit as exc:
             raise NativeRunError(
                 "native_system_exit", f"native scheduler exited with {exc.code!r}",
@@ -567,6 +666,7 @@ def _execute_native_single_run(request, attestation, restoration):
 
         connection = sqlite3.connect(database)
         try:
+            _inspect_generated_playback(connection, history, channel)
             channel_results.append(_build_channel_result(
                 connection, channel, channel_numbers[channel], channel_seed,
                 history, statistics,
@@ -582,6 +682,9 @@ def _execute_native_single_run(request, attestation, restoration):
                 connection, projected, histories, channel_results, protected,
                 baseline_foreign_keys, MEDIA_ROOT,
             )
+        except NativeRunError:
+            connection.rollback()
+            raise
         except Exception as exc:
             connection.rollback()
             raise NativeRunError(

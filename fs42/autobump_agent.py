@@ -4,14 +4,39 @@ import subprocess
 
 sys.path.append(os.getcwd())
 from fs42.catalog_entry import CatalogEntry
-from fs42.scheduling_context import scheduling_random
+from fs42.autobump_descriptor import (
+    AUTOBUMP_CATALOG_TAG,
+    AUTOBUMP_PATH_PREFIX,
+    AUTOBUMP_VALIDATION_PATH,
+)
+from fs42.scheduling_context import in_validation_mode, scheduling_random
 import urllib.parse
+
+
+class AutoBumpConfigurationError(ValueError):
+    pass
+
+
+class AutoBumpValidationSubprocessBlocked(RuntimeError):
+    pass
 
 
 class AutoBumpAgent:
     base_url = "http://127.0.0.1:4242/static/bump/bump.html"
-    url_prefix = ":autobump:="
-    tag_str = ":autobump:"
+    url_prefix = AUTOBUMP_PATH_PREFIX
+    tag_str = AUTOBUMP_CATALOG_TAG
+
+    @staticmethod
+    def validation_subprocess_required(station_config):
+        """Mirror the native duration-probe branch without inspecting values."""
+        if "autobump" not in station_config:
+            return False
+        ab_config = station_config["autobump"]
+        if not isinstance(ab_config, dict):
+            raise AutoBumpConfigurationError(
+                "AutoBump configuration must be an object"
+            )
+        return not ab_config.get("duration") and bool(ab_config.get("bg_video"))
 
     @staticmethod
     def do_fill(station_config):
@@ -73,6 +98,11 @@ class AutoBumpAgent:
 
     @staticmethod
     def message_bump(ab_config, base_url, loopmusic=True, show_countdown=False):
+        if in_validation_mode():
+            return CatalogEntry(
+                AUTOBUMP_VALIDATION_PATH, ab_config["duration"],
+                AutoBumpAgent.tag_str,
+            )
         ab_config["loopmusic"] = "true" if loopmusic else "false"
         ab_config["countdown"] = "true" if show_countdown else "false"
         if "next_network" in ab_config:
@@ -84,6 +114,11 @@ class AutoBumpAgent:
 
     @staticmethod
     def next_up_bump(ab_config, base_url, network_name, loopmusic=True, show_countdown=False):
+        if in_validation_mode():
+            return CatalogEntry(
+                AUTOBUMP_VALIDATION_PATH, ab_config["duration"],
+                AutoBumpAgent.tag_str,
+            )
         ab_config["subtitle"] = f"Coming up on {network_name}"
         ab_config["next_network"] = network_name
         ab_config["loopmusic"] = "true" if loopmusic else "false"
@@ -103,6 +138,10 @@ class AutoBumpAgent:
 
     @staticmethod
     def get_bg_video_duration(bg_video):
+        if in_validation_mode():
+            raise AutoBumpValidationSubprocessBlocked(
+                "AutoBump subprocess use is blocked during validation"
+            )
         if str(bg_video).startswith("http"):
             return None
 

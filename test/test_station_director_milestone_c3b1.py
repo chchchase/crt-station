@@ -410,6 +410,30 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertIn("C1 output bytes: stdout=12 stderr=34", rendered)
         self.assertNotIn("/", rendered)
 
+    def test_autobump_c1_codes_reach_cli_without_descriptor_data(self):
+        for code, phase, invoked in (
+            ("autobump_subprocess_required", "configuration", False),
+            ("autobump_subprocess_blocked", "scheduler", True),
+            ("autobump_selected", "scheduler", True),
+            ("invalid_playback_descriptor", "scheduler", True),
+        ):
+            outcome = CoordinatorOutcome(
+                state="failed", proposal_id=VALID_PROPOSAL["proposal_id"],
+                run_id=RUN_ID, validation_status="failed", phase="run_1",
+                failure_code="c1_run_failed",
+                scheduler_invoked=(invoked, False),
+                c1_run=1, c1_domain=(
+                    "native_preparation" if not invoked else "native_scheduler"
+                ), c1_phase=phase, c1_code=code, c1_channel_number=2,
+                c1_launcher_outcome="nonzero_exit", c1_stdout_bytes=0,
+                c1_stderr_bytes=0, c1_stdout_truncated=False,
+                c1_stderr_truncated=False,
+            )
+            rendered = render_cli_outcome(outcome)
+            self.assertIn(f"C1 code: {code}", rendered)
+            self.assertIn("C1 channel: 2", rendered)
+            self.assertNotIn("opaque-secret-suffix", rendered)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
