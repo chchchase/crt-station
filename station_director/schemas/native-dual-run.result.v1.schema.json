@@ -133,8 +133,37 @@
                 }
               ]
             },
-            "message": {"type": "string", "maxLength": 1000}
-          }
+            "message": {"type": "string", "maxLength": 1000},
+            "capture_failure_kind": {
+              "enum": [
+                "source_path_resolution", "invocation_verification", "stage_allocation",
+                "configuration_inventory", "configuration_physical_fingerprint",
+                "configuration_logical_fingerprint", "configuration_snapshot",
+                "free_space_check", "stage_source_publication", "database_snapshot",
+                "database_backup_verification", "media_manifest_capture",
+                "media_logical_fingerprint", "post_capture_stability",
+                "capture_artifact_initialization", "single_run_finalization",
+                "context_consistency"
+              ]
+            }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": ["code"],
+                "properties": {"code": {"const": "source_capture_failed"}}
+              },
+              "then": {
+                "required": ["capture_failure_kind"],
+                "properties": {
+                  "phase": {"const": "capture"},
+                  "message": {"const": "Source capture failed."},
+                  "category": {"type": "null"}
+                }
+              },
+              "else": {"not": {"required": ["capture_failure_kind"]}}
+            }
+          ]
         }
       ]
     },

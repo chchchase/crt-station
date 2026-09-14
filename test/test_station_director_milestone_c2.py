@@ -1,5 +1,6 @@
 import json
 import hashlib
+import io
 import math
 import os
 import shutil
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -15,9 +17,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from station_director.dual_run import (
+    CAPTURE_FAILURE_KINDS,
     DualRunError,
     _assert_inputs_stable,
+    _capture_step,
     _capture_shared_inputs,
+    _prepare_scope,
     _space_requirement,
     _validate_result_semantics,
     run_dual_comparison,
@@ -26,6 +31,7 @@ from station_director.isolation import LaunchResult
 from station_director.isolation_probe import PROBE_RESULTS
 from station_director.isolation_probe import PROBE_RESULTS
 from station_director.policy import load_policy
+from station_director.single_run import SingleRunError
 from station_director.preservation import (
     MAX_FOREIGN_KEY_FINDINGS,
     MAX_PROTECTED_JSON_FILE_BYTES,
@@ -335,6 +341,661 @@ class CanonicalEncodingTests(unittest.TestCase):
 
 
 class SharedSnapshotTests(unittest.TestCase):
+    def _preparation_fixture(self, root):
+        source = root / "project"
+        (source / "confs").mkdir(parents=True)
+        (source / "runtime").mkdir()
+        (source / "confs/main_config.json").write_text("{}\n", encoding="utf-8")
+        (source / "confs/action.json").write_text(
+            json.dumps({"station_conf": {"network_name": "Action"}}) + "\n",
+            encoding="utf-8",
+        )
+        (source / "runtime/watch_in_order_state.json").write_text(
+            "{}\n", encoding="utf-8")
+        create_database(source / "runtime/fs42_fluid.db").close()
+        media = root / "media"
+        media.mkdir()
+        (media / "clip.mp4").write_bytes(b"synthetic")
+        stages = [root / "fs42-i-000000000001", root / "fs42-i-000000000002"]
+        for stage in stages:
+            stage.mkdir(mode=0o700)
+        locks = [Mock(name="lock-one"), Mock(name="lock-two")]
+        allocations = [
+            ("000000000001", stages[0], locks[0]),
+            ("000000000002", stages[1], locks[1]),
+        ]
+        return source, media, stages, locks, allocations
+
+    @staticmethod
+    def _remove_test_stage(stage):
+        shutil.rmtree(stage)
+        return True, "removed"
+
+    def test_every_capture_subphase_has_a_precise_safe_classification(self):
+        hostile = RuntimeError(
+            "password=hunter2 /etc/shadow /home/chaseanderegg secret-token")
+        for kind in sorted(CAPTURE_FAILURE_KINDS):
+            with self.subTest(kind=kind), self.assertRaises(DualRunError) as raised:
+                _capture_step(kind, Mock(side_effect=hostile))
+            self.assertEqual(raised.exception.code, "source_capture_failed")
+            self.assertEqual(raised.exception.phase, "capture")
+            self.assertEqual(raised.exception.capture_failure_kind, kind)
+            self.assertEqual(str(raised.exception), "Source capture failed.")
+            self.assertNotIn("hunter2", str(raised.exception))
+
+    def test_capture_classification_preserves_explicit_codes_and_interrupts(self):
+        explicit = DualRunError("capture", "backup_mismatch", "fixed")
+        with self.assertRaises(DualRunError) as raised:
+            _capture_step("database_backup_verification", Mock(side_effect=explicit))
+        self.assertIs(raised.exception, explicit)
+        with self.assertRaises(KeyboardInterrupt):
+            _capture_step("database_snapshot", Mock(side_effect=KeyboardInterrupt()))
+
+        class Cancellation(RuntimeError):
+            is_validation_cancellation = True
+
+        cancellation = Cancellation("stop")
+        with self.assertRaises(Cancellation) as raised:
+            _capture_step("media_manifest_capture", Mock(side_effect=cancellation))
+        self.assertIs(raised.exception, cancellation)
+
+        explicit_c1 = SingleRunError("prepare", "duplicate_stage_file", "fixed")
+        with self.assertRaises(SingleRunError) as raised:
+            _capture_step("single_run_finalization", Mock(side_effect=explicit_c1))
+        self.assertIs(raised.exception, explicit_c1)
+
+        class Impostor(RuntimeError):
+            code = "backup_mismatch"
+            phase = "complete"
+
+        with self.assertRaises(DualRunError) as raised:
+            _capture_step("database_snapshot", Mock(side_effect=Impostor("hostile")))
+        self.assertEqual(raised.exception.code, "source_capture_failed")
+        self.assertEqual(
+            raised.exception.capture_failure_kind, "database_snapshot")
+
+    def test_actual_capture_call_sites_classify_and_clean_every_created_stage(self):
+        cases = (
+            ("configuration_inventory", "protected_json_paths"),
+            ("configuration_physical_fingerprint", "fingerprint_json_files"),
+            ("configuration_logical_fingerprint",
+             "logical_protected_configuration_fingerprint"),
+            ("configuration_snapshot", "_captured_configuration_bytes"),
+            ("free_space_check", "_require_space"),
+            ("stage_source_publication", "_publish_sources"),
+            ("database_snapshot", "fingerprint_and_clone_database_targets"),
+            ("database_backup_verification", "os.chmod"),
+            ("media_manifest_capture", "capture_media_manifest"),
+            ("media_logical_fingerprint", "logical_media_manifest_fingerprint"),
+            ("capture_artifact_initialization", "SharedCapture"),
+            ("post_capture_stability", "_assert_inputs_stable"),
+        )
+        module = "station_director.dual_run."
+        for kind, target in cases:
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                source, media, stages, locks, allocations = self._preparation_fixture(
+                    Path(directory))
+                patches = [
+                    patch(module + "check_invocation_context", return_value=(True, "ok")),
+                    patch(module + "create_staging_directory", side_effect=allocations),
+                    patch(module + "cleanup_staging_directory",
+                          side_effect=self._remove_test_stage),
+                ]
+                if kind != "free_space_check":
+                    patches.append(patch(module + "_require_space"))
+                patches.append(patch(
+                    module + target,
+                    side_effect=RuntimeError("password=hunter2 /etc/shadow"),
+                ))
+                with ExitStack() as stack:
+                    for active in patches:
+                        stack.enter_context(active)
+                    with self.assertRaises(DualRunError) as raised:
+                        _prepare_scope(source, source, media, {}, {}, "comparison")
+                self.assertEqual(raised.exception.code, "source_capture_failed")
+                self.assertEqual(raised.exception.capture_failure_kind, kind)
+                self.assertEqual(str(raised.exception), "Source capture failed.")
+                self.assertEqual(
+                    getattr(raised.exception, "preparation_cleanup"),
+                    [{"run": 2, "passed": True, "quarantined": False,
+                      "detail": "cleaned"},
+                     {"run": 1, "passed": True, "quarantined": False,
+                      "detail": "cleaned"}],
+                )
+                for lock in locks:
+                    lock.close.assert_called_once_with()
+                self.assertTrue(all(not stage.exists() for stage in stages))
+
+    def test_repeated_capture_kind_call_sites_are_independently_classified(self):
+        module = "station_director.dual_run."
+
+        class BadLength:
+            def __len__(self):
+                raise RuntimeError("configuration size failed /etc/private")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            with patch(module + "check_invocation_context", return_value=(True, "ok")), \
+                    patch(module + "create_staging_directory", side_effect=allocations), \
+                    patch(module + "_captured_configuration_bytes",
+                          return_value={"confs/main_config.json": BadLength()}), \
+                    patch(module + "cleanup_staging_directory",
+                          side_effect=self._remove_test_stage):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+            self.assertEqual(
+                result["failure"]["capture_failure_kind"], "configuration_snapshot")
+            self.assertTrue(all(item["passed"] for item in result["cleanup"]))
+            self.assertTrue(all(not stage.exists() for stage in stages))
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            with patch(module + "check_invocation_context", return_value=(True, "ok")), \
+                    patch(module + "create_staging_directory", side_effect=allocations), \
+                    patch(module + "_require_space",
+                          side_effect=[None, RuntimeError("second space check failed")]), \
+                    patch(module + "cleanup_staging_directory",
+                          side_effect=self._remove_test_stage):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+            self.assertEqual(
+                result["failure"]["capture_failure_kind"], "free_space_check")
+            self.assertTrue(all(item["passed"] for item in result["cleanup"]))
+            self.assertTrue(all(not stage.exists() for stage in stages))
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+
+            class ReplacedPhysical(dict):
+                def __getitem__(self, unused_key):
+                    raise RuntimeError("physical capture replaced /etc/private")
+
+            capture = SimpleNamespace(
+                configuration_physical=ReplacedPhysical(),
+                configuration_digest="b" * 64, database_digest="c" * 64,
+                media_logical_digest="d" * 64, close=Mock(),
+            )
+            with patch(module + "check_invocation_context", return_value=(True, "ok")), \
+                    patch(module + "create_staging_directory", side_effect=allocations), \
+                    patch(module + "_capture_shared_inputs", return_value=capture), \
+                    patch(module + "cleanup_staging_directory",
+                          side_effect=self._remove_test_stage):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+            self.assertEqual(
+                result["failure"]["capture_failure_kind"],
+                "capture_artifact_initialization")
+            capture.close.assert_called_once_with()
+            self.assertTrue(all(not stage.exists() for stage in stages))
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            capture = SimpleNamespace(
+                configuration_physical={"digest": "a" * 64},
+                configuration_digest="b" * 64, database_digest="c" * 64,
+                media_logical_digest="d" * 64, close=Mock(),
+            )
+            first = SimpleNamespace(request={"validation_context": {}})
+            with patch(module + "check_invocation_context", return_value=(True, "ok")), \
+                    patch(module + "create_staging_directory", side_effect=allocations), \
+                    patch(module + "_capture_shared_inputs", return_value=capture), \
+                    patch(module + "_finalize_prepared_single_run",
+                          side_effect=[first, RuntimeError("run two finalize failed")]), \
+                    patch(module + "cleanup_staging_directory",
+                          side_effect=self._remove_test_stage):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+            self.assertEqual(
+                result["failure"]["capture_failure_kind"],
+                "single_run_finalization")
+            capture.close.assert_called_once_with()
+            for lock in locks:
+                lock.close.assert_called_once_with()
+            self.assertTrue(all(not stage.exists() for stage in stages))
+
+    def test_path_invocation_allocation_and_context_call_sites_are_classified(self):
+        class BadPath:
+            def __fspath__(self):
+                raise RuntimeError("path failed")
+
+        with self.assertRaises(DualRunError) as raised:
+            _prepare_scope(BadPath(), BadPath(), BadPath(), {}, {}, "comparison")
+        self.assertEqual(raised.exception.capture_failure_kind, "source_path_resolution")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("station_director.dual_run.check_invocation_context",
+                       side_effect=RuntimeError("ancestry failed")):
+                with self.assertRaises(DualRunError) as raised:
+                    _prepare_scope(root, root, root, {}, {}, "comparison")
+            self.assertEqual(
+                raised.exception.capture_failure_kind, "invocation_verification")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch("station_director.dual_run.check_invocation_context",
+                       return_value=(True, "ok")), patch(
+                    "station_director.dual_run.create_staging_directory",
+                    side_effect=RuntimeError("allocation failed")):
+                with self.assertRaises(DualRunError) as raised:
+                    _prepare_scope(root, root, root, {}, {}, "comparison")
+            self.assertEqual(raised.exception.capture_failure_kind, "stage_allocation")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            capture = SimpleNamespace(
+                configuration_physical={"digest": "a" * 64},
+                configuration_digest="b" * 64, database_digest="c" * 64,
+                media_logical_digest="d" * 64, close=Mock(),
+            )
+            lifecycle = SimpleNamespace(request={})
+            with patch("station_director.dual_run.check_invocation_context",
+                       return_value=(True, "ok")), patch(
+                    "station_director.dual_run.create_staging_directory",
+                    side_effect=allocations), patch(
+                    "station_director.dual_run._capture_shared_inputs",
+                    return_value=capture), patch(
+                    "station_director.dual_run._finalize_prepared_single_run",
+                    return_value=lifecycle), patch(
+                    "station_director.dual_run.cleanup_staging_directory",
+                    side_effect=self._remove_test_stage):
+                with self.assertRaises(DualRunError) as raised:
+                    _prepare_scope(source, source, media, {}, {}, "comparison")
+            self.assertEqual(raised.exception.capture_failure_kind, "context_consistency")
+            capture.close.assert_called_once_with()
+            self.assertTrue(all(not stage.exists() for stage in stages))
+
+    def test_single_run_error_from_real_finalization_boundary_keeps_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            capture = SimpleNamespace(
+                configuration_physical={"digest": "a" * 64},
+                configuration_digest="b" * 64, database_digest="c" * 64,
+                media_logical_digest="d" * 64, close=Mock(),
+            )
+            with patch("station_director.dual_run.check_invocation_context",
+                       return_value=(True, "ok")), patch(
+                    "station_director.dual_run.create_staging_directory",
+                    side_effect=allocations), patch(
+                    "station_director.dual_run._capture_shared_inputs",
+                    return_value=capture), patch(
+                    "station_director.dual_run._finalize_prepared_single_run",
+                    side_effect=SingleRunError(
+                        "prepare", "duplicate_stage_file", "/tmp/private")), patch(
+                    "station_director.dual_run.cleanup_staging_directory",
+                    side_effect=self._remove_test_stage):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+            self.assertEqual(result["failure"]["code"], "duplicate_stage_file")
+            self.assertEqual(result["failure"]["phase"], "capture")
+            self.assertEqual(
+                result["failure"]["message"],
+                "A staged validation file already exists.")
+            self.assertNotIn("capture_failure_kind", result["failure"])
+            self.assertEqual([item["passed"] for item in result["cleanup"]],
+                             [True, True])
+            self.assertTrue(all(not stage.exists() for stage in stages))
+
+    def test_uncoded_real_finalization_call_site_is_classified_and_cleaned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            capture = SimpleNamespace(
+                configuration_physical={"digest": "a" * 64},
+                configuration_digest="b" * 64, database_digest="c" * 64,
+                media_logical_digest="d" * 64, close=Mock(),
+            )
+            with patch("station_director.dual_run.check_invocation_context",
+                       return_value=(True, "ok")), patch(
+                    "station_director.dual_run.create_staging_directory",
+                    side_effect=allocations), patch(
+                    "station_director.dual_run._capture_shared_inputs",
+                    return_value=capture), patch(
+                    "station_director.dual_run._finalize_prepared_single_run",
+                    side_effect=RuntimeError("password=hunter2 /etc/shadow")), patch(
+                    "station_director.dual_run.cleanup_staging_directory",
+                    side_effect=self._remove_test_stage):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+            self.assertEqual(result["failure"]["code"], "source_capture_failed")
+            self.assertEqual(
+                result["failure"]["capture_failure_kind"],
+                "single_run_finalization")
+            capture.close.assert_called_once_with()
+            for lock in locks:
+                lock.close.assert_called_once_with()
+            self.assertTrue(all(not stage.exists() for stage in stages))
+            self.assertNotIn("hunter2", json.dumps(result))
+            self.assertNotIn("/etc", json.dumps(result))
+
+    def test_post_preparation_context_failure_keeps_cleanup_owned(self):
+        class OneReadContext(dict):
+            reads = 0
+
+            def __getitem__(self, key):
+                if key == "validation_context":
+                    self.reads += 1
+                    if self.reads > 1:
+                        raise RuntimeError("context replaced /etc/private")
+                return super().__getitem__(key)
+
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            context = {
+                "input_fingerprint": "a" * 64, "requested_seed": None,
+                "effective_seed": 1, "reference_clock": "2026-01-01T00:00:00",
+                "start_time": "2026-01-01T00:00:00",
+                "end_time": "2026-01-02T00:00:00",
+                "timezone": "America/Los_Angeles",
+            }
+            capture = SimpleNamespace(
+                configuration_physical={"digest": "a" * 64},
+                configuration_digest="b" * 64, database_digest="c" * 64,
+                media_logical_digest="d" * 64, close=Mock(),
+            )
+            lifecycles = []
+
+            def finalize(unused_root, stage, lock, token, run_id,
+                         unused_proposal, unused_policy, **unused_kwargs):
+                request = OneReadContext(
+                    validation_context=context,
+                    affected_channels=[{"number": 2, "name": "Action"}],
+                ) if not lifecycles else {
+                    "validation_context": context,
+                    "affected_channels": [{"number": 2, "name": "Action"}],
+                }
+
+                def cleanup(stage=stage, lock=lock):
+                    lock.close()
+                    shutil.rmtree(stage)
+                    return {"passed": True, "detail": "cleaned"}
+
+                lifecycle = SimpleNamespace(
+                    request=request, stage=stage, run_id=run_id,
+                    cleanup=Mock(side_effect=cleanup),
+                )
+                lifecycles.append(lifecycle)
+                return lifecycle
+
+            with patch("station_director.dual_run.check_invocation_context",
+                       return_value=(True, "ok")), patch(
+                    "station_director.dual_run.create_staging_directory",
+                    side_effect=allocations), patch(
+                    "station_director.dual_run._capture_shared_inputs",
+                    return_value=capture), patch(
+                    "station_director.dual_run._finalize_prepared_single_run",
+                    side_effect=finalize), patch(
+                    "station_director.dual_run._assert_inputs_stable",
+                    return_value={"checkpoint": "before_success", "passed": True,
+                                  "changed_categories": []}):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+            self.assertEqual(result["failure"]["code"], "source_capture_failed")
+            self.assertEqual(
+                result["failure"]["capture_failure_kind"], "context_consistency")
+            self.assertEqual([item["passed"] for item in result["cleanup"]],
+                             [True, True])
+            for lifecycle in lifecycles:
+                lifecycle.cleanup.assert_called_once_with()
+            capture.close.assert_called_once_with()
+            self.assertTrue(all(not stage.exists() for stage in stages))
+
+    def test_manifest_close_failure_is_separate_from_classified_primary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            manifest = SimpleNamespace(
+                stream=io.BytesIO(b"manifest"),
+                close=Mock(side_effect=OSError("secret close failure /etc/shadow")),
+            )
+            with patch("station_director.dual_run.check_invocation_context",
+                       return_value=(True, "ok")), patch(
+                    "station_director.dual_run.create_staging_directory",
+                    side_effect=allocations), patch(
+                    "station_director.dual_run._require_space"), patch(
+                    "station_director.dual_run.capture_media_manifest",
+                    return_value=manifest), patch(
+                    "station_director.dual_run.logical_media_manifest_fingerprint",
+                    side_effect=RuntimeError("password=hunter2")), patch(
+                    "station_director.dual_run.cleanup_staging_directory",
+                    side_effect=self._remove_test_stage):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+            self.assertEqual(result["failure"]["code"], "source_capture_failed")
+            self.assertEqual(
+                result["failure"]["capture_failure_kind"],
+                "media_logical_fingerprint")
+            manifest.close.assert_called_once_with()
+            self.assertFalse(result["cleanup"][1]["passed"])
+            self.assertIn("capture_close_failed", result["cleanup"][1]["detail"])
+            self.assertNotIn("hunter2", json.dumps(result))
+            self.assertNotIn("/etc", json.dumps(result))
+            self.assertTrue(all(not stage.exists() for stage in stages))
+
+    def test_each_preparation_cleanup_failure_preserves_primary_and_attempts_all(self):
+        for failure_mode in (
+                "lock_close", "stage_inspection", "stage_removal", "quarantine"):
+            with self.subTest(failure_mode=failure_mode), \
+                    tempfile.TemporaryDirectory() as directory:
+                source, media, stages, locks, allocations = self._preparation_fixture(
+                    Path(directory))
+                if failure_mode == "lock_close":
+                    locks[1].close.side_effect = OSError("private lock path")
+                removal_calls = []
+                quarantine_calls = []
+
+                def remove(stage):
+                    removal_calls.append(stage)
+                    if failure_mode in {"stage_removal", "quarantine"} and stage == stages[1]:
+                        return False, "private removal failure"
+                    return self._remove_test_stage(stage)
+
+                from station_director import dual_run as dual_module
+                real_inspect = dual_module._preparation_stage_exists
+                real_quarantine = dual_module._quarantine_preparation_stage
+
+                def inspect(stage):
+                    if failure_mode == "stage_inspection" and stage == stages[1]:
+                        raise OSError("private inspection failure")
+                    return real_inspect(stage)
+
+                def quarantine(stage):
+                    quarantine_calls.append(stage)
+                    if failure_mode == "quarantine" and stage == stages[1]:
+                        return False
+                    return real_quarantine(stage)
+
+                with patch("station_director.dual_run.check_invocation_context",
+                           return_value=(True, "ok")), patch(
+                        "station_director.dual_run.create_staging_directory",
+                        side_effect=allocations), patch(
+                        "station_director.dual_run.fingerprint_json_files",
+                        side_effect=RuntimeError("password=hunter2 /var/private")), patch(
+                        "station_director.dual_run.cleanup_staging_directory",
+                        side_effect=remove), patch(
+                        "station_director.dual_run._preparation_stage_exists",
+                        side_effect=inspect), patch(
+                        "station_director.dual_run._quarantine_preparation_stage",
+                        side_effect=quarantine):
+                    result = run_dual_comparison(
+                        source, source, media, {}, {}, "comparison")
+
+                self.assertEqual(result["failure"]["code"], "source_capture_failed")
+                self.assertEqual(
+                    result["failure"]["capture_failure_kind"],
+                    "configuration_physical_fingerprint")
+                self.assertEqual([item["run"] for item in result["cleanup"]], [2, 1])
+                self.assertTrue(any(not item["passed"] for item in result["cleanup"]))
+                for lock in locks:
+                    lock.close.assert_called_once_with()
+                if failure_mode != "stage_inspection":
+                    self.assertEqual(set(removal_calls), set(stages))
+                else:
+                    self.assertIn(stages[0], removal_calls)
+                    self.assertIn(stages[1], quarantine_calls)
+                if failure_mode in {"stage_inspection", "stage_removal"}:
+                    self.assertTrue((stages[1] / ".quarantine").is_file())
+                    self.assertTrue(result["cleanup"][0]["quarantined"])
+                elif failure_mode == "quarantine":
+                    self.assertTrue(stages[1].is_dir())
+                    self.assertFalse(result["cleanup"][0]["quarantined"])
+                    self.assertIn(
+                        "stage_quarantine_failed", result["cleanup"][0]["detail"])
+                else:
+                    self.assertTrue(all(not stage.exists() for stage in stages))
+                encoded = json.dumps(result, sort_keys=True)
+                self.assertNotIn("hunter2", encoded)
+                self.assertNotIn("/var", encoded)
+
+    def test_multiple_cleanup_failures_do_not_short_circuit_or_erase_primary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            for lock in locks:
+                lock.close.side_effect = OSError("private lock failure")
+            inspection_calls = []
+            removal_calls = []
+            quarantine_calls = []
+
+            def inspect(stage):
+                inspection_calls.append(stage)
+                if stage == stages[1]:
+                    raise OSError("private inspection failure")
+                return True
+
+            def remove(stage):
+                removal_calls.append(stage)
+                return False, "private removal failure"
+
+            def quarantine(stage):
+                quarantine_calls.append(stage)
+                if stage == stages[1]:
+                    return False
+                return True
+
+            with patch("station_director.dual_run.check_invocation_context",
+                       return_value=(True, "ok")), patch(
+                    "station_director.dual_run.create_staging_directory",
+                    side_effect=allocations), patch(
+                    "station_director.dual_run.fingerprint_json_files",
+                    side_effect=RuntimeError("password=hunter2 /var/private")), patch(
+                    "station_director.dual_run.cleanup_staging_directory",
+                    side_effect=remove), patch(
+                    "station_director.dual_run._preparation_stage_exists",
+                    side_effect=inspect), patch(
+                    "station_director.dual_run._quarantine_preparation_stage",
+                    side_effect=quarantine):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+
+            self.assertEqual(result["failure"]["code"], "source_capture_failed")
+            self.assertEqual(
+                result["failure"]["capture_failure_kind"],
+                "configuration_physical_fingerprint")
+            for lock in locks:
+                lock.close.assert_called_once_with()
+            self.assertEqual(set(inspection_calls), set(stages))
+            self.assertEqual(removal_calls, [stages[0]])
+            self.assertEqual(set(quarantine_calls), set(stages))
+            self.assertEqual([item["passed"] for item in result["cleanup"]],
+                             [False, False])
+            self.assertIn("stage_quarantine_failed",
+                          result["cleanup"][0]["detail"])
+            self.assertTrue(result["cleanup"][1]["quarantined"])
+            self.assertTrue(all(stage.exists() for stage in stages))
+            encoded = json.dumps(result, sort_keys=True)
+            self.assertNotIn("hunter2", encoded)
+            self.assertNotIn("/var", encoded)
+
+    def test_second_stage_allocation_failure_cleans_first_stage_and_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, media, stages, locks, allocations = self._preparation_fixture(
+                Path(directory))
+            shutil.rmtree(stages[1])
+            allocations = [allocations[0], RuntimeError("second allocation failed")]
+            with patch("station_director.dual_run.check_invocation_context",
+                       return_value=(True, "ok")), patch(
+                    "station_director.dual_run.create_staging_directory",
+                    side_effect=allocations), patch(
+                    "station_director.dual_run.cleanup_staging_directory",
+                    side_effect=self._remove_test_stage):
+                result = run_dual_comparison(
+                    source, source, media, {}, {}, "comparison")
+            self.assertEqual(
+                result["failure"]["capture_failure_kind"], "stage_allocation")
+            locks[0].close.assert_called_once_with()
+            self.assertFalse(stages[0].exists())
+            self.assertEqual(result["cleanup"], [
+                {"run": 1, "passed": True, "quarantined": False,
+                 "detail": "cleaned"},
+            ])
+
+    def test_c2_result_carries_kind_without_hostile_capture_detail(self):
+        for kind in sorted(CAPTURE_FAILURE_KINDS):
+            with self.subTest(kind=kind):
+                with self.assertRaises(DualRunError) as raised:
+                    _capture_step(kind, Mock(side_effect=RuntimeError(
+                        "password=hunter2 /etc/shadow SECRET_TOKEN=value")))
+                classified = raised.exception
+                with patch("station_director.dual_run._prepare_scope",
+                           side_effect=classified):
+                    result = run_dual_comparison(
+                        Path("synthetic"), Path("synthetic"), Path("synthetic"),
+                        {}, {}, "comparison")
+                self.assertEqual(result["failure"], {
+                    "phase": "capture", "code": "source_capture_failed",
+                    "category": None, "message": "Source capture failed.",
+                    "capture_failure_kind": kind,
+                })
+                encoded = json.dumps(result, sort_keys=True)
+                self.assertNotIn("hunter2", encoded)
+                self.assertNotIn("/etc", encoded)
+                self.assertNotIn("SECRET_TOKEN", encoded)
+
+    def test_c2_preserves_an_existing_explicit_capture_error_code(self):
+        explicit = DualRunError("capture", "backup_mismatch", "fixed")
+        with patch("station_director.dual_run._prepare_scope", side_effect=explicit):
+            result = run_dual_comparison(
+                Path("synthetic"), Path("synthetic"), Path("synthetic"),
+                {}, {}, "comparison")
+        self.assertEqual(result["failure"]["code"], "backup_mismatch")
+        self.assertNotIn("capture_failure_kind", result["failure"])
+
+    def test_c2_schema_rejects_unclassified_or_misclassified_capture_failure(self):
+        from station_director.dual_run import RESULT_SCHEMA
+        from station_director.single_run_protocol import validate_document
+
+        result = {
+            "schema_version": 1, "operation": "native_dual_run_comparison",
+            "comparison_id": "comparison", "status": "failed",
+            "phase_reached": "capture",
+            "scheduler_invoked": {"run_1": False, "run_2": False},
+            "validation_context": {}, "affected_channels": [],
+            "source_checks": [], "runs": [], "reproducibility": None,
+            "baseline_comparison": None, "cleanup": [],
+            "timings_ms": {"total": 0},
+            "failure": {"phase": "capture", "code": "source_capture_failed",
+                        "category": None, "message": "Source capture failed."},
+        }
+        with self.assertRaises(Exception):
+            validate_document(result, RESULT_SCHEMA)
+        result["failure"]["capture_failure_kind"] = "unknown"
+        with self.assertRaises(Exception):
+            validate_document(result, RESULT_SCHEMA)
+        result["failure"] = {
+            "phase": "capture", "code": "backup_mismatch", "category": None,
+            "message": "fixed", "capture_failure_kind": "database_snapshot",
+        }
+        with self.assertRaises(Exception):
+            validate_document(result, RESULT_SCHEMA)
+
     def test_two_backups_are_verified_from_one_pinned_view(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

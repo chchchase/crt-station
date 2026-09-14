@@ -21,6 +21,16 @@ LOCK_NAME = ".schedule-validation.lock"
 LOCK_WAIT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.05
 STALE_SCAN_LIMIT = 10_000
+CAPTURE_FAILURE_KINDS = frozenset({
+    "source_path_resolution", "invocation_verification", "stage_allocation",
+    "configuration_inventory", "configuration_physical_fingerprint",
+    "configuration_logical_fingerprint", "configuration_snapshot",
+    "free_space_check", "stage_source_publication", "database_snapshot",
+    "database_backup_verification", "media_manifest_capture",
+    "media_logical_fingerprint", "post_capture_stability",
+    "capture_artifact_initialization", "single_run_finalization",
+    "context_consistency",
+})
 
 
 class CoordinatorError(RuntimeError):
@@ -47,6 +57,7 @@ class CoordinatorOutcome:
     validation_status: str | None = None
     phase: str | None = None
     failure_code: str | None = None
+    capture_failure_kind: str | None = None
     scheduler_invoked: tuple = (False, False)
     report_published: bool = False
     report_durable: bool = False
@@ -66,6 +77,7 @@ class CoordinatorOutcome:
         if self.state == "disabled" and any((
                 self.proposal_id, self.run_id, self.validation_status, self.phase,
                 self.failure_code, self.scheduler_invoked != (False, False),
+                self.capture_failure_kind,
                 self.report_published, self.report_durable, self.publication_code,
                 self.latest_status, self.latest_code, self.affected_channels,
                 self.changed_channels, self.cleanup_passed is not None,
@@ -88,6 +100,11 @@ class CoordinatorOutcome:
                       "invalid_proposal_id", "validation_lock_busy",
                       "validation_lock_unsafe", "proposal_rejected",
                       "policy_rejected", "source_capture_failed",
+                      "duplicate_stage_file", "source_changed",
+                      "backup_mismatch", "context_mismatch",
+                      "insufficient_space", "invalid_comparison_id",
+                      "oversized_config", "source_root_mismatch",
+                      "unsafe_source",
                       "c1_run_failed", "normalization_failed",
                       "comparison_failed", "reproducibility_mismatch",
                       "guide_reproducibility_mismatch",
@@ -109,6 +126,12 @@ class CoordinatorOutcome:
                       "invalid_report_input"}
         if self.failure_code not in safe_codes:
             raise ValueError("unsafe coordinator failure code")
+        if ((self.failure_code == "source_capture_failed")
+                != (self.capture_failure_kind in CAPTURE_FAILURE_KINDS)):
+            raise ValueError("source capture outcome lacks a classified kind")
+        if (self.capture_failure_kind is not None
+                and self.capture_failure_kind not in CAPTURE_FAILURE_KINDS):
+            raise ValueError("unsafe capture failure kind")
         if self.state in {"failed", "interrupted"} and self.failure_code is None:
             raise ValueError("failed outcome lacks failure code")
         if self.state == "interrupted" and self.failure_code != "validation_interrupted":
@@ -303,7 +326,8 @@ def _recover_stale_stages(isolation):
                 raise CoordinatorError("stale_stage_cleanup_failed", "capture")
 
 
-def _minimal_c2_failure(run_id, code, phase="capture", source=None):
+def _minimal_c2_failure(run_id, code, phase="capture", source=None, *,
+                        capture_failure_kind=None):
     from station_director.dual_run import _base_result
     from station_director.single_run_protocol import validate_document
     from station_director.dual_run import RESULT_SCHEMA
@@ -319,10 +343,19 @@ def _minimal_c2_failure(run_id, code, phase="capture", source=None):
         "capture", "run_1", "run_2", "normalization", "comparison",
         "baseline_comparison", "cleanup", "before_success",
     ) else "capture"
+    if code == "source_capture_failed":
+        if capture_failure_kind not in CAPTURE_FAILURE_KINDS:
+            raise ValueError("source capture failure requires a precise kind")
+    elif capture_failure_kind is not None:
+        raise ValueError("capture failure kind is only valid for source capture")
     result["failure"] = {
         "phase": result["phase_reached"], "code": code,
-        "category": None, "message": "validation failed",
+        "category": None,
+        "message": ("Source capture failed." if code == "source_capture_failed"
+                    else "validation failed"),
     }
+    if capture_failure_kind is not None:
+        result["failure"]["capture_failure_kind"] = capture_failure_kind
     validate_document(result, RESULT_SCHEMA)
     return result
 
@@ -367,6 +400,8 @@ def _outcome_from_result(proposal_id, run_id, result, publication=None,
         phase=("report" if publication_error is not None
                else result.get("phase_reached")),
         failure_code=failure_code, scheduler_invoked=scheduler_tuple,
+        capture_failure_kind=(failure.get("capture_failure_kind")
+                              if failure_code == "source_capture_failed" else None),
         report_published=published, report_durable=durable,
         publication_code=publication_code,
         latest_status=latest.get("status"), latest_code=latest.get("code"),
@@ -385,6 +420,9 @@ def _outcome_without_report(proposal_id, run_id, result, code):
         proposal_id=proposal_id, run_id=run_id,
         validation_status=(result or {}).get("status"), phase="report",
         failure_code=code,
+        capture_failure_kind=(
+            ((result or {}).get("failure") or {}).get("capture_failure_kind")
+            if code == "source_capture_failed" else None),
         scheduler_invoked=(bool(schedulers.get("run_1")),
                            bool(schedulers.get("run_2"))),
         cleanup_passed=(all(item.get("passed") for item in cleanup)
@@ -515,6 +553,8 @@ def render_cli_outcome(outcome):
             lines.append(f"Phase: {outcome.phase}")
         if outcome.failure_code is not None:
             lines.append(f"Failure: {outcome.failure_code}")
+        if outcome.capture_failure_kind is not None:
+            lines.append(f"Capture failure kind: {outcome.capture_failure_kind}")
         if outcome.run_id is not None:
             lines.append(f"Run: {outcome.run_id}")
         if outcome.report_durable:

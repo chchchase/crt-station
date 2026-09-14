@@ -57,13 +57,35 @@ PER_RUN_TIMEOUT_SECONDS = 30 * 60
 TOTAL_TIMEOUT_SECONDS = 75 * 60
 RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v1.schema.json"
 
+CAPTURE_FAILURE_KINDS = frozenset({
+    "source_path_resolution", "invocation_verification", "stage_allocation",
+    "configuration_inventory", "configuration_physical_fingerprint",
+    "configuration_logical_fingerprint", "configuration_snapshot",
+    "free_space_check", "stage_source_publication", "database_snapshot",
+    "database_backup_verification", "media_manifest_capture",
+    "media_logical_fingerprint", "post_capture_stability",
+    "capture_artifact_initialization", "single_run_finalization",
+    "context_consistency",
+})
+SOURCE_CAPTURE_FAILURE_MESSAGE = "Source capture failed."
+SINGLE_RUN_CAPTURE_MESSAGES = {
+    "duplicate_stage_file": "A staged validation file already exists.",
+    "source_changed": "A staged scheduling input changed during preparation.",
+}
+
 
 class DualRunError(RuntimeError):
-    def __init__(self, phase, code, message, *, category=None):
+    def __init__(self, phase, code, message, *, category=None,
+                 capture_failure_kind=None):
         super().__init__(message)
         self.phase = phase
         self.code = code
         self.category = category
+        if capture_failure_kind is not None and capture_failure_kind not in CAPTURE_FAILURE_KINDS:
+            raise ValueError("invalid capture failure kind")
+        if (code == "source_capture_failed") != (capture_failure_kind is not None):
+            raise ValueError("source capture failures require exactly one classified kind")
+        self.capture_failure_kind = capture_failure_kind
 
 
 def _raise_if_cancelled(exc):
@@ -78,6 +100,22 @@ def _bounded_detail(value, *private_paths):
             text = text.replace(str(path), "<private-path>")
     text = re.sub(r"/tmp/fs42-i-[0-9a-f]{12}", "<stage>", text)
     return text[:1000]
+
+
+def _capture_step(kind, operation):
+    """Run one capture subphase and classify only otherwise-uncoded failures."""
+    if kind not in CAPTURE_FAILURE_KINDS:
+        raise ValueError("invalid capture failure kind")
+    try:
+        return operation()
+    except (DualRunError, SingleRunError):
+        raise
+    except Exception as exc:
+        _raise_if_cancelled(exc)
+        raise DualRunError(
+            "capture", "source_capture_failed", SOURCE_CAPTURE_FAILURE_MESSAGE,
+            capture_failure_kind=kind,
+        ) from exc
 
 
 @dataclass
@@ -242,37 +280,92 @@ def _require_space(required):
 
 
 def _capture_shared_inputs(source_root, media_root, stages):
-    config_paths = protected_json_paths(source_root)
-    physical_before = fingerprint_json_files(config_paths)
-    logical_before = logical_protected_configuration_fingerprint(config_paths)
-    configuration_bytes = _captured_configuration_bytes(source_root)
-    config_size = sum(len(raw) for raw in configuration_bytes.values())
-    source_database = Path(source_root) / "runtime/fs42_fluid.db"
-    _require_space(_space_requirement(source_database, config_size))
-    targets = _publish_sources(stages, configuration_bytes)
-    database = fingerprint_and_clone_database_targets(source_database, targets)
-    for target in targets:
-        os.chmod(target, 0o600)
-    for backup in database["backups"]:
-        if backup["logical"]["digest"] != database["logical"]["digest"]:
-            raise DualRunError("capture", "backup_mismatch", "database backups differ from pinned source")
-    manifest = capture_media_manifest(media_root, spool_directory=stages[0])
+    config_paths = _capture_step(
+        "configuration_inventory", lambda: protected_json_paths(source_root))
+    physical_before = _capture_step(
+        "configuration_physical_fingerprint",
+        lambda: fingerprint_json_files(config_paths),
+    )
+    logical_before = _capture_step(
+        "configuration_logical_fingerprint",
+        lambda: logical_protected_configuration_fingerprint(config_paths),
+    )
+    configuration_bytes = _capture_step(
+        "configuration_snapshot", lambda: _captured_configuration_bytes(source_root))
+    config_size, source_database = _capture_step(
+        "configuration_snapshot",
+        lambda: (sum(len(raw) for raw in configuration_bytes.values()),
+                 Path(source_root) / "runtime/fs42_fluid.db"),
+    )
+    _capture_step(
+        "free_space_check",
+        lambda: _require_space(_space_requirement(source_database, config_size)),
+    )
+    targets = _capture_step(
+        "stage_source_publication",
+        lambda: _publish_sources(stages, configuration_bytes),
+    )
+    database = _capture_step(
+        "database_snapshot",
+        lambda: fingerprint_and_clone_database_targets(source_database, targets),
+    )
+
+    def verify_database_backups():
+        for target in targets:
+            os.chmod(target, 0o600)
+        for backup in database["backups"]:
+            if backup["logical"]["digest"] != database["logical"]["digest"]:
+                raise DualRunError(
+                    "capture", "backup_mismatch",
+                    "database backups differ from pinned source",
+                )
+
+    _capture_step("database_backup_verification", verify_database_backups)
+    manifest = _capture_step(
+        "media_manifest_capture",
+        lambda: capture_media_manifest(media_root, spool_directory=stages[0]),
+    )
     try:
-        logical_media = logical_media_manifest_fingerprint(manifest)
-        manifest_position = manifest.stream.tell()
-        manifest.stream.seek(0, os.SEEK_END)
-        manifest_size = manifest.stream.tell()
-        manifest.stream.seek(manifest_position)
-        required = _space_requirement(source_database, config_size, manifest_size)
-        _require_space(required)
-        capture = SharedCapture(
-            logical_before["digest"], database["logical"]["digest"],
-            logical_media["digest"], physical_before, database, manifest,
-            logical_media, required, Path(stages[0]),
+        logical_media = _capture_step(
+            "media_logical_fingerprint",
+            lambda: logical_media_manifest_fingerprint(manifest),
         )
-        _assert_inputs_stable(source_root, media_root, capture, "after_capture")
-    except BaseException:
-        manifest.close()
+
+        def check_final_space():
+            manifest_position = manifest.stream.tell()
+            manifest.stream.seek(0, os.SEEK_END)
+            manifest_size = manifest.stream.tell()
+            manifest.stream.seek(manifest_position)
+            required_bytes = _space_requirement(
+                source_database, config_size, manifest_size)
+            _require_space(required_bytes)
+            return required_bytes
+
+        required = _capture_step("free_space_check", check_final_space)
+        capture = _capture_step(
+            "capture_artifact_initialization",
+            lambda: SharedCapture(
+                logical_before["digest"], database["logical"]["digest"],
+                logical_media["digest"], physical_before, database, manifest,
+                logical_media, required, Path(stages[0]),
+            ),
+        )
+        _capture_step(
+            "post_capture_stability",
+            lambda: _assert_inputs_stable(
+                source_root, media_root, capture, "after_capture"),
+        )
+    except BaseException as primary:
+        try:
+            manifest.close()
+        except BaseException:
+            # Preparation owns the staged directories. Preserve the primary
+            # capture failure and let its cleanup accounting record this
+            # separate close failure.
+            try:
+                primary._manifest_close_failed = True
+            except Exception:
+                pass
         raise
     return capture
 
@@ -353,65 +446,156 @@ def _assert_inputs_stable(source_root, media_root, capture, checkpoint):
     return {"checkpoint": checkpoint, "passed": True, "changed_categories": []}
 
 
+def _preparation_stage_exists(stage):
+    try:
+        info = Path(stage).lstat()
+    except FileNotFoundError:
+        return False
+    if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid()):
+        raise OSError("unsafe staged directory identity")
+    return True
+
+
+def _quarantine_preparation_stage(stage):
+    descriptor = os.open(
+        stage, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            return False
+        marker = os.open(
+            ".quarantine", os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=descriptor)
+        os.close(marker)
+        return True
+    except FileExistsError:
+        try:
+            marker_info = os.stat(
+                ".quarantine", dir_fd=descriptor, follow_symlinks=False)
+        except OSError:
+            return False
+        return (stat.S_ISREG(marker_info.st_mode) and marker_info.st_nlink == 1
+                and marker_info.st_uid == os.getuid()
+                and stat.S_IMODE(marker_info.st_mode) == 0o600)
+    except OSError:
+        return False
+    finally:
+        os.close(descriptor)
+
+
+def _cleanup_failed_preparation(created, capture, primary):
+    """Attempt every safe cleanup and return bounded per-run status."""
+    manifest_close_failed = bool(
+        getattr(primary, "_manifest_close_failed", False))
+    if capture is not None:
+        try:
+            capture.close()
+        except BaseException:
+            manifest_close_failed = True
+
+    results = []
+    for index, (unused_token, stage, lock) in reversed(
+            list(enumerate(created, 1))):
+        failures = []
+        if index == 1 and manifest_close_failed:
+            failures.append("capture_close_failed")
+        try:
+            lock.close()
+        except BaseException:
+            failures.append("lock_close_failed")
+
+        stage_present = True
+        try:
+            stage_present = _preparation_stage_exists(stage)
+        except BaseException:
+            failures.append("stage_inspection_failed")
+
+        if stage_present and "stage_inspection_failed" not in failures:
+            try:
+                cleaned, unused_detail = cleanup_staging_directory(stage)
+            except BaseException:
+                cleaned = False
+            if not cleaned:
+                failures.append("stage_removal_failed")
+            else:
+                stage_present = False
+
+        quarantined = False
+        if stage_present:
+            try:
+                quarantined = _quarantine_preparation_stage(stage)
+            except BaseException:
+                quarantined = False
+            if not quarantined:
+                failures.append("stage_quarantine_failed")
+
+        results.append({
+            "run": index,
+            "passed": not failures,
+            "quarantined": quarantined,
+            "detail": "cleaned" if not failures else ",".join(failures),
+        })
+    return results
+
+
 def _prepare_scope(project_root, source_root, media_root, proposal, policy, comparison_id):
     if not COMPARISON_ID_RE.fullmatch(comparison_id):
         raise DualRunError("capture", "invalid_comparison_id", "invalid comparison ID")
-    project_root = Path(project_root).resolve()
-    source_root = Path(source_root).resolve()
+    project_root, source_root, media_root = _capture_step(
+        "source_path_resolution",
+        lambda: (Path(project_root).resolve(), Path(source_root).resolve(),
+                 Path(media_root).resolve()),
+    )
     if project_root != source_root:
         raise DualRunError("capture", "source_root_mismatch", "source root must be project root")
-    allowed, detail = check_invocation_context()
+    allowed, detail = _capture_step(
+        "invocation_verification", check_invocation_context)
     if not allowed:
         raise DualRunError("capture", "invocation_context_rejected", detail)
     created = []
     capture = None
     try:
         for unused in range(2):
-            token, stage, lock = create_staging_directory()
+            token, stage, lock = _capture_step(
+                "stage_allocation", create_staging_directory)
             created.append((token, stage, lock))
         capture = _capture_shared_inputs(
-            source_root, Path(media_root).resolve(), [item[1] for item in created]
+            source_root, media_root, [item[1] for item in created]
         )
-        physical_live = capture.configuration_physical["digest"]
+        physical_live = _capture_step(
+            "capture_artifact_initialization",
+            lambda: capture.configuration_physical["digest"],
+        )
         lifecycles = []
         for index, (token, stage, lock) in enumerate(created, 1):
-            lifecycle = _finalize_prepared_single_run(
-                project_root, stage, lock, token,
-                f"{comparison_id}.run-{index}", proposal, policy,
-                configuration_digest=capture.configuration_digest,
-                database_digest=capture.database_digest,
-                media_digest=capture.media_logical_digest,
-                live_physical_digest=physical_live,
+            lifecycle = _capture_step(
+                "single_run_finalization",
+                lambda index=index, token=token, stage=stage, lock=lock:
+                _finalize_prepared_single_run(
+                    project_root, stage, lock, token,
+                    f"{comparison_id}.run-{index}", proposal, policy,
+                    configuration_digest=capture.configuration_digest,
+                    database_digest=capture.database_digest,
+                    media_digest=capture.media_logical_digest,
+                    live_physical_digest=physical_live,
+                ),
             )
             lifecycles.append(lifecycle)
-        contexts = [item.request["validation_context"] for item in lifecycles]
-        if contexts[0] != contexts[1]:
-            raise DualRunError("capture", "context_mismatch", "run contexts differ")
+
+        def verify_contexts():
+            contexts = [item.request["validation_context"] for item in lifecycles]
+            if contexts[0] != contexts[1]:
+                raise DualRunError("capture", "context_mismatch", "run contexts differ")
+
+        _capture_step("context_consistency", verify_contexts)
         return DualRunScope(lifecycles, capture, [])
     except BaseException as primary:
-        cleanup_failures = []
-        if capture is not None:
-            try:
-                capture.close()
-            except Exception as exc:
-                cleanup_failures.append(f"shared capture: {exc}")
-        for unused_token, stage, lock in reversed(created):
-            lock.close()
-            if stage.exists():
-                cleaned, detail = cleanup_staging_directory(stage)
-                if not cleaned:
-                    cleanup_failures.append(
-                        "staged run: " + _bounded_detail(detail, stage)
-                    )
-        if cleanup_failures:
-            raise DualRunError(
-                "cleanup", "cleanup_failed",
-                _bounded_detail(
-                    f"preparation failed ({type(primary).__name__}); cleanup failed: "
-                    + "; ".join(cleanup_failures),
-                    *(item[1] for item in created),
-                ),
-            ) from primary
+        cleanup_results = _cleanup_failed_preparation(created, capture, primary)
+        try:
+            primary.preparation_cleanup = cleanup_results
+        except Exception:
+            pass
         raise
 
 
@@ -494,12 +678,15 @@ def run_dual_comparison(
         scope = _prepare_scope(
             project_root, source_root, media_root, proposal, policy, comparison_id
         )
-        result["validation_context"] = {
-            key: scope.lifecycles[0].request["validation_context"][key]
-            for key in ("input_fingerprint", "requested_seed", "effective_seed",
-                        "reference_clock", "start_time", "end_time", "timezone")
-        }
-        result["affected_channels"] = scope.lifecycles[0].request["affected_channels"]
+        def copy_verified_context():
+            result["validation_context"] = {
+                key: scope.lifecycles[0].request["validation_context"][key]
+                for key in ("input_fingerprint", "requested_seed", "effective_seed",
+                            "reference_clock", "start_time", "end_time", "timezone")
+            }
+            result["affected_channels"] = scope.lifecycles[0].request["affected_channels"]
+
+        _capture_step("context_consistency", copy_verified_context)
         result["source_checks"].append(
             {"checkpoint": "after_capture", "passed": True, "changed_categories": []}
         )
@@ -523,8 +710,10 @@ def run_dual_comparison(
                 raise DualRunError(
                     f"run_{index}", "c1_run_failed",
                     f"C1 run {index} failed ({type(exc).__name__})",
-                    category=(getattr(exc, "category", None)
-                              or getattr(exc, "code", None)),
+                    category=((exc.category or exc.code)
+                              if isinstance(exc, DualRunError)
+                              else exc.code if isinstance(exc, SingleRunError)
+                              else None),
                 ) from exc
             result["scheduler_invoked"][f"run_{index}"] = response["scheduler_invoked"]
             if response["status"] != "success":
@@ -647,9 +836,19 @@ def run_dual_comparison(
         comparison_succeeded = True
     except BaseException as exc:
         result["status"] = "failed"
-        result["phase_reached"] = getattr(exc, "phase", result["phase_reached"])
+        validated_error = isinstance(exc, (DualRunError, SingleRunError))
+        exception_phase = (exc.phase if validated_error
+                           else result["phase_reached"])
+        # C1 preparation errors retain their validated code, while the C2
+        # lifecycle still records that they occurred during source capture.
+        if isinstance(exc, SingleRunError) and result["phase_reached"] == "capture":
+            exception_phase = "capture"
+        result["phase_reached"] = exception_phase
         fallback_code = {
-            "capture": "source_capture_failed",
+            # Every expected capture operation has an explicit _capture_step.
+            # Anything else is a programming failure, never an unclassified
+            # source-capture result.
+            "capture": "internal_error",
             "run_1": "c1_run_failed",
             "run_2": "c1_run_failed",
             "normalization": "normalization_failed",
@@ -657,17 +856,31 @@ def run_dual_comparison(
             "baseline_comparison": "baseline_comparison_failed",
             "cleanup": "cleanup_failed",
         }.get(result["phase_reached"], "comparison_failed")
-        code = ("validation_interrupted" if isinstance(exc, KeyboardInterrupt)
-                or getattr(exc, "is_validation_cancellation", False)
-                else getattr(exc, "code", fallback_code))
+        interrupted = (isinstance(exc, KeyboardInterrupt)
+                       or getattr(exc, "is_validation_cancellation", False))
+        code = ("validation_interrupted" if interrupted else
+                exc.code if validated_error else fallback_code)
         if code == "cleanup_failure":
             code = "cleanup_failed"
+        capture_failure_kind = getattr(exc, "capture_failure_kind", None)
+        safe_message = (
+            SINGLE_RUN_CAPTURE_MESSAGES.get(code, "Native preparation failed.")
+            if isinstance(exc, SingleRunError) and result["phase_reached"] == "capture"
+            else _bounded_detail(exc, project_root, source_root, media_root)
+        )
         result["failure"] = {
             "phase": result["phase_reached"],
             "code": code,
-            "category": getattr(exc, "category", None),
-            "message": _bounded_detail(exc, project_root, source_root, media_root),
+            "category": (exc.category if isinstance(exc, DualRunError) else None),
+            "message": (SOURCE_CAPTURE_FAILURE_MESSAGE
+                        if code == "source_capture_failed" else
+                        safe_message),
         }
+        if capture_failure_kind is not None:
+            result["failure"]["capture_failure_kind"] = capture_failure_kind
+        preparation_cleanup = getattr(exc, "preparation_cleanup", None)
+        if preparation_cleanup is not None:
+            result["cleanup"] = preparation_cleanup
     finally:
         if scope is not None:
             try:

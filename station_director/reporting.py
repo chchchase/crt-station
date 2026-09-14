@@ -24,7 +24,10 @@ from station_director.single_run_protocol import strict_json_loads, validate_doc
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VALIDATIONS_ROOT = PROJECT_ROOT / "runtime/director/validations"
-REPORT_SCHEMA = Path(__file__).with_name("schemas") / "validation-report.v1.schema.json"
+REPORT_SCHEMA_V1 = Path(__file__).with_name("schemas") / "validation-report.v1.schema.json"
+REPORT_SCHEMA_V2 = Path(__file__).with_name("schemas") / "validation-report.v2.schema.json"
+# New reports always use v2. The v1 path remains frozen for retained reports.
+REPORT_SCHEMA = REPORT_SCHEMA_V2
 LATEST_SCHEMA = Path(__file__).with_name("schemas") / "latest-validation-pointer.v1.schema.json"
 DUAL_RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v1.schema.json"
 PROPOSAL_ID_RE = re.compile(r"p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}\Z")
@@ -47,6 +50,15 @@ DIAGNOSTIC_TEMPLATES = {
     "proposal_created_gap": "The proposed schedule introduces a coverage gap.",
     "proposal_created_overlap": "The proposed schedule introduces overlapping blocks.",
     "source_capture_failed": "Source capture failed.",
+    "duplicate_stage_file": "A staged validation file already exists.",
+    "source_changed": "A staged scheduling input changed during preparation.",
+    "backup_mismatch": "A staged database backup differs from its pinned source.",
+    "context_mismatch": "Independent scheduling contexts differ.",
+    "insufficient_space": "Insufficient private staging space is available.",
+    "invalid_comparison_id": "The internal comparison identity is invalid.",
+    "oversized_config": "Protected configuration exceeds its safety limit.",
+    "source_root_mismatch": "The protected source root is not canonical.",
+    "unsafe_source": "A protected source object is unsafe.",
     "c1_run_failed": "An isolated native scheduling run failed.",
     "normalization_failed": "Schedule normalization failed.",
     "comparison_failed": "Structural reproducibility comparison failed.",
@@ -67,6 +79,16 @@ DIAGNOSTIC_TEMPLATES = {
     "internal_error": "An internal validation error occurred.",
     "internal_warning": "A validation warning occurred.",
 }
+CAPTURE_FAILURE_KINDS = frozenset({
+    "source_path_resolution", "invocation_verification", "stage_allocation",
+    "configuration_inventory", "configuration_physical_fingerprint",
+    "configuration_logical_fingerprint", "configuration_snapshot",
+    "free_space_check", "stage_source_publication", "database_snapshot",
+    "database_backup_verification", "media_manifest_capture",
+    "media_logical_fingerprint", "post_capture_stability",
+    "capture_artifact_initialization", "single_run_finalization",
+    "context_consistency",
+})
 SAFE_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,99}\Z")
 SAFE_EXCEPTION_CLASSES = {
     "DualRunError", "SingleRunError", "ProtocolError", "NormalizationError",
@@ -133,6 +155,20 @@ def _safe_identifier(value):
     return value if SAFE_IDENTIFIER_RE.fullmatch(value) else None
 
 
+def validate_report_document(report, *, retained=False):
+    """Validate a new v2 report or a retained immutable v1/v2 report."""
+    if not isinstance(report, dict):
+        raise ReportError("invalid_report", "validation report must be an object")
+    version = report.get("schema_version")
+    if version == 2:
+        schema = REPORT_SCHEMA_V2
+    elif retained and version == 1:
+        schema = REPORT_SCHEMA_V1
+    else:
+        raise ReportError("invalid_report_version", "unsupported validation report version")
+    validate_document(report, schema)
+
+
 def _structured_finding(value, default_code, default_phase):
     """Project an untrusted diagnostic without retaining its free text."""
     value = value if isinstance(value, dict) else {}
@@ -153,15 +189,32 @@ def _structured_finding(value, default_code, default_phase):
     exception_class = _safe_identifier(value.get("exception_class") or value.get("category"))
     if exception_class not in SAFE_EXCEPTION_CLASSES:
         exception_class = None
-    return {
+    capture_failure_kind = _safe_identifier(value.get("capture_failure_kind"))
+    if code == "source_capture_failed":
+        if capture_failure_kind not in CAPTURE_FAILURE_KINDS:
+            raise ReportError(
+                "invalid_report_input", "source capture failure lacks a classified kind")
+        channel = None
+        count = None
+        exception_class = None
+    else:
+        capture_failure_kind = None
+    finding = {
         "code": code,
         "phase": phase,
         "template": DIAGNOSTIC_TEMPLATES[code],
         "channel": channel,
         "count": count,
         "exception_class": exception_class,
-        "diagnostic_digest": _diagnostic_digest(value),
+        "capture_failure_kind": capture_failure_kind,
     }
+    digest_input = ({
+        "code": finding["code"], "phase": finding["phase"],
+        "capture_failure_kind": finding["capture_failure_kind"],
+        "template": finding["template"],
+    } if code == "source_capture_failed" else value)
+    finding["diagnostic_digest"] = _diagnostic_digest(digest_input)
+    return finding
 
 
 def _contains_unsafe_diagnostic(value):
@@ -300,9 +353,9 @@ def build_validation_report(proposal, c2_result, run_id, completed_at):
         "sequence_changes", "break_changes",
     )}
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "report_type": "station_director_validation",
-        "software": {"director_version": __version__, "report_schema_version": 1},
+        "software": {"director_version": __version__, "report_schema_version": 2},
         "proposal": {"id": proposal["proposal_id"], "schema_version": proposal["schema_version"],
                      "digest": hashlib.sha256(_canonical_json(proposal)).hexdigest()},
         "validation": {
@@ -367,7 +420,7 @@ def build_validation_report(proposal, c2_result, run_id, completed_at):
         "publication": {"immutable": "pending", "latest": "pending"},
     }
     _reject_unsafe_paths(report)
-    validate_document(report, REPORT_SCHEMA)
+    validate_report_document(report)
     raw = _canonical_json(report)
     if len(raw) > MAX_REPORT_JSON_BYTES:
         raise ReportError("report_too_large", "validation report exceeds size limit")
@@ -376,7 +429,7 @@ def build_validation_report(proposal, c2_result, run_id, completed_at):
 
 def render_validation_text(report):
     """Deterministically render only an already validated report object."""
-    validate_document(report, REPORT_SCHEMA)
+    validate_report_document(report)
     lines = [
         "Station Director validation",
         f"Run: {_safe_text(report['validation']['run_id'])}",
@@ -644,7 +697,7 @@ def _validate_pointer_target(parent_fd, pointer, proposal_id):
         _read_private_file(run_fd, "validation.txt", MAX_REPORT_TEXT_BYTES)
         try:
             report = strict_json_loads(raw)
-            validate_document(report, REPORT_SCHEMA)
+            validate_report_document(report, retained=True)
         except Exception as exc:
             raise ReportError("invalid_latest", "latest report is invalid") from exc
         if report["proposal"]["id"] != proposal_id or report["validation"]["run_id"] != run_id:
@@ -704,7 +757,7 @@ def _publish_latest(parent_fd, proposal_id, run_id, digest):
 
 def publish_validation_report(report):
     """Explicitly publish an immutable two-file report and optional latest pointer."""
-    validate_document(report, REPORT_SCHEMA)
+    validate_report_document(report)
     proposal_id = report["proposal"]["id"]
     run_id = report["validation"]["run_id"]
     if not PROPOSAL_ID_RE.fullmatch(proposal_id) or not RUN_ID_RE.fullmatch(run_id):

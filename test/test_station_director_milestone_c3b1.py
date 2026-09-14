@@ -431,12 +431,44 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertTrue((reports[0].parent / "latest.json").is_file())
 
     def test_validation_failure_stays_failed_with_durable_report(self):
-        result = self.coordinator._minimal_c2_failure("placeholder", "source_capture_failed", "capture")
+        result = self.coordinator._minimal_c2_failure(
+            "placeholder", "source_capture_failed", "capture",
+            capture_failure_kind="database_snapshot")
         code, stdout, stderr = self._run(result)
         self.assertEqual(code, 1)
         self.assertIn("Validation: FAIL", stdout)
+        self.assertIn("Capture failure kind: database_snapshot", stdout)
         self.assertEqual(stderr, "")
         self.assertIn("Report: validations/", stdout)
+
+    def test_source_capture_outcomes_require_an_allowlisted_kind(self):
+        with self.assertRaises(ValueError):
+            self.coordinator._minimal_c2_failure(
+                RUN_ID, "source_capture_failed")
+        with self.assertRaises(ValueError):
+            CoordinatorOutcome(
+                state="failed", proposal_id=VALID_PROPOSAL["proposal_id"],
+                run_id=RUN_ID, validation_status="failed", phase="capture",
+                failure_code="source_capture_failed")
+        outcome = CoordinatorOutcome(
+            state="failed", proposal_id=VALID_PROPOSAL["proposal_id"],
+            run_id=RUN_ID, validation_status="failed", phase="capture",
+            failure_code="source_capture_failed",
+            capture_failure_kind="configuration_snapshot")
+        rendered = render_cli_outcome(outcome)
+        self.assertIn("Capture failure kind: configuration_snapshot", rendered)
+        self.assertNotIn("/", rendered)
+        self.assertNotIn("password", rendered.casefold())
+
+    def test_explicit_single_run_preparation_code_reaches_bounded_cli(self):
+        result = self.coordinator._minimal_c2_failure(
+            RUN_ID, "duplicate_stage_file", "capture")
+        code, stdout, stderr = self._run(result)
+        self.assertEqual(code, 1)
+        self.assertIn("Failure: duplicate_stage_file", stdout)
+        self.assertNotIn("/etc", stdout)
+        self.assertNotIn("password", stdout.casefold())
+        self.assertEqual(stderr, "")
 
     def test_unverified_invalid_and_lock_busy_create_no_report(self):
         validations = self.root / "runtime/director/validations"
@@ -479,7 +511,9 @@ class CoordinatorFlowTests(unittest.TestCase):
 
     def test_enabled_call_order_is_fixed(self):
         events = []
-        result = self.coordinator._minimal_c2_failure(RUN_ID, "source_capture_failed")
+        result = self.coordinator._minimal_c2_failure(
+            RUN_ID, "source_capture_failed",
+            capture_failure_kind="database_snapshot")
         publication = {"publication_state": "published_durable",
                        "proposal_id": VALID_PROPOSAL["proposal_id"], "run_id": RUN_ID,
                        "validation_json_digest": "a" * 64,
