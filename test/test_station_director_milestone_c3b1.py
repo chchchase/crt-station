@@ -659,9 +659,9 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertEqual(events, ["invocation", "lexical", "lock", "proposal", "policy",
                                   "run_id", "stale", "c2", "projection", "publication", "unlock"])
         self.assertEqual(
-            controls["admission_cutoff"] - controls["control_started"], 6900)
+            controls["admission_cutoff"] - controls["control_started"], 7020)
         self.assertEqual(
-            controls["control_deadline"] - controls["control_started"], 7200)
+            controls["control_deadline"] - controls["control_started"], 7360)
 
     def test_lock_busy_and_policy_rejection_create_no_report(self):
         validations = self.root / "runtime/director/validations"

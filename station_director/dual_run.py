@@ -52,12 +52,34 @@ from station_director.validation_context import (
     logical_protected_configuration_fingerprint,
     proposal_boundary_to_db,
 )
+from station_director.validation_coordinator import (
+    CONTROL_DEADLINE_SECONDS,
+    EXECUTION_ADMISSION_CUTOFF_SECONDS,
+    MANDATORY_FINALIZATION_RESERVE_SECONDS as FINALIZATION_RESERVE_SECONDS,
+)
 
 
 COMPARISON_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
 MINIMUM_FREE_BYTES = 512 * 1024 * 1024
-PER_RUN_TIMEOUT_SECONDS = 30 * 60
-TOTAL_TIMEOUT_SECONDS = 75 * 60
+PER_RUN_TIMEOUT_SECONDS = 2850
+UNIT_HARD_LIMIT_SECONDS = 2700
+OUTER_WATCHDOG_SECONDS = 2730
+UNIT_INSPECTION_SECONDS = 15
+RUN_CLEANUP_SECONDS = 95
+INTERNAL_PHASE_BUDGET_SECONDS = 2520
+INTERNAL_OVERHEAD_SECONDS = 120
+CAPTURE_ALLOWANCE_SECONDS = 360
+NORMALIZATION_ALLOWANCE_SECONDS = 120
+BASELINE_COMPARISON_ALLOWANCE_SECONDS = 120
+COMPARISON_ALLOWANCE_SECONDS = 120
+ORDINARY_NON_RUN_ALLOWANCE_SECONDS = (
+    CAPTURE_ALLOWANCE_SECONDS
+    + 2 * NORMALIZATION_ALLOWANCE_SECONDS
+    + 2 * BASELINE_COMPARISON_ALLOWANCE_SECONDS
+    + COMPARISON_ALLOWANCE_SECONDS
+)
+ORDINARY_WORK_ESTIMATE_SECONDS = (
+    2 * PER_RUN_TIMEOUT_SECONDS + ORDINARY_NON_RUN_ALLOWANCE_SECONDS)
 RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v3.schema.json"
 
 CAPTURE_FAILURE_KINDS = frozenset({
@@ -732,15 +754,28 @@ def _validate_result_semantics(result):
 
 
 def run_dual_comparison(
-    project_root, source_root, media_root, proposal, policy, comparison_id,
+    project_root, source_root, media_root, proposal, policy, comparison_id, *,
+    control_started=None, admission_cutoff=None, control_deadline=None,
 ):
     """Execute C2 internally. This function is intentionally not CLI-routed."""
-    started = time.monotonic()
-    deadline = started + TOTAL_TIMEOUT_SECONDS
+    started = time.monotonic() if control_started is None else control_started
+    admission_cutoff = (started + EXECUTION_ADMISSION_CUTOFF_SECONDS
+                        if admission_cutoff is None else admission_cutoff)
+    deadline = (started + CONTROL_DEADLINE_SECONDS
+                if control_deadline is None else control_deadline)
+    if not started < admission_cutoff < deadline:
+        raise ValueError("invalid coordinator control deadline")
     result = _base_result(comparison_id)
     scope = None
     comparison_succeeded = False
+    def admit(phase, required_seconds=0):
+        if time.monotonic() + required_seconds >= admission_cutoff:
+            raise DualRunError(
+                phase, "comparison_failed",
+                "C2 execution admission cutoff reached",
+                category="execution_admission_cutoff")
     try:
+        admit("capture", CAPTURE_ALLOWANCE_SECONDS)
         scope = _prepare_scope(
             project_root, source_root, media_root, proposal, policy, comparison_id
         )
@@ -760,7 +795,8 @@ def run_dual_comparison(
         baseline_summaries = []
         for index, lifecycle in enumerate(scope.lifecycles, 1):
             result["phase_reached"] = f"run_{index}"
-            remaining = deadline - time.monotonic()
+            admit(f"run_{index}", PER_RUN_TIMEOUT_SECONDS)
+            remaining = admission_cutoff - time.monotonic()
             if remaining <= 0:
                 raise DualRunError(
                     f"run_{index}", "c1_run_failed", "C2 total timeout expired",
@@ -775,7 +811,7 @@ def run_dual_comparison(
             try:
                 result["scheduler_invoked"][f"run_{index}"] = "unknown"
                 launch_single_run(
-                    lifecycle, timeout=max(1, min(PER_RUN_TIMEOUT_SECONDS, int(remaining)))
+                    lifecycle, timeout=OUTER_WATCHDOG_SECONDS
                 )
                 response = inspect_single_run(lifecycle)
             except Exception as exc:
@@ -832,6 +868,7 @@ def run_dual_comparison(
                     _assert_inputs_stable(source_root, media_root, scope.capture, "after_run_2")
                 )
             try:
+                admit("normalization", NORMALIZATION_ALLOWANCE_SECONDS)
                 normalized_run = normalize_completed_run(
                     lifecycle.stage,
                     lifecycle.stage / "source/runtime/fs42_fluid.db",
@@ -847,6 +884,7 @@ def run_dual_comparison(
                 ) from exc
             normalized.append(normalized_run)
             try:
+                admit("baseline_comparison", BASELINE_COMPARISON_ALLOWANCE_SECONDS)
                 baseline_summaries.append(compare_baseline_to_proposed(
                     lifecycle.stage,
                     lifecycle.stage / "source/runtime/fs42_fluid.db",
@@ -876,11 +914,7 @@ def run_dual_comparison(
                 "timings_ms": response["timings_ms"],
             })
         result["phase_reached"] = "comparison"
-        if time.monotonic() >= deadline:
-            raise DualRunError(
-                "comparison", "comparison_failed", "C2 total timeout expired",
-                category="total_timeout",
-            )
+        admit("comparison", COMPARISON_ALLOWANCE_SECONDS)
         try:
             comparison = compare_normalized_runs(normalized[0], normalized[1])
         except Exception as exc:
@@ -1042,6 +1076,16 @@ def run_dual_comparison(
                 result["status"] = "success"
                 result["phase_reached"] = "complete"
         result["timings_ms"]["total"] = round((time.monotonic() - started) * 1000)
+        if time.monotonic() > deadline:
+            if result["failure"] is None:
+                result["failure"] = {
+                    "phase": "cleanup", "code": "finalization_deadline_overrun",
+                    "category": None,
+                    "message": "Mandatory finalization exceeded its reserved deadline.",
+                }
+            elif result["failure"].get("category") is None:
+                result["failure"]["category"] = "finalization_deadline_overrun"
+            result["status"] = "failed"
     validate_document(result, RESULT_SCHEMA)
     _validate_result_semantics(result)
     return result

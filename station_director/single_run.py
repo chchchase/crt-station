@@ -45,7 +45,7 @@ from station_director.validation import project_configuration
 
 REQUEST_NAME = "native-single-run.request.json"
 RESPONSE_NAME = "native-single-run.response.json"
-DEFAULT_TIMEOUT_SECONDS = 30 * 60
+DEFAULT_TIMEOUT_SECONDS = 2730
 FINALIZATION_SUBPHASES = frozenset({
     "staged_physical_fingerprint",
     "staged_logical_configuration_fingerprint",

@@ -1,6 +1,8 @@
+import ast
 import json
 import hashlib
 import io
+import inspect
 import math
 import os
 import shutil
@@ -17,7 +19,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from station_director.dual_run import (
+    BASELINE_COMPARISON_ALLOWANCE_SECONDS,
     CAPTURE_FAILURE_KINDS,
+    CAPTURE_ALLOWANCE_SECONDS,
+    COMPARISON_ALLOWANCE_SECONDS,
     DualRunError,
     _assert_inputs_stable,
     _base_result,
@@ -27,8 +32,36 @@ from station_director.dual_run import (
     _space_requirement,
     _validate_result_semantics,
     run_dual_comparison,
+    EXECUTION_ADMISSION_CUTOFF_SECONDS,
+    FINALIZATION_RESERVE_SECONDS,
+    INTERNAL_OVERHEAD_SECONDS,
+    INTERNAL_PHASE_BUDGET_SECONDS,
+    NORMALIZATION_ALLOWANCE_SECONDS,
+    ORDINARY_NON_RUN_ALLOWANCE_SECONDS,
+    ORDINARY_WORK_ESTIMATE_SECONDS,
+    OUTER_WATCHDOG_SECONDS,
+    PER_RUN_TIMEOUT_SECONDS,
+    RUN_CLEANUP_SECONDS,
+    UNIT_HARD_LIMIT_SECONDS,
+    UNIT_INSPECTION_SECONDS,
 )
-from station_director.isolation import LaunchResult
+from station_director.validation_coordinator import (
+    CONTROL_DEADLINE_SECONDS,
+    EXECUTION_ADMISSION_CUTOFF_SECONDS as COORDINATOR_ADMISSION_CUTOFF_SECONDS,
+    LOCK_RELEASE_ALLOWANCE_SECONDS,
+    MANDATORY_FINALIZATION_REQUIRED_SECONDS,
+    MANDATORY_FINALIZATION_RESERVE_SECONDS,
+    REPORT_PUBLICATION_ALLOWANCE_SECONDS,
+    SIGNAL_RESTORATION_ALLOWANCE_SECONDS,
+    STAGE_CAPTURE_FINALIZATION_ALLOWANCE_SECONDS,
+    UNIT_CLEANUP_SEQUENCE_ALLOWANCE_SECONDS,
+    UNIT_CLEANUP_SEQUENCE_COUNT,
+    _finalization_budget_exhausted,
+)
+from station_director.isolation import (
+    LaunchResult, MAX_UNIT_CLEANUP_COMMANDS, CLEANUP_TIMEOUT_SECONDS,
+    UNIT_CLEANUP_ALLOWANCE_SECONDS,
+)
 from station_director.c1_diagnostics import make_diagnostic
 from station_director.isolation_probe import PROBE_RESULTS
 from station_director.isolation_probe import PROBE_RESULTS
@@ -74,6 +107,113 @@ def insert_catalog(connection, catalog_id, path, **changes):
 
 ROOT = Path(__file__).parents[1]
 
+
+class RuntimeBudgetContractTests(unittest.TestCase):
+    def test_phase_launcher_per_run_and_total_deadlines_are_nested(self):
+        self.assertLess(INTERNAL_PHASE_BUDGET_SECONDS + INTERNAL_OVERHEAD_SECONDS,
+                        UNIT_HARD_LIMIT_SECONDS)
+        self.assertLess(UNIT_HARD_LIMIT_SECONDS, OUTER_WATCHDOG_SECONDS)
+        self.assertLess(OUTER_WATCHDOG_SECONDS + UNIT_INSPECTION_SECONDS
+                        + RUN_CLEANUP_SECONDS, PER_RUN_TIMEOUT_SECONDS)
+        self.assertEqual(RUN_CLEANUP_SECONDS, UNIT_CLEANUP_ALLOWANCE_SECONDS)
+        self.assertGreaterEqual(
+            RUN_CLEANUP_SECONDS,
+            MAX_UNIT_CLEANUP_COMMANDS * CLEANUP_TIMEOUT_SECONDS)
+        self.assertEqual(ORDINARY_WORK_ESTIMATE_SECONDS,
+                         2 * PER_RUN_TIMEOUT_SECONDS
+                         + ORDINARY_NON_RUN_ALLOWANCE_SECONDS)
+        self.assertEqual(
+            ORDINARY_NON_RUN_ALLOWANCE_SECONDS,
+            CAPTURE_ALLOWANCE_SECONDS
+            + 2 * NORMALIZATION_ALLOWANCE_SECONDS
+            + 2 * BASELINE_COMPARISON_ALLOWANCE_SECONDS
+            + COMPARISON_ALLOWANCE_SECONDS,
+        )
+        self.assertEqual(
+            (CAPTURE_ALLOWANCE_SECONDS,
+             NORMALIZATION_ALLOWANCE_SECONDS,
+             BASELINE_COMPARISON_ALLOWANCE_SECONDS,
+             COMPARISON_ALLOWANCE_SECONDS),
+            (360, 120, 120, 120),
+        )
+        self.assertEqual(ORDINARY_WORK_ESTIMATE_SECONDS, 6660)
+        self.assertLess(ORDINARY_WORK_ESTIMATE_SECONDS,
+                        EXECUTION_ADMISSION_CUTOFF_SECONDS)
+        self.assertEqual(EXECUTION_ADMISSION_CUTOFF_SECONDS,
+                         COORDINATOR_ADMISSION_CUTOFF_SECONDS)
+        self.assertEqual(EXECUTION_ADMISSION_CUTOFF_SECONDS
+                         + FINALIZATION_RESERVE_SECONDS,
+                         CONTROL_DEADLINE_SECONDS)
+
+    def test_report_publication_and_cleanup_fit_the_ordinary_work_margin(self):
+        margin = EXECUTION_ADMISSION_CUTOFF_SECONDS - ORDINARY_WORK_ESTIMATE_SECONDS
+        self.assertEqual(UNIT_CLEANUP_SEQUENCE_COUNT, 2)
+        self.assertEqual(UNIT_CLEANUP_SEQUENCE_ALLOWANCE_SECONDS,
+                         UNIT_CLEANUP_ALLOWANCE_SECONDS)
+        self.assertEqual(MANDATORY_FINALIZATION_REQUIRED_SECONDS,
+                         2 * UNIT_CLEANUP_ALLOWANCE_SECONDS
+                         + REPORT_PUBLICATION_ALLOWANCE_SECONDS
+                         + STAGE_CAPTURE_FINALIZATION_ALLOWANCE_SECONDS
+                         + SIGNAL_RESTORATION_ALLOWANCE_SECONDS
+                         + LOCK_RELEASE_ALLOWANCE_SECONDS)
+        self.assertEqual(MANDATORY_FINALIZATION_REQUIRED_SECONDS, 330)
+        self.assertEqual(MANDATORY_FINALIZATION_RESERVE_SECONDS, 340)
+        self.assertLess(MANDATORY_FINALIZATION_REQUIRED_SECONDS,
+                        MANDATORY_FINALIZATION_RESERVE_SECONDS)
+        self.assertEqual(margin, 360)
+        self.assertGreater(margin, MANDATORY_FINALIZATION_REQUIRED_SECONDS)
+
+    def test_coordinator_enforces_complete_finalization_requirement(self):
+        success = {"status": "success"}
+        failure = {"status": "failed"}
+        cutoff = 7020
+        deadline = 7360
+        later_cutoff = deadline
+        self.assertFalse(_finalization_budget_exhausted(
+            success, later_cutoff, deadline, now=deadline - 331))
+        self.assertTrue(_finalization_budget_exhausted(
+            success, later_cutoff, deadline, now=deadline - 330))
+        self.assertFalse(_finalization_budget_exhausted(
+            success, cutoff, deadline, now=cutoff - 1))
+        self.assertTrue(_finalization_budget_exhausted(
+            success, cutoff, deadline, now=cutoff))
+        self.assertFalse(_finalization_budget_exhausted(
+            failure, cutoff, deadline, now=deadline))
+
+    def test_production_phase_admission_uses_each_declared_allowance(self):
+        tree = ast.parse(inspect.getsource(run_dual_comparison))
+        calls = []
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "admit"):
+                calls.append(tuple(
+                    (argument.id if isinstance(argument, ast.Name)
+                     else argument.value if isinstance(argument, ast.Constant)
+                     else None)
+                    for argument in node.args
+                ))
+        self.assertCountEqual(
+            calls,
+            [
+                ("capture", "CAPTURE_ALLOWANCE_SECONDS"),
+                (None, "PER_RUN_TIMEOUT_SECONDS"),
+                ("normalization", "NORMALIZATION_ALLOWANCE_SECONDS"),
+                ("baseline_comparison", "BASELINE_COMPARISON_ALLOWANCE_SECONDS"),
+                ("comparison", "COMPARISON_ALLOWANCE_SECONDS"),
+            ],
+        )
+        with patch("station_director.dual_run.time.monotonic", return_value=0), \
+                patch("station_director.dual_run._prepare_scope") as prepare:
+            result = run_dual_comparison(
+                ROOT, ROOT, ROOT, {}, {}, "budget-contract",
+                control_started=0,
+                admission_cutoff=CAPTURE_ALLOWANCE_SECONDS,
+                control_deadline=CAPTURE_ALLOWANCE_SECONDS + 1,
+            )
+        prepare.assert_not_called()
+        self.assertEqual(result["failure"]["category"],
+                         "execution_admission_cutoff")
 
 GUIDE_MAGIC = b"FS42-GUIDE\x00\x01"
 GUIDE_VALUE = {"path": "/guide/test", "value": {"title": "Synthetic"}}

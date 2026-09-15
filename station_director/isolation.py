@@ -21,9 +21,13 @@ STAGING_PARENT = Path("/tmp")
 STAGING_RE = re.compile(r"fs42-i-[0-9a-f]{12}\Z")
 STAGING_MAX_AGE_SECONDS = 6 * 60 * 60
 UNIT_TIMEOUT_SECONDS = 30
+NATIVE_UNIT_HARD_LIMIT_SECONDS = 2700
+NATIVE_OUTER_WATCHDOG_SECONDS = 2730
 UNIT_INSPECTION_TIMEOUT_SECONDS = 15
 UNIT_POLL_SECONDS = 1.0
 CLEANUP_TIMEOUT_SECONDS = 10
+MAX_UNIT_CLEANUP_COMMANDS = 9
+UNIT_CLEANUP_ALLOWANCE_SECONDS = 95
 MAX_CAPTURE_BYTES = 64 * 1024
 PROBE_OUTPUT = "preflight-probe.json"
 class IsolationError(RuntimeError):
@@ -113,21 +117,27 @@ def _is_absent_unit_message(value):
     return any(text in lowered for text in ("not found", "not loaded", "could not be found", "does not exist"))
 
 
-def _run_cleanup_command(argv):
+def _cleanup_timeout(deadline):
+    return max(0.001, min(CLEANUP_TIMEOUT_SECONDS, deadline - time.monotonic()))
+
+
+def _run_cleanup_command(argv, deadline):
     try:
         completed = subprocess.run(
-            argv, capture_output=True, text=True, timeout=CLEANUP_TIMEOUT_SECONDS)
+            argv, capture_output=True, text=True,
+            timeout=_cleanup_timeout(deadline),
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     detail = (completed.stderr or completed.stdout).strip()
     return completed.returncode == 0 or _is_absent_unit_message(detail), detail
 
 
-def _unit_absent(unit_name):
+def _unit_absent(unit_name, deadline):
     try:
         shown = subprocess.run(
             ["systemctl", "--user", "show", "--property=LoadState", "--value", unit_name],
-            capture_output=True, text=True, timeout=CLEANUP_TIMEOUT_SECONDS,
+            capture_output=True, text=True, timeout=_cleanup_timeout(deadline),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
@@ -137,24 +147,27 @@ def _unit_absent(unit_name):
     return absent, detail or "no output"
 
 
-def cleanup_unit(unit_name):
+def cleanup_unit(unit_name, *, deadline=None):
+    deadline = (time.monotonic() + UNIT_CLEANUP_ALLOWANCE_SECONDS
+                if deadline is None else deadline)
     details = []
     for action in ("stop", "reset-failed"):
         ok, detail = _run_cleanup_command(
-            ["systemctl", "--user", action, unit_name]
+            ["systemctl", "--user", action, unit_name], deadline
         )
         details.append(f"{action}: {detail or ('ok' if ok else 'failed')}")
-    absent, detail = _unit_absent(unit_name)
+    absent, detail = _unit_absent(unit_name, deadline)
     details.append(f"show: {detail}")
     for signal in ("TERM", "KILL"):
         if absent:
             break
         ok, detail = _run_cleanup_command(
-            ["systemctl", "--user", "kill", "--kill-who=all", f"--signal={signal}", unit_name]
+            ["systemctl", "--user", "kill", "--kill-who=all", f"--signal={signal}", unit_name],
+            deadline,
         )
         details.append(f"kill-{signal}: {detail or ('ok' if ok else 'failed')}")
-        _run_cleanup_command(["systemctl", "--user", "stop", unit_name])
-        absent, detail = _unit_absent(unit_name)
+        _run_cleanup_command(["systemctl", "--user", "stop", unit_name], deadline)
+        absent, detail = _unit_absent(unit_name, deadline)
         details.append(f"show-after-{signal}: {detail}")
     return absent, "; ".join(details)
 
@@ -402,7 +415,7 @@ class IsolationLauncher:
 
     def run(
         self, staging_path, sandbox_argv, unit_name, timeout=UNIT_TIMEOUT_SECONDS,
-        *, stage_tmp=False,
+        *, stage_tmp=False, unit_timeout=None,
     ):
         temporary = None
         try:
@@ -412,7 +425,13 @@ class IsolationLauncher:
                 self.project_root, staging_path, sandbox_argv,
                 stage_tmp=stage_tmp, verified_temporary=temporary,
             )
-            unit_timeout = max(1, timeout - 5)
+            unit_timeout = (
+                NATIVE_UNIT_HARD_LIMIT_SECONDS
+                if unit_timeout is None and timeout == NATIVE_OUTER_WATCHDOG_SECONDS
+                else max(1, timeout - 5) if unit_timeout is None else unit_timeout
+            )
+            if unit_timeout <= 0 or unit_timeout >= timeout:
+                raise IsolationError("unit timeout must be positive and below outer watchdog")
             command = [
                 "systemd-run",
                 "--user",

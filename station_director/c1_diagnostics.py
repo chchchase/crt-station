@@ -65,6 +65,7 @@ DIAGNOSTIC_RULES = {
     "staged_preparation": ("native_preparation", ("configuration", "preservation"), "Staged scheduling preparation failed."),
     "sequence_restore_failure": ("native_preservation", ("configuration", "catalog", "scheduler", "preservation", "guide"), "Sequence restoration failed."),
     "catalog_failure": ("native_catalog", ("catalog",), "Native catalog construction failed."),
+    "catalog_metadata_unavailable": ("native_catalog", ("catalog", "scheduler"), "Verified catalog metadata is unavailable."),
     "catalog_reconciliation": ("native_catalog", ("catalog",), "Catalog reconciliation failed."),
     "native_system_exit": ("native_scheduler", ("native_import", "configuration", "catalog", "scheduler", "preservation", "guide"), "Native code exited unexpectedly."),
     "scheduler_failure": ("native_scheduler", ("scheduler",), "Native schedule generation failed."),

@@ -12,7 +12,11 @@ from pathlib import Path
 from fs42.catalog import ShowCatalog
 from fs42.liquid_schedule import LiquidSchedule
 from fs42.liquid_io import LiquidIO
-from fs42.scheduling_context import ValidationSchedulingContext, activate_validation_context
+from fs42.scheduling_context import (
+    ValidationCatalogMetadataUnavailable,
+    ValidationSchedulingContext,
+    activate_validation_context,
+)
 from fs42.station_manager import StationManager
 from fs42.guide_reader import (
     GuideLoadingError,
@@ -54,6 +58,10 @@ from station_director.worker_bootstrap import VerifiedWorkerAttestation
 PROTECTED_CHANNELS = {"CRT Station Guide", "Watch In Order"}
 STAGE_ROOT = Path("/stage")
 MEDIA_ROOT = Path("/media")
+CONFIGURATION_BUDGET_SECONDS = 120
+CATALOG_BUDGET_SECONDS = 1980
+SCHEDULER_BUDGET_SECONDS = 300
+FINAL_NATIVE_BUDGET_SECONDS = 120
 PROJECT_ROOT = Path("/project")
 
 
@@ -552,6 +560,7 @@ def _execute_native_single_run(request, attestation, restoration):
             start_time=datetime.fromisoformat(history.regeneration_start),
             end_time=datetime.fromisoformat(history.effective_horizon),
             seed=channel_seed,
+            media_root=str(MEDIA_ROOT),
         )
         try:
             native_config = _native_station_config(channel, context)
@@ -576,6 +585,10 @@ def _execute_native_single_run(request, attestation, restoration):
                 phase="configuration", channel=channel,
             )
         channel_inputs[channel] = (history, context, native_config)
+    if time.monotonic() - started > CONFIGURATION_BUDGET_SECONDS:
+        raise NativeRunError(
+            "native_configuration", "Native configuration budget expired.",
+            phase="configuration")
     if checkpoint is not None:
         checkpoint.publish("configuration_completed")
 
@@ -603,6 +616,12 @@ def _execute_native_single_run(request, attestation, restoration):
         except SystemExit as exc:
             raise NativeRunError(
                 "native_system_exit", f"native catalog exited with {exc.code!r}",
+                phase="catalog", channel=channel,
+            ) from exc
+        except ValidationCatalogMetadataUnavailable as exc:
+            raise NativeRunError(
+                "catalog_metadata_unavailable",
+                "Verified catalog metadata is unavailable.",
                 phase="catalog", channel=channel,
             ) from exc
         except Exception as exc:
@@ -639,6 +658,10 @@ def _execute_native_single_run(request, attestation, restoration):
         finally:
             connection.close()
         catalog_seconds += time.monotonic() - catalog_started
+        if catalog_seconds > CATALOG_BUDGET_SECONDS:
+            raise NativeRunError(
+                "catalog_failure", "Native catalog budget expired.",
+                phase="catalog", channel=channel)
 
         try:
             scheduler_started = time.monotonic()
@@ -658,6 +681,17 @@ def _execute_native_single_run(request, attestation, restoration):
             if checkpoint is not None:
                 checkpoint.publish("scheduler_completed")
             scheduler_seconds += time.monotonic() - scheduler_started
+            if scheduler_seconds > SCHEDULER_BUDGET_SECONDS:
+                raise NativeRunError(
+                    "scheduler_failure", "Native scheduler budget expired.",
+                    phase="scheduler", channel=channel, scheduler_invoked=True)
+        except ValidationCatalogMetadataUnavailable as exc:
+            raise NativeRunError(
+                "catalog_metadata_unavailable",
+                "Verified catalog metadata is unavailable.",
+                phase="scheduler" if scheduler_entered else "catalog",
+                channel=channel, scheduler_invoked=scheduler_entered,
+            ) from exc
         except autobump_runtime.AutoBumpValidationSubprocessBlocked as exc:
             raise NativeRunError(
                 "autobump_subprocess_blocked",
@@ -711,6 +745,10 @@ def _execute_native_single_run(request, attestation, restoration):
         datetime.fromisoformat(proposal_start), datetime.fromisoformat(proposal_end),
     )
     guide_finished = time.monotonic()
+    if guide_finished - preservation_started > FINAL_NATIVE_BUDGET_SECONDS:
+        raise NativeRunError(
+            "guide_validation_failed", "Native finalization budget expired.",
+            phase="guide", scheduler_invoked=scheduler_entered)
     _final_input_verification(attestation, request)
     return {
         "scheduler_invoked": scheduler_entered,

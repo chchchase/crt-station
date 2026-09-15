@@ -7,6 +7,10 @@ sys.path.append(os.getcwd())
 
 from fs42.fluid_statements import FluidStatements
 from fs42.media_processor import MediaProcessor
+from fs42.scheduling_context import (
+    ValidationCatalogMetadataUnavailable,
+    in_validation_mode,
+)
 from fs42.station_manager import StationManager
 
 class FluidBuilder:
@@ -143,8 +147,13 @@ class FluidBuilder:
             for entry in entries:
                 if hasattr(entry, 'realpath') and entry.realpath:
                     # Check if we've already scanned this file (row exists in table)
-                    cursor.execute("SELECT path FROM chapter_points WHERE path=?", (entry.realpath,))
+                    chapter_path = (FluidStatements.validation_cache_path(entry.realpath)
+                                    if in_validation_mode() else entry.realpath)
+                    cursor.execute("SELECT path FROM chapter_points WHERE path=?", (chapter_path,))
                     if not cursor.fetchone():  # Never scanned before
+                        if in_validation_mode():
+                            raise ValidationCatalogMetadataUnavailable(
+                                "cached chapter metadata is missing")
                         # Scan for chapters
                         chapters = MediaProcessor.chapter_detect(entry.realpath, entry.duration)
                         # Always store result, even if empty or None

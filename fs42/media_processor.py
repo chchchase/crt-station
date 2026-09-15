@@ -159,6 +159,8 @@ class MediaProcessor:
 
             # it might not support streams, so check with moviepy
             if duration <= 0.0:
+                from fs42.scheduling_context import block_validation_media_runtime
+                block_validation_media_runtime()
                 try:
                     video_clip = VideoFileClip(fname)
                     duration = video_clip.duration
@@ -181,6 +183,9 @@ class MediaProcessor:
                 _l.debug(f"--_process_media is done with {fname}: {show_clip}")
 
         except Exception as e:
+            from fs42.scheduling_context import ValidationCatalogMetadataUnavailable
+            if isinstance(e, ValidationCatalogMetadataUnavailable):
+                raise
             _l.exception(e)
             _l.error(f"Error processing media file {fname}")
 
@@ -221,6 +226,8 @@ class MediaProcessor:
     @staticmethod
     def _get_duration(file_name) -> tuple:
         """Returns (duration, error_hint). duration is -1 on failure; error_hint is a human-readable cause or None."""
+        from fs42.scheduling_context import block_validation_media_runtime
+        block_validation_media_runtime()
         _l = logging.getLogger("MEDIA")
         try:
             probed = ffmpeg.probe(file_name)
@@ -440,6 +447,8 @@ class MediaProcessor:
 
     @staticmethod
     def black_detect(fname, base_duration, black_min_duration=0.1, black_pixel_tresh=0.1, black_ratio_thresh=0.95):
+        from fs42.scheduling_context import block_validation_media_runtime
+        block_validation_media_runtime()
         def min_segment(break_points):
             spx = sorted(break_points, key=lambda x: x["segment_duration"])
             return spx[0]["segment_duration"]
@@ -532,6 +541,8 @@ class MediaProcessor:
 
     @staticmethod
     def chapter_detect(fname, base_duration):
+        from fs42.scheduling_context import block_validation_media_runtime
+        block_validation_media_runtime()
         import subprocess
         import json
 

@@ -24,6 +24,25 @@ LOCK_NAME = ".schedule-validation.lock"
 LOCK_WAIT_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.05
 STALE_SCAN_LIMIT = 10_000
+EXECUTION_ADMISSION_CUTOFF_SECONDS = 7020
+UNIT_CLEANUP_SEQUENCE_COUNT = 2
+UNIT_CLEANUP_SEQUENCE_ALLOWANCE_SECONDS = 95
+REPORT_PUBLICATION_ALLOWANCE_SECONDS = 120
+STAGE_CAPTURE_FINALIZATION_ALLOWANCE_SECONDS = 10
+SIGNAL_RESTORATION_ALLOWANCE_SECONDS = 5
+LOCK_RELEASE_ALLOWANCE_SECONDS = 5
+MANDATORY_FINALIZATION_REQUIRED_SECONDS = (
+    UNIT_CLEANUP_SEQUENCE_COUNT * UNIT_CLEANUP_SEQUENCE_ALLOWANCE_SECONDS
+    + REPORT_PUBLICATION_ALLOWANCE_SECONDS
+    + STAGE_CAPTURE_FINALIZATION_ALLOWANCE_SECONDS
+    + SIGNAL_RESTORATION_ALLOWANCE_SECONDS
+    + LOCK_RELEASE_ALLOWANCE_SECONDS
+)
+MANDATORY_FINALIZATION_RESERVE_SECONDS = 340
+CONTROL_DEADLINE_SECONDS = (
+    EXECUTION_ADMISSION_CUTOFF_SECONDS
+    + MANDATORY_FINALIZATION_RESERVE_SECONDS
+)
 CAPTURE_FAILURE_KINDS = frozenset({
     "source_path_resolution", "invocation_verification", "stage_allocation",
     "configuration_inventory", "configuration_physical_fingerprint",
@@ -567,6 +586,14 @@ def _outcome_without_report(proposal_id, run_id, result, code):
         quarantined=any(item.get("quarantined") for item in cleanup),
     )
 
+
+def _finalization_budget_exhausted(result, admission_cutoff, control_deadline, *, now=None):
+    current = time.monotonic() if now is None else now
+    return (result.get("status") == "success"
+            and (current >= admission_cutoff
+                 or current + MANDATORY_FINALIZATION_REQUIRED_SECONDS
+                 >= control_deadline))
+
 def validate_saved_proposal(proposal_id):
     """Run the complete public flow only when the checked-in gate is true."""
     if not validation_control.SCHEDULE_VALIDATION_ENABLED:
@@ -604,6 +631,10 @@ def validate_saved_proposal(proposal_id):
                 publish_validation_report,
             )
             run_id = create_validation_run_id()
+            control_started = time.monotonic()
+            admission_cutoff = (
+                control_started + EXECUTION_ADMISSION_CUTOFF_SECONDS)
+            control_deadline = control_started + CONTROL_DEADLINE_SECONDS
             result = None
             try:
                 with _CancellationScope() as cancellation:
@@ -623,12 +654,25 @@ def validate_saved_proposal(proposal_id):
                         result = run_dual_comparison(
                             TRUSTED_PROJECT_ROOT, TRUSTED_PROJECT_ROOT,
                             CANONICAL_MEDIA_ROOT, proposal, policy, run_id,
+                            control_started=control_started,
+                            admission_cutoff=admission_cutoff,
+                            control_deadline=control_deadline,
                         )
                         validate_document(result, RESULT_SCHEMA)
                         _validate_result_semantics(result)
                     if result.get("comparison_id") != run_id:
                         return _outcome_without_report(
                             proposal_id, run_id, result, "internal_error")
+                    if _finalization_budget_exhausted(
+                            result, admission_cutoff, control_deadline):
+                        result["status"] = "failed"
+                        result["phase_reached"] = "cleanup"
+                        result["failure"] = {
+                            "phase": "cleanup",
+                            "code": "finalization_deadline_overrun",
+                            "category": None,
+                            "message": "Mandatory finalization exceeded its reserved deadline.",
+                        }
                     completed_at = datetime.now(timezone.utc).isoformat().replace(
                         "+00:00", "Z")
                     try:

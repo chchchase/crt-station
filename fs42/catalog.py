@@ -142,6 +142,13 @@ class ShowCatalog:
 
                 return self._build_standard()
             case "loop":
+                if in_validation_mode() and FF_USE_FLUID_FILE_CACHE:
+                    from fs42.fluid_builder import FluidBuilder
+
+                    self.__fluid_builder = FluidBuilder()
+                    media_filter = self.config.get("media_filter", "video")
+                    self.__fluid_builder.scan_file_cache(
+                        self.config["content_dir"], media_filter)
                 return self._build_single()
             case "guide":
                 raise NotImplementedError("Guide catalog not supported yet.")
@@ -156,7 +163,10 @@ class ShowCatalog:
         media_filter = self.config.get("media_filter", "video")
         self._l.info(f"Checking for media in {self.config['content_dir']} for single directory with filter={media_filter}")
         file_list = MediaProcessor._find_media(self.config["content_dir"], media_filter)
-        self.clip_index[tag] = MediaProcessor._process_media(file_list, tag, content_type="feature")
+        self.clip_index[tag] = MediaProcessor._process_media(
+            file_list, tag,
+            fluid=(self.__fluid_builder if in_validation_mode() else None),
+            content_type="feature")
         self._l.info(f"Building complete - processed {len(file_list)} files")
         self._write_catalog()
 
@@ -309,7 +319,10 @@ class ShowCatalog:
                     if tag_key not in self.clip_index:
                         self.clip_index[tag_key] = []
                     file_list = MediaProcessor._find_media(subfolder_path, media_filter)
-                    clips = MediaProcessor._process_media(file_list, tag_key, content_type="bump")
+                    clips = MediaProcessor._process_media(
+                        file_list, tag_key,
+                        fluid=(self.__fluid_builder if in_validation_mode() else None),
+                        content_type="bump")
                     subdir_clips = MediaProcessor._process_subs(
                         subfolder_path, tag_key, bumpdir=True,
                         fluid=self.__fluid_builder, content_type="bump",
@@ -322,17 +335,33 @@ class ShowCatalog:
         # add sign-off and off-air videos to the clip index
         if "sign_off_video" in self.config:
             self._l.debug("Adding sign-off video")
-            video_clip = VideoFileClip(self.config["sign_off_video"])
-            self.clip_index["sign_off"] = [CatalogEntry(self.config["sign_off_video"], video_clip.duration, "sign_off", content_type="sign_off")]
-            video_clip.close()
+            if in_validation_mode():
+                entry = MediaProcessor.process_one(
+                    self.config["sign_off_video"], "sign_off", [],
+                    self.__fluid_builder, content_type="sign_off")
+                if entry is None:
+                    raise RuntimeError("cached sign-off metadata is unavailable")
+                self.clip_index["sign_off"] = [entry]
+            else:
+                video_clip = VideoFileClip(self.config["sign_off_video"])
+                self.clip_index["sign_off"] = [CatalogEntry(self.config["sign_off_video"], video_clip.duration, "sign_off", content_type="sign_off")]
+                video_clip.close()
             self._l.debug(f"Added sign-off video {self.config['sign_off_video']}")
             total_count += 1
 
         if "off_air_video" in self.config:
             self._l.debug("Adding off air video")
-            video_clip = VideoFileClip(self.config["off_air_video"])
-            self.clip_index["off_air"] = [CatalogEntry(self.config["off_air_video"], video_clip.duration, "off_air", content_type="off_air")]
-            video_clip.close()
+            if in_validation_mode():
+                entry = MediaProcessor.process_one(
+                    self.config["off_air_video"], "off_air", [],
+                    self.__fluid_builder, content_type="off_air")
+                if entry is None:
+                    raise RuntimeError("cached off-air metadata is unavailable")
+                self.clip_index["off_air"] = [entry]
+            else:
+                video_clip = VideoFileClip(self.config["off_air_video"])
+                self.clip_index["off_air"] = [CatalogEntry(self.config["off_air_video"], video_clip.duration, "off_air", content_type="off_air")]
+                video_clip.close()
             self._l.debug(f"Added off air video {self.config['off_air_video']}")
             total_count += 1
 

@@ -5,7 +5,12 @@ import os
 import json
 from fs42.media_processor import MediaProcessor
 from fs42.fluid_objects import FileRepoEntry
-from fs42.scheduling_context import scheduling_now
+from fs42.scheduling_context import (
+    ValidationCatalogMetadataUnavailable,
+    current_validation_context,
+    in_validation_mode,
+    scheduling_now,
+)
 
 
 class FluidStatements:
@@ -18,12 +23,40 @@ class FluidStatements:
         cursor = connection.cursor()
         cursor.execute("SELECT * FROM file_meta WHERE path = ?;", (full_path,))
         row = cursor.fetchone()
+        if row is None and in_validation_mode():
+            cache_path = FluidStatements.validation_cache_path(full_path)
+            cursor.execute("SELECT * FROM file_meta WHERE path = ?;", (cache_path,))
+            row = cursor.fetchone()
         result = None
         if row:
             repo_entry = FileRepoEntry(row)
+            if in_validation_mode():
+                FluidStatements.validate_cached_entry(repo_entry)
+                try:
+                    info = os.stat(full_path)
+                except OSError as exc:
+                    raise ValidationCatalogMetadataUnavailable(
+                        "cached media identity is unavailable") from exc
+                if (info.st_size, info.st_mtime) != (
+                        repo_entry.size, repo_entry.last_mod):
+                    raise ValidationCatalogMetadataUnavailable(
+                        "cached media metadata is stale")
             result = repo_entry
         cursor.close()
         return result
+
+    @staticmethod
+    def validation_cache_path(path):
+        normalized = os.path.normpath(os.fspath(path))
+        media_root = os.path.normpath(current_validation_context().media_root)
+        for root in dict.fromkeys((media_root, "/media")):
+            if normalized == root:
+                return "/mnt/t7/CRT-Media"
+            prefix = root + "/"
+            if normalized.startswith(prefix):
+                return "/mnt/t7/CRT-Media/" + normalized[len(prefix):]
+        raise ValidationCatalogMetadataUnavailable(
+            "validation media cache identity is invalid")
 
     @staticmethod
     def iterate_file_entries(connection: sqlite3.Connection, entries: list[FileRepoEntry]) -> None:
@@ -32,7 +65,9 @@ class FluidStatements:
         cursor = connection.cursor()
         for entry in entries:
             # see if there is an entry already
-            cursor.execute("SELECT * FROM file_meta WHERE path = ?;", (entry.path,))
+            lookup_path = (FluidStatements.validation_cache_path(entry.path)
+                           if in_validation_mode() else entry.path)
+            cursor.execute("SELECT * FROM file_meta WHERE path = ?;", (lookup_path,))
             row = cursor.fetchone()
             if row:
                 repo_entry = FileRepoEntry()
@@ -41,8 +76,13 @@ class FluidStatements:
                 # Check if we need to update this entry
                 needs_update = False
 
-                # Update if file stats changed
-                if entry != repo_entry:
+                # Preserve the native comparison outside validation; validation
+                # deliberately ignores the staged-path identity and compares the
+                # immutable cache fields that establish freshness.
+                if in_validation_mode():
+                    if (entry.size, entry.last_mod) != (repo_entry.size, repo_entry.last_mod):
+                        needs_update = True
+                elif entry != repo_entry:
                     needs_update = True
 
                 # Also update if this is an audio file with empty metadata
@@ -52,14 +92,40 @@ class FluidStatements:
                     needs_update = True
 
                 if needs_update:
+                    if in_validation_mode():
+                        raise ValidationCatalogMetadataUnavailable(
+                            "cached media metadata is stale")
                     FluidStatements.update_file_entry(connection, entry)
+                elif in_validation_mode():
+                    FluidStatements.validate_cached_entry(repo_entry)
                 elif repo_entry.media_type != 'audio':
                     FluidStatements.refresh_video_meta(connection, repo_entry)
 
             else:
-
+                if in_validation_mode():
+                    raise ValidationCatalogMetadataUnavailable(
+                        "cached media metadata is missing")
                 FluidStatements.add_file_entry(connection, entry)
         cursor.close()
+
+    @staticmethod
+    def validate_cached_entry(entry):
+        if (
+            not isinstance(entry.duration, (int, float)) or isinstance(entry.duration, bool)
+            or entry.duration <= 0 or entry.media_type not in {"video", "audio"}
+        ):
+            raise ValidationCatalogMetadataUnavailable(
+                "cached media metadata is invalid")
+        if entry.meta:
+            try:
+                metadata = json.loads(entry.meta)
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValidationCatalogMetadataUnavailable(
+                    "cached media metadata is malformed") from exc
+            if (not isinstance(metadata, dict)
+                    or not isinstance(metadata.get("type"), str)):
+                raise ValidationCatalogMetadataUnavailable(
+                    "cached media metadata is untyped")
 
     @staticmethod
     def refresh_video_meta(connection: sqlite3.Connection, repo_entry: FileRepoEntry):
@@ -104,6 +170,9 @@ class FluidStatements:
     @staticmethod
     def update_file_entry(connection: sqlite3.Connection, entry: FileRepoEntry):
         """An old entry has changed, get the new stats and update it."""
+        if in_validation_mode():
+            raise ValidationCatalogMetadataUnavailable(
+                "validation cannot refresh media metadata")
         cursor = connection.cursor()
         now = scheduling_now()
 
@@ -130,6 +199,9 @@ class FluidStatements:
     @staticmethod
     def add_file_entry(connection: sqlite3.Connection, entry: FileRepoEntry):
         """This file isn't in the cache - add it."""
+        if in_validation_mode():
+            raise ValidationCatalogMetadataUnavailable(
+                "validation cannot generate media metadata")
         cursor = connection.cursor()
         now = scheduling_now()
 
@@ -169,7 +241,9 @@ class FluidStatements:
     def get_break_points(connection: sqlite3.Connection, path: str) -> dict:
         """Get the break points for this file"""
         cursor = connection.cursor()
-        cursor.execute("SELECT points FROM break_points WHERE path=?", (path,))
+        lookup_path = (FluidStatements.validation_cache_path(path)
+                       if in_validation_mode() else path)
+        cursor.execute("SELECT points FROM break_points WHERE path=?", (lookup_path,))
         row = cursor.fetchone()
         result = {}
         if row:
@@ -198,7 +272,9 @@ class FluidStatements:
     def get_chapter_points(connection: sqlite3.Connection, path: str) -> dict:
         """Get the chapter points for this file. Returns {} if no chapters or never scanned."""
         cursor = connection.cursor()
-        cursor.execute("SELECT points FROM chapter_points WHERE path=?", (path,))
+        lookup_path = (FluidStatements.validation_cache_path(path)
+                       if in_validation_mode() else path)
+        cursor.execute("SELECT points FROM chapter_points WHERE path=?", (lookup_path,))
         row = cursor.fetchone()
         result = {}
         if row:

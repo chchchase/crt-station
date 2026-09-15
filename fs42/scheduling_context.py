@@ -16,6 +16,16 @@ from dataclasses import dataclass
 VALIDATION_TIMEZONE = "America/Los_Angeles"
 
 
+class ValidationCatalogMetadataUnavailable(RuntimeError):
+    """Required staged catalog metadata is absent or not current."""
+
+
+def block_validation_media_runtime():
+    if in_validation_mode():
+        raise ValidationCatalogMetadataUnavailable(
+            "verified cached catalog metadata is required during validation")
+
+
 @dataclass(frozen=True)
 class ValidationSchedulingContext:
     reference_clock: datetime.datetime
@@ -24,6 +34,7 @@ class ValidationSchedulingContext:
     seed: int
     timezone: str = VALIDATION_TIMEZONE
     validation_mode: bool = True
+    media_root: str = "/media"
 
     def __post_init__(self):
         for name in ("reference_clock", "start_time", "end_time"):
@@ -40,6 +51,8 @@ class ValidationSchedulingContext:
             raise ValueError(f"validation timezone must be {VALIDATION_TIMEZONE}")
         if self.validation_mode is not True:
             raise ValueError("ValidationSchedulingContext requires validation_mode=true")
+        if not isinstance(self.media_root, str) or not self.media_root.startswith("/"):
+            raise ValueError("validation media_root must be absolute")
 
 
 class _Activation:

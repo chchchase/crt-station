@@ -106,18 +106,23 @@ class IsolationTests(unittest.TestCase):
 
     def test_retained_active_exited_process_returns_promptly_with_properties(self):
         running = {
-            "valid": True, "termination_kind": "running",
-            "exit_status": None, "signal": None,
+            "valid": True,
+            "termination_kind": "running",
+            "exit_status": None,
+            "signal": None,
             "main_process_started": True,
         }
         terminal = {
-            "valid": True, "termination_kind": "completed",
-            "exit_status": 0, "signal": None,
+            "valid": True,
+            "termination_kind": "completed",
+            "exit_status": 0,
+            "signal": None,
             "main_process_started": True,
         }
         started = time.monotonic()
         with patch.object(
-            isolation, "inspect_unit_termination", side_effect=(running, terminal),
+            isolation, "inspect_unit_termination",
+            side_effect=(running, terminal),
         ) as inspect, patch.object(isolation, "UNIT_POLL_SECONDS", 0):
             result = isolation._run_bounded(
                 [sys.executable, "-c", "import time; time.sleep(30)"],
@@ -137,11 +142,16 @@ class IsolationTests(unittest.TestCase):
 
     def test_retained_active_running_requires_affirmative_local_watchdog(self):
         running = {
-            "valid": True, "termination_kind": "running",
-            "exit_status": None, "signal": None,
+            "valid": True,
+            "termination_kind": "running",
+            "exit_status": None,
+            "signal": None,
             "main_process_started": True,
         }
-        outer_timeout = {**running, "termination_kind": "outer_watchdog"}
+        outer_timeout = {
+            **running,
+            "termination_kind": "outer_watchdog",
+        }
         def inspect(unused_unit, **kwargs):
             return outer_timeout if kwargs.get("launcher_timed_out") else running
         with patch.object(
