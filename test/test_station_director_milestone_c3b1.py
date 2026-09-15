@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from station_director import cli, validation, validation_control
+from station_director.c1_diagnostics import DIAGNOSTIC_RULES
 from station_director.validation_coordinator import (
     CoordinatorError,
     _recover_stale_stages,
@@ -416,15 +417,15 @@ class CoordinatorFlowTests(unittest.TestCase):
             ("autobump_subprocess_blocked", "scheduler", True),
             ("autobump_selected", "scheduler", True),
             ("invalid_playback_descriptor", "scheduler", True),
+            ("catalog_metadata_unavailable", "catalog", False),
         ):
             outcome = CoordinatorOutcome(
                 state="failed", proposal_id=VALID_PROPOSAL["proposal_id"],
                 run_id=RUN_ID, validation_status="failed", phase="run_1",
                 failure_code="c1_run_failed",
                 scheduler_invoked=(invoked, False),
-                c1_run=1, c1_domain=(
-                    "native_preparation" if not invoked else "native_scheduler"
-                ), c1_phase=phase, c1_code=code, c1_channel_number=2,
+                c1_run=1, c1_domain=DIAGNOSTIC_RULES[code][0],
+                c1_phase=phase, c1_code=code, c1_channel_number=2,
                 c1_launcher_outcome="nonzero_exit", c1_stdout_bytes=0,
                 c1_stderr_bytes=0, c1_stdout_truncated=False,
                 c1_stderr_truncated=False,
@@ -567,7 +568,7 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertEqual(len(report_directories), 1)
         document = json.loads(
             (report_directories[0] / "validation.json").read_text(encoding="utf-8"))
-        self.assertEqual(document["schema_version"], 4)
+        self.assertEqual(document["schema_version"], 5)
         finding = document["findings"]["errors"][0]
         self.assertEqual(finding["capture_run"], 2)
         self.assertEqual(finding["finalization_subphase"], "proposal_projection")
@@ -629,6 +630,7 @@ class CoordinatorFlowTests(unittest.TestCase):
 
     def test_enabled_call_order_is_fixed(self):
         events = []
+        controls = {}
         result = self.coordinator._minimal_c2_failure(
             RUN_ID, "source_capture_failed",
             capture_failure_kind="database_snapshot")
@@ -649,13 +651,17 @@ class CoordinatorFlowTests(unittest.TestCase):
                              side_effect=lambda: (events.append("policy") or POLICY)),                 patch.object(self.reporting, "create_validation_run_id",
                              side_effect=lambda: (events.append("run_id") or RUN_ID)),                 patch.object(self.coordinator, "_recover_stale_stages",
                              side_effect=lambda value: events.append("stale")),                 patch("station_director.dual_run.run_dual_comparison",
-                      side_effect=lambda *args: (events.append("c2") or result)),                 patch.object(self.reporting, "build_validation_report",
+                      side_effect=lambda *args, **kwargs: (events.append("c2") or controls.update(kwargs) or result)),                 patch.object(self.reporting, "build_validation_report",
                              side_effect=lambda *args: (events.append("projection") or Mock())),                 patch.object(self.reporting, "publish_validation_report",
                              side_effect=lambda value: (events.append("publication") or publication)):
             outcome = self.coordinator.validate_saved_proposal(VALID_PROPOSAL["proposal_id"])
         self.assertEqual(outcome.state, "failed")
         self.assertEqual(events, ["invocation", "lexical", "lock", "proposal", "policy",
                                   "run_id", "stale", "c2", "projection", "publication", "unlock"])
+        self.assertEqual(
+            controls["admission_cutoff"] - controls["control_started"], 6900)
+        self.assertEqual(
+            controls["control_deadline"] - controls["control_started"], 7200)
 
     def test_lock_busy_and_policy_rejection_create_no_report(self):
         validations = self.root / "runtime/director/validations"

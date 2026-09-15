@@ -74,6 +74,7 @@ def insert_catalog(connection, catalog_id, path, **changes):
 
 ROOT = Path(__file__).parents[1]
 
+
 GUIDE_MAGIC = b"FS42-GUIDE\x00\x01"
 GUIDE_VALUE = {"path": "/guide/test", "value": {"title": "Synthetic"}}
 
@@ -281,7 +282,29 @@ def synthetic_project(root, media):
         json.dumps({"station_conf": station_conf}) + "\n", encoding="utf-8"
     )
     (project / "runtime/watch_in_order_state.json").write_text("{}\n", encoding="utf-8")
-    create_database(project / "runtime/fs42_fluid.db").close()
+    connection = create_database(project / "runtime/fs42_fluid.db")
+    try:
+        now = "2026-09-14 00:00:00"
+        for name, relative in (
+            ("clip.mp4", "Synthetic/clip.mp4"),
+            ("other.mp4", "Synthetic/other.mp4"),
+            ("replacement.mp4", "replacement.mp4"),
+        ):
+            source = media / "synthetic" / relative
+            info = source.stat()
+            cached = f"/mnt/t7/CRT-Media/synthetic/{relative}"
+            connection.execute(
+                "INSERT INTO file_meta VALUES (?,?,?,?,?,?,?,?,?)",
+                (cached, 3600.0, info.st_size, now, info.st_mtime, now, now,
+                 json.dumps({"type": "video"}), "video"),
+            )
+            connection.execute(
+                "INSERT INTO chapter_points VALUES (?,?,?)",
+                (cached, "[]", now),
+            )
+        connection.commit()
+    finally:
+        connection.close()
     (project / "fs42").mkdir()
     shutil.copy(
         ROOT / "fs42/station_config_schema.json",
@@ -2263,7 +2286,9 @@ class DualRunLifecycleTests(unittest.TestCase):
                     "launcher_summary": {"outcome": "nonzero_exit",
                                          "stdout_bytes": 0, "stderr_bytes": 0,
                                          "stdout_truncated": False,
-                                         "stderr_truncated": False},
+                                         "stderr_truncated": False,
+                                         "termination_kind": "nonzero_exit",
+                                         "exit_status": 1, "signal": None},
                 }
                 if mutation == "phase":
                     result["failure"]["phase"] = "run_2"
@@ -2343,6 +2368,7 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
                     "-pix_fmt", "yuv420p", str(target),
                 ], check=True, timeout=30,
             )
+        shutil.copy2(content / "other.mp4", media / "synthetic/replacement.mp4")
         project = synthetic_project(root, media)
         proposal = base_proposal()
         proposal["directives"] = [{
@@ -2389,7 +2415,7 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
                         "SELECT id,content_json,plan_json FROM liquid_blocks ORDER BY start_time LIMIT 1"
                     ).fetchone()
                     catalog_id = int(json.loads(row[1]))
-                    replacement = str(media / "synthetic/Synthetic/other.mp4")
+                    replacement = str(media / "synthetic/replacement.mp4")
                     connection.execute(
                         "UPDATE catalog_entries SET path=?,realpath=? WHERE id=?",
                         (replacement, replacement, catalog_id),
@@ -2470,8 +2496,8 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
             self.assertTrue(all(not item["staged_main_config"] for item in details))
             self.assertEqual([item["cache_size"] for item in details], [1, 1])
             self.assertTrue(all(item["guide_validation"]["status"] == "pass" for item in details))
-            self.assertEqual(result["schema_version"], 2)
-            self.assertEqual([item["response_schema_version"] for item in details], [2, 2])
+            self.assertEqual(result["schema_version"], 3)
+            self.assertEqual([item["response_schema_version"] for item in details], [3, 3])
 
     def test_complete_genuine_lifecycle_detects_selected_media_difference(self):
         with tempfile.TemporaryDirectory() as directory:

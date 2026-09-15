@@ -416,6 +416,12 @@ class ScheduleComparisonTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_retained_v4_report_remains_schema_valid(self):
+        retained = copy.deepcopy(self.report)
+        retained["schema_version"] = 4
+        retained["software"]["report_schema_version"] = 4
+        validate_report_document(retained, retained=True)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.project = Path(self.temp.name) / "project"
@@ -447,8 +453,8 @@ class ReportTests(unittest.TestCase):
         return parent
 
     def test_software_identity_schema_and_deterministic_text(self):
-        self.assertEqual(self.report["schema_version"], 4)
-        self.assertEqual(self.report["software"]["report_schema_version"], 4)
+        self.assertEqual(self.report["schema_version"], 5)
+        self.assertEqual(self.report["software"]["report_schema_version"], 5)
         self.assertTrue(self.report["software"]["director_version"])
         self.assertLessEqual(len(self.report["software"]["director_version"]), 100)
         validate_document(self.report, REPORT_SCHEMA)
@@ -475,7 +481,8 @@ class ReportTests(unittest.TestCase):
             "launcher_summary": {
                 "outcome": "nonzero_exit", "stdout_bytes": 123,
                 "stderr_bytes": 456, "stdout_truncated": True,
-                "stderr_truncated": True},
+                "stderr_truncated": True, "termination_kind": "nonzero_exit",
+                "exit_status": 1, "signal": None},
         }
         report = build_validation_report(
             PROPOSAL, result, self.run_id, "2026-09-13T12:00:00Z")
@@ -485,7 +492,7 @@ class ReportTests(unittest.TestCase):
                          "worker_verification")
         self.assertEqual(set(finding["c1_diagnostic"]["launcher_summary"]), {
             "outcome", "stdout_bytes", "stderr_bytes", "stdout_truncated",
-            "stderr_truncated"})
+            "stderr_truncated", "termination_kind", "exit_status", "signal"})
         serialized = _canonical_json(report)
         for forbidden in (b"hunter2", b"/etc/shadow", b"ENVIRONMENT"):
             self.assertNotIn(forbidden, serialized)
@@ -504,12 +511,41 @@ class ReportTests(unittest.TestCase):
         with self.assertRaisesRegex(ReportError, "invalid C1"):
             validate_report_document(tampered)
 
+    def test_unknown_scheduler_state_survives_c2_report_digest_and_text(self):
+        result = _base_result("comparison")
+        result["phase_reached"] = "run_1"
+        result["scheduler_invoked"] = {"run_1": "unknown", "run_2": False}
+        result["source_checks"] = [{
+            "checkpoint": "after_capture", "passed": True,
+            "changed_categories": [],
+        }]
+        detail = make_diagnostic("worker_response_missing", "response")
+        detail["scheduler_invoked"] = "unknown"
+        result["failure"] = {
+            "phase": "run_1", "code": "c1_run_failed",
+            "category": "worker_response_missing",
+            "message": "An isolated native scheduling run failed.",
+            "c1_diagnostic": {"run": 1, "detail": detail},
+            "launcher_summary": {
+                "outcome": "nonzero_exit", "stdout_bytes": 0,
+                "stderr_bytes": 0, "stdout_truncated": False,
+                "stderr_truncated": False, "termination_kind": "nonzero_exit",
+                "exit_status": 1, "signal": None,
+            },
+        }
+        report = build_validation_report(
+            PROPOSAL, result, self.run_id, "2026-09-13T12:00:00Z")
+        self.assertEqual(report["validation"]["scheduler_invoked"]["run_1"],
+                         "unknown")
+        self.assertIn(b"run 1=unknown", render_validation_text(report))
+
     def test_autobump_diagnostics_are_value_free_through_report_digest_and_text(self):
         for code, phase, invoked in (
             ("autobump_subprocess_required", "configuration", False),
             ("autobump_subprocess_blocked", "scheduler", True),
             ("autobump_selected", "scheduler", True),
             ("invalid_playback_descriptor", "scheduler", True),
+            ("catalog_metadata_unavailable", "catalog", False),
         ):
             digests = []
             for poison in (
@@ -533,6 +569,8 @@ class ReportTests(unittest.TestCase):
                         "outcome": "nonzero_exit", "stdout_bytes": 0,
                         "stderr_bytes": 0, "stdout_truncated": False,
                         "stderr_truncated": False,
+                        "termination_kind": "nonzero_exit",
+                        "exit_status": 1, "signal": None,
                     },
                 }
                 report = build_validation_report(

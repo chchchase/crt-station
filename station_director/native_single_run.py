@@ -539,6 +539,7 @@ def _execute_native_single_run(request, attestation, restoration):
     scheduler_entered = False
     channel_inputs = {}
     unused_descriptor, autobump_runtime = _native_autobump_contract()
+    checkpoint = getattr(attestation, "checkpoint", None)
     for channel in affected:
         attestation.verify(request)
         history = histories[channel]
@@ -575,6 +576,8 @@ def _execute_native_single_run(request, attestation, restoration):
                 phase="configuration", channel=channel,
             )
         channel_inputs[channel] = (history, context, native_config)
+    if checkpoint is not None:
+        checkpoint.publish("configuration_completed")
 
     for channel in affected:
         history, context, native_config = channel_inputs[channel]
@@ -588,11 +591,15 @@ def _execute_native_single_run(request, attestation, restoration):
         try:
             catalog_started = time.monotonic()
             attestation.verify(request)
+            if checkpoint is not None:
+                checkpoint.publish("catalog_entered")
             with activate_validation_context(context):
                 ShowCatalog(
                     native_config, rebuild_catalog=True, load=False
                 )
             attestation.verify(request)
+            if checkpoint is not None:
+                checkpoint.publish("catalog_completed")
         except SystemExit as exc:
             raise NativeRunError(
                 "native_system_exit", f"native catalog exited with {exc.code!r}",
@@ -640,12 +647,16 @@ def _execute_native_single_run(request, attestation, restoration):
                 schedule = LiquidSchedule(native_config)
                 _map_catalog_in_memory(schedule)
             attestation.verify(request)
+            if checkpoint is not None:
+                checkpoint.publish("scheduler_entry")
             scheduler_entered = True
             restoration["scheduler_invoked"] = True
             schedule.generate_validation_range(
                 context.start_time, context.end_time, context
             )
             attestation.verify(request)
+            if checkpoint is not None:
+                checkpoint.publish("scheduler_completed")
             scheduler_seconds += time.monotonic() - scheduler_started
         except autobump_runtime.AutoBumpValidationSubprocessBlocked as exc:
             raise NativeRunError(

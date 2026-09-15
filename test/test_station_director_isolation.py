@@ -2,6 +2,7 @@ import fcntl
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -58,6 +59,173 @@ class FakeRunner:
 
 
 class IsolationTests(unittest.TestCase):
+    def test_authoritative_unit_termination_classification(self):
+        def payload(result, code, status, started="123", active="failed", sub="failed"):
+            return "\n".join((
+                "LoadState=loaded", f"ActiveState={active}", f"SubState={sub}",
+                f"Result={result}", f"ExecMainCode={code}",
+                f"ExecMainStatus={status}",
+                f"ExecMainStartTimestampMonotonic={started}",
+            )) + "\n"
+        cases = (
+            (payload("success", 1, 0, active="inactive", sub="dead"), "completed", 0, None, True),
+            (payload("success", 1, 0, active="active", sub="exited"), "completed", 0, None, True),
+            (payload("exit-code", 1, 7), "nonzero_exit", 7, None, True),
+            (payload("timeout", 2, 9), "runtime_timeout", None, 9, True),
+            (payload("oom-kill", 2, 9), "oom_kill", None, 9, True),
+            (payload("signal", 2, 15), "external_signal", None, 15, True),
+            (payload("signal", 2, 9), "external_signal", None, 9, True),
+            (payload("start-limit-hit", 0, 0, started="0"), "launcher_failure", None, None, False),
+        )
+        for raw, kind, exit_status, signal_number, started in cases:
+            with self.subTest(kind=kind), patch.object(
+                isolation.subprocess, "run", return_value=completed([], stdout=raw)
+            ):
+                evidence = isolation.inspect_unit_termination("fixed.service")
+            self.assertTrue(evidence["valid"])
+            self.assertEqual(evidence["termination_kind"], kind)
+            self.assertEqual(evidence["exit_status"], exit_status)
+            self.assertEqual(evidence["signal"], signal_number)
+            self.assertIs(evidence["main_process_started"], started)
+
+        running = payload("success", 0, 0, active="active", sub="running")
+        with patch.object(
+            isolation.subprocess, "run", return_value=completed([], stdout=running)
+        ):
+            ordinary = isolation.inspect_unit_termination("fixed.service")
+            polling = isolation.inspect_unit_termination(
+                "fixed.service", allow_running=True)
+            timed_out = isolation.inspect_unit_termination(
+                "fixed.service", launcher_timed_out=True)
+        self.assertFalse(ordinary["valid"])
+        self.assertEqual(ordinary["termination_kind"], "launcher_state_invalid")
+        self.assertTrue(polling["valid"])
+        self.assertEqual(polling["termination_kind"], "running")
+        self.assertTrue(timed_out["valid"])
+        self.assertEqual(timed_out["termination_kind"], "outer_watchdog")
+
+    def test_retained_active_exited_process_returns_promptly_with_properties(self):
+        running = {
+            "valid": True, "termination_kind": "running",
+            "exit_status": None, "signal": None,
+            "main_process_started": True,
+        }
+        terminal = {
+            "valid": True, "termination_kind": "completed",
+            "exit_status": 0, "signal": None,
+            "main_process_started": True,
+        }
+        started = time.monotonic()
+        with patch.object(
+            isolation, "inspect_unit_termination", side_effect=(running, terminal),
+        ) as inspect, patch.object(isolation, "UNIT_POLL_SECONDS", 0):
+            result = isolation._run_bounded(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                "fixed.service", 30, supervise_retained_unit=True,
+            )
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(result.timed_out)
+        self.assertTrue(result.unit_state_valid)
+        self.assertEqual(result.termination_kind, "completed")
+        self.assertEqual(result.exit_status, 0)
+        self.assertEqual(inspect.call_count, 2)
+        inspect.assert_called_with(
+            "fixed.service", allow_running=True,
+            inspection_timeout=isolation.UNIT_INSPECTION_TIMEOUT_SECONDS,
+        )
+
+    def test_retained_active_running_requires_affirmative_local_watchdog(self):
+        running = {
+            "valid": True, "termination_kind": "running",
+            "exit_status": None, "signal": None,
+            "main_process_started": True,
+        }
+        outer_timeout = {**running, "termination_kind": "outer_watchdog"}
+        def inspect(unused_unit, **kwargs):
+            return outer_timeout if kwargs.get("launcher_timed_out") else running
+        with patch.object(
+            isolation, "inspect_unit_termination", side_effect=inspect
+        ):
+            result = isolation._run_bounded(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                "fixed.service", 0.01, supervise_retained_unit=True,
+            )
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(result.termination_kind, "outer_watchdog")
+        self.assertTrue(result.main_process_started)
+
+    def test_missing_malformed_and_contradictory_unit_properties_fail_closed(self):
+        values = (
+            "LoadState=loaded\n",
+            "LoadState=loaded\nLoadState=loaded\n",
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=success\n"
+            "ExecMainCode=1\nExecMainStatus=9\nExecMainStartTimestampMonotonic=0\n",
+            "LoadState=loaded\nActiveState=active\nSubState=running\nResult=success\n"
+            "ExecMainCode=0\nExecMainStatus=0\nExecMainStartTimestampMonotonic=0\n",
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=timeout\n"
+            "ExecMainCode=1\nExecMainStatus=9\nExecMainStartTimestampMonotonic=123\n",
+            "LoadState=loaded\nActiveState=failed\nSubState=failed\nResult=signal\n"
+            "ExecMainCode=2\nExecMainStatus=255\nExecMainStartTimestampMonotonic=123\n",
+        )
+        for raw in values:
+            with self.subTest(raw=raw), patch.object(
+                isolation.subprocess, "run", return_value=completed([], stdout=raw)
+            ):
+                evidence = isolation.inspect_unit_termination("fixed.service")
+            self.assertFalse(evidence["valid"])
+            self.assertEqual(evidence["termination_kind"], "launcher_state_invalid")
+
+        with patch.object(
+            isolation.subprocess, "run",
+            return_value=completed([], returncode=1,
+                                   stderr="Unit could not be found"),
+        ):
+            evidence = isolation.inspect_unit_termination("fixed.service")
+        self.assertFalse(evidence["valid"])
+        self.assertIs(evidence["main_process_started"], None)
+
+    def test_systemd_run_exec_failure_is_the_only_launcher_local_never_started_proof(self):
+        with patch.object(
+            isolation.subprocess, "Popen", side_effect=FileNotFoundError("missing")
+        ):
+            result = isolation._run_bounded(
+                ["systemd-run", "--user", "--", "fixed"], "fixed.service", 1)
+        self.assertFalse(result.launcher_executed)
+        self.assertTrue(result.unit_state_valid)
+        self.assertIs(result.main_process_started, False)
+        self.assertEqual(result.termination_kind, "launcher_failure")
+
+    def test_cleanup_uses_one_deadline_and_attempts_the_production_maximum(self):
+        calls = []
+        def run(argv, **kwargs):
+            calls.append((tuple(argv), kwargs["timeout"]))
+            if argv[:3] == ["systemctl", "--user", "show"]:
+                return completed(argv, 0, stdout="loaded\n")
+            return completed(argv, 1, stderr="failed")
+        with patch.object(isolation.subprocess, "run", side_effect=run), patch.object(
+            isolation.time, "monotonic", side_effect=range(1, 20)
+        ):
+            ok, unused_detail = isolation.cleanup_unit("fixed.service", deadline=12)
+        self.assertFalse(ok)
+        self.assertEqual(len(calls), isolation.MAX_UNIT_CLEANUP_COMMANDS)
+        self.assertEqual(len([argv for argv, unused in calls if "show" in argv]), 3)
+        self.assertEqual(len([argv for argv, unused in calls if "kill" in argv]), 2)
+        self.assertTrue(all(0 < timeout <= isolation.CLEANUP_TIMEOUT_SECONDS
+                            for unused, timeout in calls))
+        self.assertLess(calls[-1][1], calls[0][1])
+
+    def test_native_timeout_hierarchy_has_no_timer_race(self):
+        self.assertLess(isolation.NATIVE_UNIT_HARD_LIMIT_SECONDS,
+                        isolation.NATIVE_OUTER_WATCHDOG_SECONDS)
+        self.assertEqual(isolation.NATIVE_UNIT_HARD_LIMIT_SECONDS, 2700)
+        self.assertEqual(isolation.NATIVE_OUTER_WATCHDOG_SECONDS, 2730)
+        source = Path(isolation.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('"--collect"', source)
+        self.assertIn('"--property=RemainAfterExit=yes"', source)
+        self.assertIn("supervise_retained_unit=True", source)
+
     def run_mocked_preflight(self, directory, mode="success", profile="standard"):
         root = Path(directory)
         (root / "runtime/director").mkdir(parents=True, exist_ok=True)

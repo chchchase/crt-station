@@ -14,7 +14,7 @@ from pathlib import Path
 
 from station_director import validation_control
 from station_director.c1_diagnostics import (
-    DIAGNOSTIC_RULES, MAX_LAUNCH_BYTE_COUNT, validate_diagnostic,
+    DIAGNOSTIC_RULES, MAX_LAUNCH_BYTE_COUNT,
 )
 
 
@@ -100,8 +100,9 @@ class CoordinatorOutcome:
 
     def __post_init__(self):
         states = {"disabled", "rejected", "passed", "failed", "interrupted"}
-        if self.state not in states or self.scheduler_invoked not in (
-                (False, False), (True, False), (True, True)):
+        scheduler_values = (True, False, "unknown")
+        if (self.state not in states or len(self.scheduler_invoked) != 2
+                or any(value not in scheduler_values for value in self.scheduler_invoked)):
             raise ValueError("invalid coordinator outcome")
         if self.state == "disabled" and any((
                 self.proposal_id, self.run_id, self.validation_status, self.phase,
@@ -147,6 +148,7 @@ class CoordinatorOutcome:
                       "baseline_comparison_failed", "baseline_summary_mismatch",
                       "unexpected_schedule_difference", "input_changed",
                       "cleanup_failed", "validation_interrupted",
+                      "finalization_deadline_overrun",
                       "stale_stage_cleanup_failed", "stale_unit_not_absent",
                       "stale_stage_scan_limit", "stale_stage_ambiguous",
                       "internal_error", "publication_failed",
@@ -175,7 +177,8 @@ class CoordinatorOutcome:
                 "fingerprint_category": self.c1_fingerprint_category,
                 "channel_number": self.c1_channel_number,
             }
-            validate_diagnostic(detail)
+            from station_director.c1_diagnostics import validate_host_diagnostic
+            validate_host_diagnostic(detail)
             if self.c1_launcher_outcome not in {
                     "completed", "nonzero_exit", "timed_out", "launch_error"}:
                 raise ValueError("invalid C1 launcher outcome")
@@ -446,7 +449,8 @@ def _minimal_c2_failure(run_id, code, phase="capture", source=None, *,
 def _outcome_from_result(proposal_id, run_id, result, publication=None,
                          publication_error=None):
     schedulers = result.get("scheduler_invoked", {})
-    scheduler_tuple = (bool(schedulers.get("run_1")), bool(schedulers.get("run_2")))
+    scheduler_tuple = (schedulers.get("run_1", "unknown"),
+                       schedulers.get("run_2", "unknown"))
     cleanup = result.get("cleanup", [])
     cleanup_passed = (all(item.get("passed") for item in cleanup)
                       if cleanup else None)
@@ -556,8 +560,8 @@ def _outcome_without_report(proposal_id, run_id, result, code):
                              if code == "c1_run_failed" else None),
         c1_stderr_truncated=(launcher.get("stderr_truncated")
                              if code == "c1_run_failed" else None),
-        scheduler_invoked=(bool(schedulers.get("run_1")),
-                           bool(schedulers.get("run_2"))),
+        scheduler_invoked=(schedulers.get("run_1", "unknown"),
+                           schedulers.get("run_2", "unknown")),
         cleanup_passed=(all(item.get("passed") for item in cleanup)
                         if cleanup else None),
         quarantined=any(item.get("quarantined") for item in cleanup),

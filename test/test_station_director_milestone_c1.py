@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+import warnings
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -27,7 +28,8 @@ from station_director.single_run_protocol import (
     MAX_DOCUMENT_BYTES,
     ProtocolError,
     REQUEST_SCHEMA,
-    RESPONSE_SCHEMA_V2 as RESPONSE_SCHEMA,
+    RESPONSE_SCHEMA_V3 as RESPONSE_SCHEMA,
+    RESPONSE_SCHEMA_V2,
     RESPONSE_SCHEMA_V1,
     bind_request,
     strict_json_loads,
@@ -72,6 +74,13 @@ from station_director.worker_bootstrap import (
     finalize_work_tree,
     projected_configuration_documents,
 )
+from station_director.worker_checkpoint import (
+    CHECKPOINT_DIRECTORY,
+    CheckpointWriter,
+    WorkerCheckpointError,
+    read_checkpoint_evidence,
+    _validate_transitions,
+)
 from test.test_station_director_schedule import base_proposal
 from test.test_station_director_milestone_b2 import (
     catalog_row,
@@ -81,6 +90,237 @@ from test.test_station_director_milestone_b2 import (
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def publish_completed_worker_checkpoints(stage):
+    with CheckpointWriter(stage) as writer:
+        for state in (
+            "worker_started", "probes_passed", "snapshot_verified",
+            "seed_verified", "request_verified", "native_import_completed",
+            "configuration_completed", "catalog_entered", "catalog_completed",
+            "scheduler_entry", "scheduler_completed",
+            "response_publication_attempted", "response_publication_completed",
+        ):
+            writer.publish(state)
+
+
+class WorkerCheckpointTests(unittest.TestCase):
+    def test_canonical_sequence_and_exact_pending_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory)
+            stage.chmod(0o700)
+            with CheckpointWriter(stage) as writer:
+                for state in (
+                    "worker_started", "probes_passed", "snapshot_verified",
+                    "seed_verified", "request_verified", "native_import_completed",
+                    "configuration_completed", "catalog_entered", "catalog_completed",
+                    "scheduler_entry", "scheduler_completed",
+                    "response_publication_attempted", "response_publication_completed",
+                ):
+                    writer.publish(state)
+            evidence = read_checkpoint_evidence(stage)
+            self.assertTrue(evidence.worker_started)
+            self.assertTrue(evidence.scheduler_entered)
+            self.assertTrue(evidence.response_completed)
+
+            tail = stage / CHECKPOINT_DIRECTORY / "pending-14.json"
+            tail.write_bytes(b'{"partial"')
+            tail.chmod(0o600)
+            evidence = read_checkpoint_evidence(stage)
+            self.assertTrue(evidence.ignored_pending_tail)
+            self.assertEqual(len(evidence.states), 13)
+
+    def test_checkpoint_gaps_replacements_and_bad_transitions_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory); stage.chmod(0o700)
+            with CheckpointWriter(stage) as writer:
+                writer.publish("worker_started")
+                with self.assertRaises(WorkerCheckpointError):
+                    writer.publish("seed_verified")
+            root = stage / CHECKPOINT_DIRECTORY
+            wrong = root / "pending-03.json"
+            wrong.write_text("", encoding="utf-8"); wrong.chmod(0o600)
+            with self.assertRaises(WorkerCheckpointError):
+                read_checkpoint_evidence(stage)
+            wrong.unlink()
+            target = root / "checkpoint-01.json"
+            alias = root / "pending-02.json"
+            os.link(target, alias)
+            with self.assertRaises(WorkerCheckpointError):
+                read_checkpoint_evidence(stage)
+
+    def test_worker_started_is_required_first_and_seventh_cycle_prefixes_fail(self):
+        with self.assertRaises(WorkerCheckpointError):
+            _validate_transitions(("response_publication_attempted",))
+        prefix = (
+            "worker_started", "probes_passed", "snapshot_verified",
+            "seed_verified", "request_verified", "native_import_completed",
+            "configuration_completed",
+        )
+        cycle = ("catalog_entered", "catalog_completed", "scheduler_entry",
+                 "scheduler_completed")
+        for length in range(1, len(cycle) + 1):
+            with self.subTest(length=length), self.assertRaises(WorkerCheckpointError):
+                _validate_transitions(prefix + cycle * 6 + cycle[:length])
+
+    def test_worker_checkpoint_module_has_no_runtime_or_fs42_dependency(self):
+        source = (ROOT / "station_director/worker_checkpoint.py").read_text()
+        tree = ast.parse(source)
+        imported = {node.module for node in ast.walk(tree)
+                    if isinstance(node, ast.ImportFrom) and node.module}
+        imported.update(alias.name for node in ast.walk(tree)
+                        if isinstance(node, ast.Import) for alias in node.names)
+        self.assertFalse(any(name.startswith("fs42") for name in imported))
+        self.assertFalse(imported & {"subprocess", "socket", "urllib", "requests"})
+
+    def test_scheduler_attestation_precedence_for_abnormal_termination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory); stage.chmod(0o700)
+            media = stage / "media"; media.mkdir()
+            request = request_for(stage, media)
+            lifecycle = SingleRunLifecycle(
+                ROOT, stage, types.SimpleNamespace(closed=False), "token",
+                request["run_id"], "unit", request,
+                launcher_result=LaunchResult(
+                    "unit", 1, "", "", termination_kind="external_signal",
+                    signal=9, main_process_started=True, unit_state_valid=True),
+            )
+            with CheckpointWriter(stage) as writer:
+                for state in (
+                    "worker_started", "probes_passed", "snapshot_verified",
+                    "seed_verified", "request_verified", "native_import_completed",
+                    "configuration_completed", "catalog_entered", "catalog_completed",
+                    "scheduler_entry",
+                ):
+                    writer.publish(state)
+            with self.assertRaises(SingleRunError) as caught:
+                inspect_single_run(lifecycle)
+            self.assertEqual(caught.exception.c1_diagnostic["code"],
+                             "worker_external_signal")
+            self.assertIs(caught.exception.scheduler_state, True)
+
+    def test_started_missing_response_is_unknown_but_never_started_is_false(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); root.chmod(0o700)
+            media = root / "media"; media.mkdir()
+            request = request_for(root, media)
+            for started, expected in ((True, "unknown"), (False, False)):
+                lifecycle = SingleRunLifecycle(
+                    ROOT, root, types.SimpleNamespace(closed=False), "token",
+                    request["run_id"], "unit", request,
+                    launcher_result=LaunchResult(
+                        "unit", 1, "", "",
+                        termination_kind=("nonzero_exit" if started else "launcher_failure"),
+                        exit_status=(1 if started else None),
+                        main_process_started=started, unit_state_valid=True),
+                )
+                with self.subTest(started=started), self.assertRaises(SingleRunError) as caught:
+                    inspect_single_run(lifecycle)
+                self.assertEqual(caught.exception.scheduler_state, expected)
+
+    def test_missing_unit_after_launcher_execution_is_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); root.chmod(0o700)
+            media = root / "media"; media.mkdir()
+            request = request_for(root, media)
+            lifecycle = SingleRunLifecycle(
+                ROOT, root, types.SimpleNamespace(closed=False), "token",
+                request["run_id"], "unit", request,
+                launcher_result=LaunchResult(
+                    "unit", 1, "", "", termination_kind="launcher_state_invalid",
+                    main_process_started=None, unit_state_valid=False,
+                    launcher_executed=True),
+            )
+            with self.assertRaises(SingleRunError) as caught:
+                inspect_single_run(lifecycle)
+            self.assertEqual(caught.exception.c1_diagnostic["code"],
+                             "launcher_state_invalid")
+            self.assertEqual(caught.exception.scheduler_state, "unknown")
+
+    def test_validation_media_guards_precede_probe_decoder_and_subprocess(self):
+        import datetime
+        from fs42 import media_processor
+        from fs42.scheduling_context import (
+            ValidationCatalogMetadataUnavailable,
+            ValidationSchedulingContext,
+            activate_validation_context,
+        )
+        context = ValidationSchedulingContext(
+            datetime.datetime(2026, 9, 14), datetime.datetime(2026, 9, 14),
+            datetime.datetime(2026, 9, 15), 1,
+        )
+        with activate_validation_context(context), patch.object(
+            media_processor.ffmpeg, "probe"
+        ) as probe, patch.object(
+            media_processor, "VideoFileClip"
+        ) as decoder, patch("subprocess.run") as process:
+            with self.assertRaises(ValidationCatalogMetadataUnavailable):
+                media_processor.MediaProcessor._get_duration("opaque")
+            with self.assertRaises(ValidationCatalogMetadataUnavailable):
+                media_processor.MediaProcessor.black_detect("opaque", 1)
+            with self.assertRaises(ValidationCatalogMetadataUnavailable):
+                media_processor.MediaProcessor.chapter_detect("opaque", 1)
+        probe.assert_not_called()
+        decoder.assert_not_called()
+        process.assert_not_called()
+
+    def test_ordinary_media_probe_keeps_its_native_argument(self):
+        from fs42 import media_processor
+        with patch.object(
+            media_processor.ffmpeg, "probe",
+            return_value={"format": {"duration": "12.5"}},
+        ) as probe:
+            duration, error = media_processor.MediaProcessor._get_duration(
+                "ordinary-native-argument")
+        self.assertEqual((duration, error), (12.5, None))
+        probe.assert_called_once_with("ordinary-native-argument")
+
+    def test_validation_direct_cache_lookup_requires_current_typed_metadata(self):
+        import datetime
+        from fs42.fluid_statements import FluidStatements
+        from fs42.scheduling_context import (
+            ValidationCatalogMetadataUnavailable,
+            ValidationSchedulingContext,
+            activate_validation_context,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "media"; media.mkdir()
+            item = media / "item.mp4"; item.write_bytes(b"fixture")
+            info = item.stat()
+            database = root / "cache.db"
+            connection = sqlite3.connect(database)
+            FluidStatements.init_db(connection)
+            connection.execute(
+                "INSERT INTO file_meta VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("/mnt/t7/CRT-Media/item.mp4", 12.0, info.st_size, 1,
+                 info.st_mtime, 1, 1, '{"type":"movie"}', "video"),
+            )
+            connection.commit()
+            context = ValidationSchedulingContext(
+                datetime.datetime(2026, 9, 14), datetime.datetime(2026, 9, 14),
+                datetime.datetime(2026, 9, 15), 1, media_root=str(media),
+            )
+            with activate_validation_context(context):
+                self.assertEqual(
+                    FluidStatements.check_file_cache(connection, str(item)).duration,
+                    12.0)
+                connection.execute(
+                    "UPDATE file_meta SET meta=? WHERE path=?",
+                    ("{}", "/mnt/t7/CRT-Media/item.mp4"),
+                )
+                connection.commit()
+                with self.assertRaises(ValidationCatalogMetadataUnavailable):
+                    FluidStatements.check_file_cache(connection, str(item))
+                connection.execute(
+                    "UPDATE file_meta SET meta=?, size=? WHERE path=?",
+                    ('{"type":"movie"}', info.st_size + 1,
+                     "/mnt/t7/CRT-Media/item.mp4"),
+                )
+                connection.commit()
+                with self.assertRaises(ValidationCatalogMetadataUnavailable):
+                    FluidStatements.check_file_cache(connection, str(item))
+            connection.close()
 
 
 def test_attestation(request):
@@ -1225,16 +1465,21 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                     datetime.datetime(2026, 9, 14), datetime.datetime(2026, 9, 14),
                     datetime.datetime(2026, 9, 15), 7,
                 )
+                manager = StationManager()
+                self.assertEqual(manager.server_conf["db_path"], "runtime/fs42_fluid.db")
+                self.assertTrue(manager.server_conf["start_mpv"])
+                self.assertEqual(manager.server_conf["custom_holidays"], {})
+                config = manager.station_by_name("Synthetic Loop")
+                self.assertIsNotNone(config)
+                ShowCatalog(config, rebuild_catalog=True, load=False)
                 with activate_validation_context(context):
-                    manager = StationManager()
-                    self.assertEqual(manager.server_conf["db_path"], "runtime/fs42_fluid.db")
-                    self.assertTrue(manager.server_conf["start_mpv"])
-                    self.assertEqual(manager.server_conf["custom_holidays"], {})
-                    config = manager.station_by_name("Synthetic Loop")
-                    self.assertIsNotNone(config)
-                    ShowCatalog(config, rebuild_catalog=True, load=False)
                     schedule = LiquidSchedule(config)
-                schedule.generate_validation_range(context.start_time, context.end_time, context)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", category=DeprecationWarning,
+                        message="The default datetime adapter is deprecated.*")
+                    schedule.generate_validation_range(
+                        context.start_time, context.end_time, context)
                 connection = sqlite3.connect(root / "runtime/fs42_fluid.db")
                 try:
                     self.assertGreater(connection.execute(
@@ -1653,6 +1898,34 @@ class SyntheticNativeEngineTests(unittest.TestCase):
             self.assertTrue(caught.exception.scheduler_invoked)
             runner.assert_not_called()
 
+    def test_cache_metadata_absence_has_its_distinct_fixed_catalog_diagnostic(self):
+        from fs42.scheduling_context import ValidationCatalogMetadataUnavailable
+        from station_director import native_single_run as native
+
+        class Catalog:
+            def __init__(self, *unused, **unused_kwargs):
+                raise ValidationCatalogMetadataUnavailable(
+                    "private path and media identity")
+
+        with tempfile.TemporaryDirectory() as directory:
+            work, media, request, projected = self._fixture(Path(directory))
+            with patch.object(
+                native, "_verified_work_tree",
+                return_value=(work, projected, ["Action"], {"Action": 2}, 0),
+            ), patch.object(
+                native, "_native_station_config",
+                side_effect=lambda channel, unused_context: projected[channel]["station_conf"],
+            ), patch.object(native, "MEDIA_ROOT", media), patch.object(
+                native, "ShowCatalog", Catalog
+            ), patch.object(native, "LiquidSchedule") as schedule:
+                with self.assertRaises(native.NativeRunError) as caught:
+                    native.execute_native_single_run(request, test_attestation(request))
+            self.assertEqual(caught.exception.code, "catalog_metadata_unavailable")
+            self.assertEqual(caught.exception.phase, "catalog")
+            self.assertFalse(caught.exception.scheduler_invoked)
+            self.assertNotIn("private", str(caught.exception))
+            schedule.assert_not_called()
+
     def test_malformed_autobump_remains_native_configuration_error(self):
         from station_director import native_single_run as native
 
@@ -1844,7 +2117,7 @@ class VersionedDiagnosticTests(unittest.TestCase):
 
     def _success_response(self, request):
         return {
-            "schema_version": 2, "operation": "native_single_run",
+            "schema_version": 3, "operation": "native_single_run",
             "run_id": request["run_id"],
             "proposal_id": request["proposal"]["proposal_id"],
             "status": "success", "phase_reached": "complete",
@@ -1864,6 +2137,43 @@ class VersionedDiagnosticTests(unittest.TestCase):
                            "preservation": 0, "guide": 0, "total": 1},
             "diagnostics": {"messages": [], "truncated": False},
         }
+
+    def test_response_construction_and_publication_failures_leave_fixed_checkpoint(self):
+        for target in ("_base_response", "write_private_json_exclusive"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                request, request_path = self._request_file(root)
+                patches = [patch(
+                    "station_director.single_run_worker.attest_before_native_import",
+                    return_value=(probes(request["run_id"]), test_attestation(request)),
+                )]
+                if target == "_base_response":
+                    patches.append(patch(
+                        "station_director.single_run_worker._base_response",
+                        side_effect=RuntimeError("opaque")))
+                else:
+                    fake = types.SimpleNamespace(execute_native_single_run=lambda *unused: {
+                        "channels": [passing_channel()],
+                        "preservation": {"retained_history": "pass", "protected_channels": "pass",
+                                         "sequence_tables_restored": "pass", "foreign_key_baseline": "pass"},
+                        "path_validation": {"passed": True, "mapping_count": 0, "scheduled_path_checks": 0},
+                        "guide_validation": passing_guide(), "timings_ms": {},
+                        "verification": passing_verification(), "scheduler_invoked": True,
+                    })
+                    patches.extend((
+                        patch("station_director.single_run_worker.write_private_json_exclusive",
+                              side_effect=OSError("opaque")),
+                        patch("station_director.single_run_worker.importlib.import_module",
+                              return_value=fake),
+                    ))
+                with ExitStack() as stack:
+                    for active in patches:
+                        stack.enter_context(active)
+                    with self.assertRaises((RuntimeError, OSError)):
+                        run_worker(request_path, root / "response.json")
+                evidence = read_checkpoint_evidence(root)
+                self.assertTrue(evidence.response_attempted)
+                self.assertFalse(evidence.response_completed)
 
     def test_dependency_free_rules_are_strict_and_value_free(self):
         source = (ROOT / "station_director/c1_diagnostics.py").read_text()
@@ -1910,7 +2220,7 @@ class VersionedDiagnosticTests(unittest.TestCase):
                 ) as loader:
                     result = run_worker(request_path, root / "response.json")
                 loader.assert_not_called()
-                self.assertEqual(result["schema_version"], 2)
+                self.assertEqual(result["schema_version"], 3)
                 self.assertEqual(result["failure"]["code"], code)
                 self.assertEqual(result["failure"]["probe"], probe)
                 self.assertEqual(result["failure"]["fingerprint_category"], category)
@@ -1936,6 +2246,7 @@ class VersionedDiagnosticTests(unittest.TestCase):
             ("invalid_configuration", "configuration", False),
             ("autobump_subprocess_required", "configuration", False),
             ("catalog_failure", "catalog", False),
+            ("catalog_metadata_unavailable", "catalog", False),
             ("scheduler_failure", "scheduler", True),
             ("autobump_subprocess_blocked", "scheduler", True),
             ("autobump_selected", "scheduler", True),
@@ -2014,6 +2325,42 @@ class VersionedDiagnosticTests(unittest.TestCase):
                 write_private_json_exclusive(root / "response.json", response,
                                              RESPONSE_SCHEMA)
 
+    def test_frozen_v2_remains_readable_but_production_rejects_downgrade(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request, unused = self._request_file(root)
+            response = self._success_response(request)
+            response["schema_version"] = 2
+            path = root / "native-single-run.response.json"
+            write_private_json_exclusive(path, response, RESPONSE_SCHEMA_V2)
+            with HeldDocument(path, RESPONSE_SCHEMA_V2) as retained:
+                self.assertEqual(retained.payload["schema_version"], 2)
+            lifecycle = SingleRunLifecycle(
+                ROOT, root, types.SimpleNamespace(closed=False), "token",
+                request["run_id"], "unit", request,
+                launcher_result=LaunchResult("unit", 0, "", ""))
+            with self.assertRaises(SingleRunError) as caught:
+                inspect_single_run(lifecycle)
+            self.assertEqual(caught.exception.c1_diagnostic["code"],
+                             "worker_response_invalid")
+
+    def test_valid_v3_response_cannot_bypass_missing_checkpoint_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request, unused = self._request_file(root)
+            response = self._success_response(request)
+            write_private_json_exclusive(
+                root / "native-single-run.response.json", response, RESPONSE_SCHEMA)
+            lifecycle = SingleRunLifecycle(
+                ROOT, root, types.SimpleNamespace(closed=False), "token",
+                request["run_id"], "unit", request,
+                launcher_result=LaunchResult("unit", 0, "", ""))
+            with self.assertRaises(SingleRunError) as caught:
+                inspect_single_run(lifecycle)
+            self.assertEqual(caught.exception.c1_diagnostic["code"],
+                             "worker_checkpoint_mismatch")
+            self.assertEqual(caught.exception.scheduler_state, "unknown")
+
     def test_host_classifies_every_response_acquisition_boundary(self):
         variants = (
             ("missing", "worker_response_missing"),
@@ -2051,12 +2398,13 @@ class VersionedDiagnosticTests(unittest.TestCase):
                         response["channels"][0]["name"] = "After School"
                     elif variant == "exit": lifecycle.launcher_result.returncode = 1
                     write_private_json_exclusive(response_path, response, RESPONSE_SCHEMA)
+                    publish_completed_worker_checkpoints(root)
                 with self.assertRaises(SingleRunError) as caught:
                     inspect_single_run(lifecycle)
                 self.assertEqual(caught.exception.c1_diagnostic["code"], code)
                 self.assertEqual(set(caught.exception.launcher_summary), {
                     "outcome", "stdout_bytes", "stderr_bytes", "stdout_truncated",
-                    "stderr_truncated"})
+                    "stderr_truncated", "termination_kind", "exit_status", "signal"})
                 self.assertNotIn("secret", json.dumps(caught.exception.launcher_summary))
                 self.assertNotIn("shadow", json.dumps(caught.exception.launcher_summary))
 
@@ -2243,7 +2591,8 @@ class LifecycleTests(unittest.TestCase):
             stage.mkdir(mode=0o700)
             observed = {}
 
-            def launch(command, unit, timeout):
+            def launch(command, unit, timeout, *, supervise_retained_unit):
+                self.assertTrue(supervise_retained_unit)
                 transient = stage / "transient"
                 observed["exists"] = transient.is_dir()
                 observed["mode"] = transient.stat().st_mode & 0o777
@@ -2323,7 +2672,10 @@ class LifecycleTests(unittest.TestCase):
             stage = root / "fs42-i-123456abcdef"
             stage.mkdir(mode=0o700)
 
-            def replace_during_launch(unused_command, unit, unused_timeout):
+            def replace_during_launch(
+                unused_command, unit, unused_timeout, *, supervise_retained_unit,
+            ):
+                self.assertTrue(supervise_retained_unit)
                 transient = stage / "transient"
                 transient.rename(stage / "replaced-transient")
                 transient.mkdir(mode=0o700)
@@ -2360,7 +2712,8 @@ class LifecycleTests(unittest.TestCase):
             stage.mkdir(mode=0o700)
             captured = {}
 
-            def launch(command, unit, timeout):
+            def launch(command, unit, timeout, *, supervise_retained_unit):
+                self.assertTrue(supervise_retained_unit)
                 captured["command"] = command
                 return LaunchResult(unit, 0, "", "")
 
@@ -2423,7 +2776,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn("/project/station_director/single_run_worker.py", launcher.args[1])
             self.assertTrue(launcher.args[4])
             response = {
-                "schema_version": 2, "operation": "native_single_run",
+                "schema_version": 3, "operation": "native_single_run",
                 "run_id": request["run_id"], "proposal_id": request["proposal"]["proposal_id"],
                 "status": "success", "phase_reached": "complete", "scheduler_invoked": True,
                 "validation_context": {
@@ -2449,6 +2802,7 @@ class LifecycleTests(unittest.TestCase):
                 "diagnostics": {"messages": [], "truncated": False},
             }
             write_private_json_exclusive(root / "native-single-run.response.json", response, RESPONSE_SCHEMA)
+            publish_completed_worker_checkpoints(root)
             self.assertEqual(inspect_single_run(lifecycle)["status"], "success")
             self.assertIsNotNone(lifecycle.response)
 
@@ -2486,7 +2840,7 @@ class LifecycleTests(unittest.TestCase):
                 "station_director.single_run.cleanup_staging_directory",
                 return_value=(True, "removed"),
             ):
-                with self.assertRaisesRegex(SingleRunError, "unit remained"):
+                with self.assertRaisesRegex(SingleRunError, "could not be proven absent"):
                     lifecycle.cleanup()
             self.assertFalse(lifecycle.lock.closed)
 

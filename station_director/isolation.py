@@ -21,6 +21,8 @@ STAGING_PARENT = Path("/tmp")
 STAGING_RE = re.compile(r"fs42-i-[0-9a-f]{12}\Z")
 STAGING_MAX_AGE_SECONDS = 6 * 60 * 60
 UNIT_TIMEOUT_SECONDS = 30
+UNIT_INSPECTION_TIMEOUT_SECONDS = 15
+UNIT_POLL_SECONDS = 1.0
 CLEANUP_TIMEOUT_SECONDS = 10
 MAX_CAPTURE_BYTES = 64 * 1024
 PROBE_OUTPUT = "preflight-probe.json"
@@ -39,6 +41,12 @@ class LaunchResult:
     stderr_bytes: int = 0
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    termination_kind: str = "completed"
+    exit_status: object = None
+    signal: object = None
+    main_process_started: object = None
+    unit_state_valid: bool = False
+    launcher_executed: bool = True
 
 
 def _utc_now():
@@ -107,7 +115,8 @@ def _is_absent_unit_message(value):
 
 def _run_cleanup_command(argv):
     try:
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=CLEANUP_TIMEOUT_SECONDS)
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=CLEANUP_TIMEOUT_SECONDS)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     detail = (completed.stderr or completed.stdout).strip()
@@ -403,35 +412,50 @@ class IsolationLauncher:
                 self.project_root, staging_path, sandbox_argv,
                 stage_tmp=stage_tmp, verified_temporary=temporary,
             )
+            unit_timeout = max(1, timeout - 5)
             command = [
                 "systemd-run",
                 "--user",
                 "--quiet",
                 "--wait",
-                "--collect",
                 "--pipe",
                 "--service-type=exec",
                 f"--unit={unit_name}",
                 "--property=RestrictAddressFamilies=AF_UNIX",
-                f"--property=RuntimeMaxSec={max(1, timeout - 5)}s",
+                "--property=RemainAfterExit=yes",
+                f"--property=RuntimeMaxSec={int(unit_timeout)}s",
                 "--",
                 *bwrap,
             ]
-            result = _run_bounded(command, unit_name, timeout)
+            result = _run_bounded(
+                command, unit_name, timeout, supervise_retained_unit=True)
+            if not result.launcher_executed:
+                return result
             if temporary is not None:
-                temporary.assert_ready()
+                try:
+                    temporary.assert_ready()
+                except Exception as exc:
+                    exc.launcher_result = result
+                    raise
             return result
         finally:
             if temporary is not None:
                 temporary.close()
 
 
-def _run_bounded(command, unit_name, timeout, limit=MAX_CAPTURE_BYTES):
+def _run_bounded(
+    command, unit_name, timeout, limit=MAX_CAPTURE_BYTES, *,
+    supervise_retained_unit=False,
+):
     """Drain both child streams fully while retaining only bounded prefixes."""
     try:
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError as exc:
-        return LaunchResult(unit_name, 127, "", str(exc), stderr_bytes=len(str(exc).encode()))
+        return LaunchResult(
+            unit_name, 127, "", str(exc), stderr_bytes=len(str(exc).encode()),
+            termination_kind="launcher_failure", main_process_started=False,
+            unit_state_valid=True, launcher_executed=False,
+        )
     captures = {"stdout": bytearray(), "stderr": bytearray()}
     totals = {"stdout": 0, "stderr": 0}
     def drain(name, pipe):
@@ -450,17 +474,63 @@ def _run_bounded(command, unit_name, timeout, limit=MAX_CAPTURE_BYTES):
     for thread in threads:
         thread.start()
     timed_out = False
-    try:
-        returncode = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        process.terminate()
+    evidence = None
+    if supervise_retained_unit:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                evidence = inspect_unit_termination(
+                    unit_name, launcher_timed_out=True,
+                    inspection_timeout=UNIT_INSPECTION_TIMEOUT_SECONDS,
+                )
+                break
+            evidence = inspect_unit_termination(
+                unit_name, allow_running=True,
+                inspection_timeout=min(
+                    UNIT_INSPECTION_TIMEOUT_SECONDS, remaining),
+            )
+            if (evidence["valid"]
+                    and evidence["termination_kind"] != "running"):
+                break
+            launcher_status = process.poll()
+            if launcher_status is not None:
+                break
+            time.sleep(min(UNIT_POLL_SECONDS, remaining))
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        if evidence is not None and evidence["valid"]:
+            kind = evidence["termination_kind"]
+            if kind == "completed":
+                returncode = 0
+            elif kind == "nonzero_exit":
+                returncode = evidence["exit_status"]
+            elif kind in {"runtime_timeout", "outer_watchdog"}:
+                returncode = 124
+            else:
+                returncode = 1
+        else:
+            returncode = process.returncode
+            if returncode is None:
+                returncode = 124 if timed_out else 1
+    else:
         try:
-            process.wait(timeout=2)
+            returncode = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2)
-        returncode = 124
+            timed_out = True
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+            returncode = 124
     for thread in threads:
         thread.join(timeout=5)
     def decoded(name):
@@ -472,11 +542,144 @@ def _run_bounded(command, unit_name, timeout, limit=MAX_CAPTURE_BYTES):
             r"\1=[REDACTED]", value,
         )
         return value
-    return LaunchResult(
+    result = LaunchResult(
         unit_name, returncode, decoded("stdout"), decoded("stderr"), timed_out,
         totals["stdout"], totals["stderr"], totals["stdout"] > limit,
         totals["stderr"] > limit,
     )
+    if evidence is not None:
+        result.termination_kind = evidence["termination_kind"]
+        result.exit_status = evidence["exit_status"]
+        result.signal = evidence["signal"]
+        result.main_process_started = evidence["main_process_started"]
+        result.unit_state_valid = evidence["valid"]
+    return result
+
+
+_UNIT_PROPERTIES = (
+    "LoadState", "ActiveState", "SubState", "Result", "ExecMainCode",
+    "ExecMainStatus", "ExecMainStartTimestampMonotonic",
+)
+_UNIT_RESULTS = {
+    "success", "exit-code", "signal", "core-dump", "timeout", "oom-kill",
+    "resources", "protocol", "start-limit-hit", "condition", "assert",
+    "watchdog", "exec-condition", "skipped",
+}
+_EXEC_CODES = {"0": "", "1": "exited", "2": "killed", "3": "dumped",
+               "": "", "exited": "exited", "killed": "killed", "dumped": "dumped"}
+
+
+def _invalid_unit_evidence():
+    return {
+        "valid": False, "termination_kind": "launcher_state_invalid",
+        "exit_status": None, "signal": None, "main_process_started": None,
+    }
+
+
+def inspect_unit_termination(
+    unit_name, *, launcher_timed_out=False, allow_running=False,
+    inspection_timeout=UNIT_INSPECTION_TIMEOUT_SECONDS,
+):
+    """Capture fixed systemd properties before cleanup; never expose raw values."""
+    argv = [
+        "systemctl", "--user", "show", "--no-pager",
+        "--property=" + ",".join(_UNIT_PROPERTIES), unit_name,
+    ]
+    try:
+        shown = subprocess.run(
+            argv, capture_output=True, text=True,
+            timeout=max(0.001, min(
+                UNIT_INSPECTION_TIMEOUT_SECONDS, inspection_timeout)),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return _invalid_unit_evidence()
+    if shown.returncode != 0:
+        return _invalid_unit_evidence()
+    values = {}
+    for line in shown.stdout.splitlines():
+        if line.count("=") != 1:
+            return _invalid_unit_evidence()
+        name, value = line.split("=", 1)
+        if name not in _UNIT_PROPERTIES or name in values:
+            return _invalid_unit_evidence()
+        values[name] = value
+    if set(values) != set(_UNIT_PROPERTIES):
+        return _invalid_unit_evidence()
+    if values["LoadState"] == "not-found":
+        return _invalid_unit_evidence()
+    if values["LoadState"] != "loaded" or values["Result"] not in _UNIT_RESULTS:
+        return _invalid_unit_evidence()
+    active_pair = (values["ActiveState"], values["SubState"])
+    if active_pair not in {
+        ("active", "running"), ("activating", "start"),
+        ("active", "exited"), ("inactive", "dead"), ("failed", "failed"),
+    }:
+        return _invalid_unit_evidence()
+    try:
+        status = int(values["ExecMainStatus"])
+        started_at = int(values["ExecMainStartTimestampMonotonic"])
+    except ValueError:
+        return _invalid_unit_evidence()
+    if (status < 0 or status > 255 or started_at < 0
+            or values["ExecMainCode"] not in _EXEC_CODES):
+        return _invalid_unit_evidence()
+    code = _EXEC_CODES[values["ExecMainCode"]]
+    started = started_at > 0
+    if not started:
+        if (code or status
+                or active_pair in {("active", "running"), ("activating", "start"),
+                                   ("active", "exited")}
+                or values["Result"] == "success"):
+            return _invalid_unit_evidence()
+        return {
+            "valid": True, "termination_kind": "launcher_failure",
+            "exit_status": None, "signal": None, "main_process_started": False,
+        }
+    if active_pair in {("active", "running"), ("activating", "start")}:
+        if code or status or values["Result"] != "success":
+            return _invalid_unit_evidence()
+        if allow_running and not launcher_timed_out:
+            return {
+                "valid": True, "termination_kind": "running",
+                "exit_status": None, "signal": None,
+                "main_process_started": True,
+            }
+        if not launcher_timed_out:
+            return _invalid_unit_evidence()
+        return {
+            "valid": True, "termination_kind": "outer_watchdog",
+            "exit_status": None, "signal": None, "main_process_started": True,
+        }
+    result = values["Result"]
+    if result == "timeout":
+        if code not in {"killed", "dumped"} or not 1 <= status <= 64:
+            return _invalid_unit_evidence()
+        kind, exit_status, signal_number = "runtime_timeout", None, status or None
+    elif result == "oom-kill":
+        if code not in {"killed", "dumped"} or not 1 <= status <= 64:
+            return _invalid_unit_evidence()
+        kind, exit_status, signal_number = "oom_kill", None, status or None
+    elif result in {"resources", "protocol"}:
+        if code in {"killed", "dumped"} and 1 <= status <= 64:
+            kind, exit_status, signal_number = "sandbox_restriction", None, status
+        elif code == "exited" and status:
+            kind, exit_status, signal_number = "sandbox_restriction", status, None
+        else:
+            return _invalid_unit_evidence()
+    elif result in {"signal", "core-dump"} and code in {"killed", "dumped"} \
+            and 1 <= status <= 64:
+        kind, exit_status, signal_number = "external_signal", None, status or None
+    elif result == "exit-code" and code == "exited" and status:
+        kind, exit_status, signal_number = "nonzero_exit", status, None
+    elif result == "success" and code == "exited" and status == 0:
+        kind, exit_status, signal_number = "completed", 0, None
+    else:
+        return _invalid_unit_evidence()
+    return {
+        "valid": True, "termination_kind": kind,
+        "exit_status": exit_status, "signal": signal_number,
+        "main_process_started": True,
+    }
 
 
 def _failed_probe_results(detail):

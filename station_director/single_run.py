@@ -24,12 +24,16 @@ from station_director.preservation import (
 from station_director.single_run_protocol import (
     HeldDocument,
     ProtocolError,
-    RESPONSE_SCHEMA_V2 as RESPONSE_SCHEMA,
+    RESPONSE_SCHEMA_V3 as RESPONSE_SCHEMA,
     bind_request,
     write_private_json_exclusive,
     REQUEST_SCHEMA,
 )
 from station_director.c1_diagnostics import launcher_summary, make_diagnostic
+from station_director.worker_checkpoint import (
+    WorkerCheckpointError,
+    read_checkpoint_evidence,
+)
 from station_director.validation_context import (
     canonical_seed_inputs,
     derive_validation_context,
@@ -58,7 +62,7 @@ FINALIZATION_SUBPHASES = frozenset({
 
 class SingleRunError(RuntimeError):
     def __init__(self, phase, code, message, *, finalization_subphase=None,
-                 c1_diagnostic=None, launcher=None):
+                 c1_diagnostic=None, launcher=None, scheduler_state="unknown"):
         super().__init__(message)
         self.phase = phase
         self.code = code
@@ -68,6 +72,9 @@ class SingleRunError(RuntimeError):
         self.finalization_subphase = finalization_subphase
         self.c1_diagnostic = c1_diagnostic
         self.launcher_summary = launcher
+        if scheduler_state not in (True, False, "unknown"):
+            raise ValueError("invalid scheduler state")
+        self.scheduler_state = scheduler_state
 
 
 class SingleRunFinalizationError(SingleRunError):
@@ -116,7 +123,7 @@ class SingleRunLifecycle:
     def settle_unit(self):
         """Prove the worker unit absent while retaining the locked stage."""
         if self.unit_settled:
-            return {"passed": True, "detail": "unit already proven absent"}
+            return {"passed": True, "detail": "unit_absent"}
         try:
             unit_ok, unit_detail = cleanup_unit(self.unit_name)
         except Exception as exc:
@@ -126,18 +133,18 @@ class SingleRunLifecycle:
             quarantine.touch(mode=0o600, exist_ok=True)
             raise SingleRunError(
                 "cleanup", "cleanup_failure",
-                f"unit not proven absent; staging quarantined at {self.stage}: {unit_detail}",
+                "worker unit could not be proven absent; staging was quarantined",
             )
         self.unit_settled = True
-        return {"passed": True, "detail": unit_detail}
+        return {"passed": True, "detail": "unit_absent"}
 
     def cleanup(self):
         if self.cleaned:
-            return {"passed": True, "detail": "already cleaned"}
+            return {"passed": True, "detail": "cleanup_complete"}
         details = []
         if (self.stage / ".quarantine").exists():
             raise SingleRunError(
-                "cleanup", "cleanup_failure", f"staging remains quarantined at {self.stage}"
+                "cleanup", "cleanup_failure", "staging remains quarantined"
             )
         try:
             settled = self.settle_unit()
@@ -150,7 +157,7 @@ class SingleRunLifecycle:
             quarantine.touch(mode=0o600, exist_ok=True)
             raise SingleRunError(
                 "cleanup", "cleanup_failure",
-                f"unit not proven absent; staging quarantined at {self.stage}: {unit_detail}",
+                "worker unit could not be proven absent; staging was quarantined",
             )
         guide_input = self.stage / "guide-input"
         guide_database = guide_input / "guide.db"
@@ -169,13 +176,13 @@ class SingleRunLifecycle:
                     f"guide snapshot could not be prepared for cleanup: {type(exc).__name__}",
                 ) from exc
         stage_ok, stage_detail = cleanup_staging_directory(self.stage)
-        details.append(f"stage: {stage_detail}")
+        details.append("stage: removed" if stage_ok else "stage: cleanup_failed")
         self.cleaned = unit_ok and stage_ok
         if self.cleaned:
             self.lock.close()
         if not self.cleaned:
             raise SingleRunError("cleanup", "cleanup_failure", "; ".join(details))
-        return {"passed": True, "detail": "; ".join(details)}
+        return {"passed": True, "detail": "cleanup_complete"}
 
 
 def _copy_private(source, target):
@@ -372,68 +379,151 @@ def launch_single_run(lifecycle, *, timeout=DEFAULT_TIMEOUT_SECONDS):
     if lifecycle.cleaned or lifecycle.launcher_result is not None:
         raise SingleRunError("launch", "invalid_lifecycle", "run is not launchable")
     launcher = IsolationLauncher(lifecycle.project_root)
-    lifecycle.launcher_result = launcher.run(
-        lifecycle.stage,
-        [
-            sandbox_python(lifecycle.project_root),
-            "/project/station_director/single_run_worker.py",
-            f"/stage/{REQUEST_NAME}",
-            f"/stage/{RESPONSE_NAME}",
-        ],
-        lifecycle.unit_name,
-        timeout=timeout,
-        stage_tmp=True,
-    )
+    try:
+        lifecycle.launcher_result = launcher.run(
+            lifecycle.stage,
+            [
+                sandbox_python(lifecycle.project_root),
+                "/project/station_director/single_run_worker.py",
+                f"/stage/{REQUEST_NAME}",
+                f"/stage/{RESPONSE_NAME}",
+            ],
+            lifecycle.unit_name,
+            timeout=timeout,
+            stage_tmp=True,
+        )
+    except Exception as exc:
+        launched = getattr(exc, "launcher_result", None)
+        if launched is not None:
+            lifecycle.launcher_result = launched
+        raise
     return lifecycle.launcher_result
 
 
 def inspect_single_run(lifecycle):
     if lifecycle.launcher_result is None:
         raise SingleRunError("inspect", "not_launched", "run has not been launched")
-    if lifecycle.launcher_result.timed_out:
+    launch = lifecycle.launcher_result
+    try:
+        evidence = read_checkpoint_evidence(lifecycle.stage)
+    except WorkerCheckpointError as exc:
+        raise SingleRunError(
+            "response", "worker_checkpoint_mismatch",
+            "worker checkpoint evidence is invalid",
+            c1_diagnostic={**make_diagnostic("worker_checkpoint_mismatch", "response"),
+                           "scheduler_invoked": "unknown"},
+            launcher=launcher_summary(launch), scheduler_state="unknown") from exc
+    if (launch.unit_state_valid and launch.main_process_started is False
+            and evidence.worker_started):
+        raise SingleRunError(
+            "response", "worker_checkpoint_mismatch",
+            "worker checkpoint evidence contradicts launcher state",
+            c1_diagnostic={**make_diagnostic("worker_checkpoint_mismatch", "response"),
+                           "scheduler_invoked": "unknown"},
+            launcher=launcher_summary(launch), scheduler_state="unknown")
+    if evidence.scheduler_entered:
+        scheduler_state = True
+    elif launch.unit_state_valid and launch.main_process_started is False:
+        scheduler_state = False
+    else:
+        scheduler_state = "unknown"
+    termination_codes = {
+        "runtime_timeout": ("worker_runtime_timeout", "native worker reached its runtime limit"),
+        "oom_kill": ("worker_oom_kill", "native worker was terminated for memory exhaustion"),
+        "external_signal": ("worker_external_signal", "native worker was terminated by a signal"),
+        "launcher_state_invalid": ("launcher_state_invalid", "launcher state evidence is invalid"),
+        "launcher_failure": ("launcher_failed", "native worker did not begin execution"),
+        "sandbox_restriction": ("launcher_failed", "native worker was blocked by isolation policy"),
+    }
+    response_path = lifecycle.stage / RESPONSE_NAME
+    response_exists = os.path.lexists(response_path)
+    if (not response_exists and launch.timed_out
+            and launch.termination_kind not in {"runtime_timeout", "oom_kill", "external_signal"}):
+        launch.termination_kind = "outer_watchdog"
         raise SingleRunError(
             "launch", "worker_timeout", "native worker timed out",
-            c1_diagnostic=make_diagnostic("launcher_timeout", "launch"),
-            launcher=launcher_summary(lifecycle.launcher_result))
-    response_path = lifecycle.stage / RESPONSE_NAME
-    if not os.path.lexists(response_path):
+            c1_diagnostic={**make_diagnostic("launcher_timeout", "launch"),
+                           "scheduler_invoked": scheduler_state},
+            launcher=launcher_summary(launch), scheduler_state=scheduler_state)
+    if not response_exists and launch.termination_kind in termination_codes:
+        code, message = termination_codes[launch.termination_kind]
         raise SingleRunError(
-            "response", "worker_response_missing", "worker response is missing",
-            c1_diagnostic=make_diagnostic("worker_response_missing", "response"),
-            launcher=launcher_summary(lifecycle.launcher_result))
+            "launch", code, message,
+            c1_diagnostic={**make_diagnostic(code, "launch"),
+                           "scheduler_invoked": scheduler_state},
+            launcher=launcher_summary(launch), scheduler_state=scheduler_state)
+    if not response_exists:
+        if launch.termination_kind == "nonzero_exit" and not evidence.response_attempted:
+            raise SingleRunError(
+                "launch", "worker_nonzero_exit", "native worker exited unsuccessfully",
+                c1_diagnostic={**make_diagnostic("worker_nonzero_exit", "launch"),
+                               "scheduler_invoked": scheduler_state},
+                launcher=launcher_summary(launch), scheduler_state=scheduler_state)
+        code = ("worker_response_publication_failed" if evidence.response_attempted
+                else "worker_response_missing")
+        raise SingleRunError(
+            "response", code, "worker response is missing",
+            c1_diagnostic={**make_diagnostic(code, "response"),
+                           "scheduler_invoked": scheduler_state},
+            launcher=launcher_summary(launch), scheduler_state=scheduler_state)
     try:
         document_context = HeldDocument(response_path, RESPONSE_SCHEMA)
     except ProtocolError as exc:
         raise SingleRunError(
             "response", "worker_response_invalid", "worker response is invalid",
-            c1_diagnostic=make_diagnostic("worker_response_invalid", "response"),
-            launcher=launcher_summary(lifecycle.launcher_result)) from exc
+            c1_diagnostic={**make_diagnostic("worker_response_invalid", "response"),
+                           "scheduler_invoked": scheduler_state},
+            launcher=launcher_summary(launch), scheduler_state=scheduler_state) from exc
     with document_context as document:
         response = document.payload
         if response["run_id"] != lifecycle.run_id:
             raise SingleRunError("response", "run_id_mismatch", "worker run ID mismatch",
-                                 c1_diagnostic=make_diagnostic("worker_response_identity_mismatch", "response"),
-                                 launcher=launcher_summary(lifecycle.launcher_result))
+                                 c1_diagnostic={**make_diagnostic("worker_response_identity_mismatch", "response"),
+                                                "scheduler_invoked": scheduler_state},
+                                 launcher=launcher_summary(lifecycle.launcher_result),
+                                 scheduler_state=scheduler_state)
         if response["proposal_id"] != lifecycle.request["proposal"]["proposal_id"]:
             raise SingleRunError("response", "proposal_id_mismatch", "worker proposal ID mismatch",
-                                 c1_diagnostic=make_diagnostic("worker_response_identity_mismatch", "response"),
-                                 launcher=launcher_summary(lifecycle.launcher_result))
+                                 c1_diagnostic={**make_diagnostic("worker_response_identity_mismatch", "response"),
+                                                "scheduler_invoked": scheduler_state},
+                                 launcher=launcher_summary(lifecycle.launcher_result),
+                                 scheduler_state=scheduler_state)
         context = response["validation_context"]
         expected = lifecycle.request["validation_context"]
         for name in ("input_fingerprint", "requested_seed", "effective_seed"):
             if context[name] != expected[name]:
                 raise SingleRunError("response", "context_mismatch", "worker context mismatch",
-                                     c1_diagnostic=make_diagnostic("worker_context_mismatch", "response"),
-                                     launcher=launcher_summary(lifecycle.launcher_result))
+                                     c1_diagnostic={**make_diagnostic("worker_context_mismatch", "response"),
+                                                    "scheduler_invoked": scheduler_state},
+                                     launcher=launcher_summary(lifecycle.launcher_result),
+                                     scheduler_state=scheduler_state)
         if response["affected_channels"] != lifecycle.request["affected_channels"]:
             raise SingleRunError("response", "affected_channels_mismatch", "worker affected channels mismatch",
-                                 c1_diagnostic=make_diagnostic("worker_channels_mismatch", "response"),
-                                 launcher=launcher_summary(lifecycle.launcher_result))
+                                 c1_diagnostic={**make_diagnostic("worker_channels_mismatch", "response"),
+                                                "scheduler_invoked": scheduler_state},
+                                 launcher=launcher_summary(lifecycle.launcher_result),
+                                 scheduler_state=scheduler_state)
         document.assert_unchanged()
+    response_state = response["scheduler_invoked"]
+    if response_state != evidence.scheduler_entered:
+        raise SingleRunError(
+            "response", "worker_checkpoint_mismatch", "worker response contradicts checkpoints",
+            c1_diagnostic={**make_diagnostic("worker_checkpoint_mismatch", "response"),
+                           "scheduler_invoked": "unknown"},
+            launcher=launcher_summary(launch), scheduler_state="unknown")
+    if not evidence.response_completed:
+        raise SingleRunError(
+            "response", "worker_checkpoint_incomplete", "worker checkpoint publication is incomplete",
+            c1_diagnostic={**make_diagnostic("worker_checkpoint_incomplete", "response",
+                                             scheduler_invoked=response_state),
+                           "scheduler_invoked": response_state},
+            launcher=launcher_summary(launch), scheduler_state=response_state)
     if lifecycle.launcher_result.returncode != (0 if response["status"] == "success" else 1):
         raise SingleRunError("response", "exit_status_mismatch", "worker exit status contradicts response",
-                             c1_diagnostic=make_diagnostic("worker_exit_status_mismatch", "response"),
-                             launcher=launcher_summary(lifecycle.launcher_result))
+                             c1_diagnostic={**make_diagnostic("worker_exit_status_mismatch", "response"),
+                                            "scheduler_invoked": response_state},
+                             launcher=launcher_summary(lifecycle.launcher_result),
+                             scheduler_state=response_state)
     lifecycle.response = response
     return response
 

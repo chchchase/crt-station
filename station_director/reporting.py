@@ -28,10 +28,11 @@ REPORT_SCHEMA_V1 = Path(__file__).with_name("schemas") / "validation-report.v1.s
 REPORT_SCHEMA_V2 = Path(__file__).with_name("schemas") / "validation-report.v2.schema.json"
 REPORT_SCHEMA_V3 = Path(__file__).with_name("schemas") / "validation-report.v3.schema.json"
 REPORT_SCHEMA_V4 = Path(__file__).with_name("schemas") / "validation-report.v4.schema.json"
-# New reports always use v4. Older paths remain frozen for retained reports.
-REPORT_SCHEMA = REPORT_SCHEMA_V4
+REPORT_SCHEMA_V5 = Path(__file__).with_name("schemas") / "validation-report.v5.schema.json"
+# New reports always use v5. Older paths remain frozen for retained reports.
+REPORT_SCHEMA = REPORT_SCHEMA_V5
 LATEST_SCHEMA = Path(__file__).with_name("schemas") / "latest-validation-pointer.v1.schema.json"
-DUAL_RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v2.schema.json"
+DUAL_RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v3.schema.json"
 PROPOSAL_ID_RE = re.compile(r"p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}\Z")
 RUN_ID_RE = re.compile(r"v-[0-9]{8}T[0-9]{6}[0-9]{6}Z-[a-f0-9]{32}\Z")
 MAX_REPORT_JSON_BYTES = 512 * 1024
@@ -72,6 +73,7 @@ DIAGNOSTIC_TEMPLATES = {
     "unexpected_schedule_difference": "The proposal introduced an unauthorized schedule difference.",
     "input_changed": "A validated source input changed during validation.",
     "cleanup_failed": "Validation cleanup failed.",
+    "finalization_deadline_overrun": "Mandatory finalization exceeded its reserved deadline.",
     "validation_interrupted": "Validation was interrupted.",
     "stale_stage_cleanup_failed": "A verified stale Director stage could not be cleaned.",
     "stale_unit_not_absent": "A stale Director transient unit could not be proven absent.",
@@ -171,20 +173,20 @@ def _safe_identifier(value):
 
 
 def validate_report_document(report, *, retained=False):
-    """Validate a new v4 report or a retained immutable v1/v2/v3/v4 report."""
+    """Validate a new v5 report or a retained immutable v1-v4 report."""
     if not isinstance(report, dict):
         raise ReportError("invalid_report", "validation report must be an object")
     version = report.get("schema_version")
-    if version == 4:
-        schema = REPORT_SCHEMA_V4
-    elif retained and version in (1, 2, 3):
+    if version == 5:
+        schema = REPORT_SCHEMA_V5
+    elif retained and version in (1, 2, 3, 4):
         schema = {1: REPORT_SCHEMA_V1, 2: REPORT_SCHEMA_V2,
-                  3: REPORT_SCHEMA_V3}[version]
+                  3: REPORT_SCHEMA_V3, 4: REPORT_SCHEMA_V4}[version]
     else:
         raise ReportError("invalid_report_version", "unsupported validation report version")
     validate_document(report, schema)
-    if version == 4:
-        from station_director.c1_diagnostics import validate_diagnostic
+    if version == 5:
+        from station_director.c1_diagnostics import validate_host_diagnostic
         for group in ("baseline_findings", "unexpected_differences", "warnings", "errors"):
             for finding in report["findings"][group]:
                 if finding["template"] != DIAGNOSTIC_TEMPLATES.get(finding["code"]):
@@ -192,7 +194,7 @@ def validate_report_document(report, *, retained=False):
                 c1 = finding["c1_diagnostic"]
                 if finding["code"] == "c1_run_failed":
                     try:
-                        validate_diagnostic(c1["detail"])
+                        validate_host_diagnostic(c1["detail"])
                     except (KeyError, TypeError, ValueError) as exc:
                         raise ReportError("invalid_report", "invalid C1 report diagnostic") from exc
                     if finding["phase"] != f"run_{c1['run']}":
@@ -252,19 +254,20 @@ def _structured_finding(value, default_code, default_phase):
         finalization_subphase = None
     c1_diagnostic = None
     if code == "c1_run_failed":
-        from station_director.c1_diagnostics import validate_diagnostic
+        from station_director.c1_diagnostics import validate_host_diagnostic
         wrapped = value.get("c1_diagnostic")
         launcher = value.get("launcher_summary")
         if (not isinstance(wrapped, dict) or wrapped.get("run") not in (1, 2)
                 or not isinstance(launcher, dict)):
             raise ReportError("invalid_report_input", "C1 failure lacks safe diagnostics")
-        validate_diagnostic(wrapped.get("detail"))
+        validate_host_diagnostic(wrapped.get("detail"))
         c1_diagnostic = {
             "run": wrapped["run"], "detail": dict(wrapped["detail"]),
             "launcher_summary": {
                 key: launcher[key] for key in (
                     "outcome", "stdout_bytes", "stderr_bytes",
-                    "stdout_truncated", "stderr_truncated")},
+                    "stdout_truncated", "stderr_truncated",
+                    "termination_kind", "exit_status", "signal")},
         }
     finding = {
         "code": code,
@@ -427,16 +430,16 @@ def build_validation_report(proposal, c2_result, run_id, completed_at):
         "sequence_changes", "break_changes",
     )}
     report = {
-        "schema_version": 4,
+        "schema_version": 5,
         "report_type": "station_director_validation",
-        "software": {"director_version": __version__, "report_schema_version": 4},
+        "software": {"director_version": __version__, "report_schema_version": 5},
         "proposal": {"id": proposal["proposal_id"], "schema_version": proposal["schema_version"],
                      "digest": hashlib.sha256(_canonical_json(proposal)).hexdigest()},
         "validation": {
             "run_id": run_id, "status": "success" if success else "failed",
             "phase_reached": c2_result.get("phase_reached", "capture"),
             "scheduler_invoked": c2_result.get("scheduler_invoked",
-                                                {"run_1": False, "run_2": False}),
+                                                {"run_1": "unknown", "run_2": "unknown"}),
             "live_inputs_changed": any(item is not None and not item["passed"]
                                        for item in stability.values()),
             "completed_at": completed_at,

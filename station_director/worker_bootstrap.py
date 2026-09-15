@@ -326,15 +326,16 @@ _ATTESTATION_TOKEN = object()
 
 
 class VerifiedWorkerAttestation:
-    __slots__ = ("run_id", "request_digest", "snapshot", "inputs", "_active")
+    __slots__ = ("run_id", "request_digest", "snapshot", "inputs", "checkpoint", "_active")
 
-    def __init__(self, token, request, snapshot, inputs):
+    def __init__(self, token, request, snapshot, inputs, checkpoint=None):
         if token is not _ATTESTATION_TOKEN:
             raise BootstrapError("worker attestation cannot be constructed directly")
         self.run_id = request["run_id"]
         self.request_digest = request["request_digest"]
         self.snapshot = snapshot
         self.inputs = inputs
+        self.checkpoint = checkpoint
         self._active = True
 
     def verify(self, request):
@@ -423,7 +424,8 @@ def verify_original_snapshot(request, stage_root, media_root, project_root):
     return actual
 
 
-def attest_before_native_import(request, stage_root, media_root, project_root):
+def attest_before_native_import(request, stage_root, media_root, project_root,
+                                checkpoint=None):
     probes = build_probe_payload(request["run_id"], stage_root=stage_root, stage_tmp=True)
     normalized, probe_error = validate_probe_payload(probes, request["run_id"])
     if probe_error or not all(item["passed"] for item in normalized.values()):
@@ -433,6 +435,8 @@ def attest_before_native_import(request, stage_root, media_root, project_root):
             "isolation probe attestation failed", phase="probes",
             code="isolation_probe_failed", probe=failed,
         )
+    if checkpoint is not None:
+        checkpoint.publish("probes_passed")
     try:
         original = _classified(
             "original_configuration_verification_failed",
@@ -448,6 +452,8 @@ def attest_before_native_import(request, stage_root, media_root, project_root):
         raise BootstrapError("staged snapshot verification failed",
                              code="projected_configuration_verification_failed",
                              fingerprint_category="projected_logical_configuration") from exc
+    if checkpoint is not None:
+        checkpoint.publish("snapshot_verified")
     try:
         try:
             verify_validation_context(
@@ -476,5 +482,8 @@ def attest_before_native_import(request, stage_root, media_root, project_root):
     except Exception:
         inputs.close()
         raise
+    if checkpoint is not None:
+        checkpoint.publish("seed_verified")
     snapshot = {**original, **projected}
-    return probes, VerifiedWorkerAttestation(_ATTESTATION_TOKEN, request, snapshot, inputs)
+    return probes, VerifiedWorkerAttestation(
+        _ATTESTATION_TOKEN, request, snapshot, inputs, checkpoint)

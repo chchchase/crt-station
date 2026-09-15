@@ -58,7 +58,7 @@ COMPARISON_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,100}\Z")
 MINIMUM_FREE_BYTES = 512 * 1024 * 1024
 PER_RUN_TIMEOUT_SECONDS = 30 * 60
 TOTAL_TIMEOUT_SECONDS = 75 * 60
-RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v2.schema.json"
+RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v3.schema.json"
 
 CAPTURE_FAILURE_KINDS = frozenset({
     "source_path_resolution", "invocation_verification", "stage_allocation",
@@ -628,7 +628,7 @@ def _prepare_scope(project_root, source_root, media_root, proposal, policy, comp
 
 def _base_result(comparison_id):
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "operation": "native_dual_run_comparison",
         "comparison_id": comparison_id,
         "status": "failed",
@@ -671,10 +671,10 @@ def _validate_result_semantics(result):
         c1 = failure.get("c1_diagnostic")
         launcher = failure.get("launcher_summary")
         if failure.get("code") == "c1_run_failed":
-            from station_director.c1_diagnostics import validate_diagnostic
+            from station_director.c1_diagnostics import validate_host_diagnostic
             if not isinstance(c1, dict) or c1.get("run") not in (1, 2):
                 raise DualRunError("protocol", "invalid_result", "C1 failure lacks run identity")
-            validate_diagnostic(c1.get("detail"))
+            validate_host_diagnostic(c1.get("detail"))
             run_key = f"run_{c1['run']}"
             if failure.get("phase") != run_key:
                 raise DualRunError("protocol", "invalid_result", "C1 run/phase mismatch")
@@ -773,6 +773,7 @@ def run_dual_comparison(
                         "stderr_truncated": False},
                 )
             try:
+                result["scheduler_invoked"][f"run_{index}"] = "unknown"
                 launch_single_run(
                     lifecycle, timeout=max(1, min(PER_RUN_TIMEOUT_SECONDS, int(remaining)))
                 )
@@ -782,16 +783,20 @@ def run_dual_comparison(
                 if isinstance(exc, SingleRunError) and exc.c1_diagnostic is not None:
                     diagnostic = exc.c1_diagnostic
                     launch_summary = exc.launcher_summary
+                    result["scheduler_invoked"][f"run_{index}"] = exc.scheduler_state
                 elif getattr(lifecycle, "launcher_result", None) is not None:
                     diagnostic = make_diagnostic(
                         "worker_response_invalid", "response")
                     launch_summary = launcher_summary(lifecycle.launcher_result)
                 else:
                     diagnostic = make_diagnostic("launcher_failed", "launch")
+                    result["scheduler_invoked"][f"run_{index}"] = False
                     launch_summary = {
                         "outcome": "launch_error", "stdout_bytes": 0,
                         "stderr_bytes": 0, "stdout_truncated": False,
-                        "stderr_truncated": False}
+                        "stderr_truncated": False,
+                        "termination_kind": "launcher_failure",
+                        "exit_status": None, "signal": None}
                 raise DualRunError(
                     f"run_{index}", "c1_run_failed",
                     "An isolated native scheduling run failed.",
@@ -922,6 +927,8 @@ def run_dual_comparison(
             )
         comparison_succeeded = True
     except BaseException as exc:
+        if result["phase_reached"] == "run_1":
+            result["scheduler_invoked"]["run_2"] = False
         result["status"] = "failed"
         validated_error = isinstance(exc, (DualRunError, SingleRunError))
         exception_phase = (exc.phase if validated_error

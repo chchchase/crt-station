@@ -1,8 +1,8 @@
 """Dependency-free, allowlisted diagnostics for the isolated C1 protocol."""
 
-C1_RESPONSE_VERSION = 2
-C2_RESULT_VERSION = 2
-REPORT_VERSION = 4
+C1_RESPONSE_VERSION = 3
+C2_RESULT_VERSION = 3
+REPORT_VERSION = 5
 
 PROBE_IDENTIFIERS = (
     "environment_sanitized", "host_home_not_exposed", "host_run_not_exposed",
@@ -24,8 +24,16 @@ FINGERPRINT_CATEGORIES = (
 DIAGNOSTIC_RULES = {
     "launcher_failed": ("launcher", ("launch",), "The isolated worker could not be launched."),
     "launcher_timeout": ("launcher", ("launch",), "The isolated worker timed out."),
+    "worker_runtime_timeout": ("launcher", ("launch",), "The worker reached its runtime limit."),
+    "worker_oom_kill": ("launcher", ("launch",), "The worker was terminated for memory exhaustion."),
+    "worker_external_signal": ("launcher", ("launch",), "The worker was terminated by an external signal."),
+    "worker_nonzero_exit": ("launcher", ("launch",), "The worker exited unsuccessfully."),
+    "launcher_state_invalid": ("launcher", ("launch",), "The launcher state evidence is invalid."),
     "worker_response_missing": ("worker_protocol", ("response",), "The worker response is missing."),
     "worker_response_invalid": ("worker_protocol", ("response",), "The worker response is invalid."),
+    "worker_response_publication_failed": ("worker_protocol", ("response",), "Worker response publication failed."),
+    "worker_checkpoint_mismatch": ("worker_protocol", ("response",), "Worker checkpoint evidence contradicts the response."),
+    "worker_checkpoint_incomplete": ("worker_protocol", ("response",), "Worker checkpoint publication is incomplete."),
     "worker_response_identity_mismatch": ("worker_protocol", ("response",), "The worker response identity does not match."),
     "worker_context_mismatch": ("worker_protocol", ("response",), "The worker validation context does not match."),
     "worker_channels_mismatch": ("worker_protocol", ("response",), "The worker channel set does not match."),
@@ -67,6 +75,11 @@ DIAGNOSTIC_RULES = {
 }
 
 LAUNCH_OUTCOMES = ("completed", "nonzero_exit", "timed_out", "launch_error")
+TERMINATION_KINDS = (
+    "completed", "nonzero_exit", "runtime_timeout", "outer_watchdog",
+    "oom_kill", "external_signal", "launcher_failure", "launcher_state_invalid",
+    "sandbox_restriction",
+)
 MAX_LAUNCH_BYTE_COUNT = (1 << 63) - 1
 WORKER_DIAGNOSTIC_CODES = frozenset(
     code for code, (domain, unused_phases, unused_template) in DIAGNOSTIC_RULES.items()
@@ -119,6 +132,15 @@ def launcher_summary(result, outcome=None):
                    "completed" if result.returncode == 0 else "nonzero_exit")
     if outcome not in LAUNCH_OUTCOMES:
         raise ValueError("invalid launcher outcome")
+    termination = getattr(result, "termination_kind", "launcher_failure")
+    if termination not in TERMINATION_KINDS:
+        termination = "launcher_state_invalid"
+    exit_status = getattr(result, "exit_status", None)
+    signal_number = getattr(result, "signal", None)
+    if isinstance(exit_status, bool) or not isinstance(exit_status, (int, type(None))):
+        exit_status = None
+    if isinstance(signal_number, bool) or not isinstance(signal_number, (int, type(None))):
+        signal_number = None
     return {
         "outcome": outcome,
         "stdout_bytes": min(MAX_LAUNCH_BYTE_COUNT,
@@ -127,4 +149,23 @@ def launcher_summary(result, outcome=None):
                             max(0, int(getattr(result, "stderr_bytes", 0)))),
         "stdout_truncated": bool(getattr(result, "stdout_truncated", False)),
         "stderr_truncated": bool(getattr(result, "stderr_truncated", False)),
+        "termination_kind": termination,
+        "exit_status": exit_status,
+        "signal": signal_number,
     }
+
+
+def host_diagnostic(detail, scheduler_state):
+    """Copy a validated value-free C1 diagnostic into the tri-state host shape."""
+    validate_diagnostic(detail)
+    if scheduler_state not in (True, False, "unknown"):
+        raise ValueError("invalid host scheduler state")
+    return {**detail, "scheduler_invoked": scheduler_state}
+
+
+def validate_host_diagnostic(value):
+    if not isinstance(value, dict) or value.get("scheduler_invoked") not in (
+            True, False, "unknown"):
+        raise ValueError("invalid host diagnostic scheduler state")
+    worker_shape = {**value, "scheduler_invoked": value["scheduler_invoked"] is True}
+    validate_diagnostic(worker_shape)
