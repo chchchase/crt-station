@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,7 +29,7 @@ def create_database(path):
             media_type TEXT
         );
         CREATE TABLE chapter_points (
-            path TEXT PRIMARY KEY,
+            path TEXT PRIMARY KEY REFERENCES file_meta(path),
             points TEXT NOT NULL,
             last_updated TEXT NOT NULL
         );
@@ -246,6 +247,41 @@ class ChapterEnvelopeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             FluidStatements.get_chapter_points(self.connection, os.fspath(self.media))
 
+    def test_questionable_legacy_requires_explicit_maintenance_replacement(self):
+        from fs42.chapter_analysis import CompletedChapterAnalysis, METHOD_FFPROBE
+        from fs42.fluid_statements import FluidStatements
+
+        raw = json.dumps([
+            {"chapter_start": 0, "chapter_end": 601, "segment_duration": 601}
+        ])
+        self.connection.execute(
+            "INSERT INTO chapter_points VALUES(?,?,?)",
+            (os.fspath(self.media), raw, "old"))
+        self.connection.commit()
+        with self.assertRaises(ValueError):
+            FluidStatements.classify_chapter_points(
+                self.connection, os.fspath(self.media))
+        info = self.media.stat()
+        previous = warmup._writer_row_state(
+            self.connection, os.fspath(self.media), warmup.MediaItem(
+                (self.media.name,), info.st_size, info.st_mtime_ns, info.st_mtime))
+        self.assertEqual(previous["status"], "re_attestation_required")
+        with self.assertRaises(ValueError):
+            with self.connection:
+                FluidStatements.add_chapter_points(
+                    self.connection, os.fspath(self.media),
+                    CompletedChapterAnalysis(METHOD_FFPROBE, ()),
+                    self.media.stat(), previous, baseline_verified=True)
+        self.assertEqual(self.connection.execute(
+            "SELECT points FROM chapter_points").fetchone(), (raw,))
+        with self.connection:
+            FluidStatements.add_chapter_points(
+                self.connection, os.fspath(self.media),
+                CompletedChapterAnalysis(METHOD_FFPROBE, ()), self.media.stat(),
+                previous, baseline_verified=True, replace_questionable=True)
+        self.assertEqual(json.loads(self.connection.execute(
+            "SELECT points FROM chapter_points").fetchone()[0])["chapters"], [])
+
     def test_future_native_failure_does_not_create_legacy_empty_row(self):
         from fs42.chapter_analysis import ChapterAnalysisError
         from fs42.fluid_builder import FluidBuilder
@@ -376,6 +412,94 @@ class InventorySafetyTests(unittest.TestCase):
         inventory[item.relative] = item
         inventory[item.relative] = item
         self.assertEqual(len(inventory), 1)
+
+
+class CorrectedCountTests(unittest.TestCase):
+    def test_malformed_legacy_nonempty_is_not_promoted_to_re_attestation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "counts.sqlite3"
+            connection = create_database(database)
+            path = "/synthetic/malformed.mp4"
+            item = warmup.MediaItem(("malformed.mp4",), 10, 1, 1e-9)
+            connection.execute(
+                "INSERT INTO file_meta(path,duration,size,last_mod) VALUES(?,?,?,?)",
+                (path, 600.0, 10, 1e-9))
+            connection.execute(
+                "INSERT INTO chapter_points VALUES(?,?,?)",
+                (path, json.dumps([{"chapter_end": 601}]), "old"))
+            connection.commit()
+            with self.assertRaisesRegex(
+                    warmup.MaintenanceError, "chapter_cache_invalid"):
+                warmup._chapter_counts(connection, {path: item}, {path})
+            connection.close()
+
+    def test_audited_population_invariants_are_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "counts.sqlite3"
+            connection = create_database(database)
+            eligible = {}
+            existing = set()
+            for index in range(4_173):
+                path = f"/synthetic/{index:04d}.mp4"
+                duration = 100.0 if index < 151 else 600.0
+                eligible[path] = warmup.MediaItem(
+                    (f"{index:04d}.mp4",), 10, index + 1,
+                    (index + 1) / 1e9)
+                existing.add(path)
+                connection.execute(
+                    "INSERT INTO file_meta(path,duration,size,last_mod) VALUES(?,?,?,?)",
+                    (path, duration, 10, (index + 1) / 1e9))
+                if 3_322 <= index < 3_976:
+                    connection.execute(
+                        "INSERT INTO chapter_points VALUES(?,?,?)",
+                        (path, "[]", "old"))
+                elif 3_976 <= index < 4_096:
+                    connection.execute(
+                        "INSERT INTO chapter_points VALUES(?,?,?)",
+                        (path, json.dumps([{
+                            "chapter_start": 0, "chapter_end": 601,
+                            "segment_duration": 601,
+                        }]), "old"))
+                elif index >= 4_096:
+                    connection.execute(
+                        "INSERT INTO chapter_points VALUES(?,?,?)",
+                        (path, json.dumps([{
+                            "chapter_start": 0, "chapter_end": 10,
+                            "segment_duration": 10,
+                        }]), "old"))
+            for index in range(155):
+                path = f"/synthetic/unavailable-{index:03d}.mp4"
+                points = "[]" if index < 114 else json.dumps([{
+                    "chapter_start": 0, "chapter_end": 10,
+                    "segment_duration": 10,
+                }])
+                connection.execute(
+                    "INSERT INTO chapter_points VALUES(?,?,?)",
+                    (path, points, "old"))
+            connection.commit()
+            counts = warmup._chapter_counts(connection, eligible, existing)
+            connection.close()
+        self.assertEqual(counts["eligible"], 4_173)
+        self.assertEqual(counts["missing"], 3_322)
+        self.assertEqual(counts["current_empty"], 654)
+        self.assertEqual(counts["legacy_empty"], 768)
+        self.assertEqual(counts["unavailable_empty"], 114)
+        self.assertEqual(counts["legacy_nonempty"], 197)
+        self.assertEqual(counts["trusted_legacy_nonempty"], 77)
+        self.assertEqual(counts["re_attestation_required"], 120)
+        self.assertEqual(counts["unavailable_nonempty"], 41)
+        self.assertEqual(counts["orphan_retirements"], 155)
+        self.assertEqual(counts["attestations"], 4_096)
+        self.assertEqual(counts["short_media"], 151)
+        self.assertEqual(counts["probes"], 3_945)
+        self.assertEqual(
+            counts["eligible"],
+            counts["missing"] + counts["current_empty"]
+            + counts["legacy_nonempty"])
+        self.assertEqual(
+            counts["attestations"],
+            counts["missing"] + counts["current_empty"]
+            + counts["re_attestation_required"])
 
 
 class BackupProtocolTests(unittest.TestCase):
@@ -763,6 +887,185 @@ class BackupProtocolTests(unittest.TestCase):
                     database=self.database, backup_root=self.backups)
 
 
+class ProgressProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.backups = self.root / "backups"
+        self.backups.mkdir(mode=0o700)
+        self.arguments = {
+            "proposal_id": "p-20260912T064839Z-04191281",
+            "baseline_identity": "1" * 64,
+            "inventory_identity": "2" * 64,
+            "inventory_count": 4,
+            "primary_count": 2,
+            "questionable_count": 1,
+            "backup_root": self.backups,
+        }
+        self.document = warmup._new_progress(
+            self.arguments["proposal_id"], self.arguments["baseline_identity"],
+            self.arguments["inventory_identity"], "3" * 64, (0, 2), (3,))
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_initial_and_replacement_publication_are_fsynced_and_exact(self):
+        events = []
+        real_fsync = warmup.os.fsync
+        real_rename = warmup._rename_noreplace
+        real_replace = warmup.os.replace
+
+        def fsync(descriptor):
+            events.append("fsync")
+            return real_fsync(descriptor)
+
+        def rename(source, destination):
+            events.append("noreplace")
+            return real_rename(source, destination)
+
+        def replace(source, destination):
+            events.append("replace")
+            return real_replace(source, destination)
+
+        with mock.patch.object(warmup.os, "fsync", side_effect=fsync), mock.patch.object(
+                warmup, "_rename_noreplace", side_effect=rename), mock.patch.object(
+                    warmup.os, "replace", side_effect=replace):
+            first = warmup._publish_progress(
+                self.document, None, **self.arguments)
+            second = warmup._publish_next_progress(
+                first, arguments=self.arguments, phase="questionable")
+        self.assertEqual(warmup._read_progress_file(
+            self.backups / warmup.PROGRESS_FINAL), second)
+        self.assertFalse((self.backups / warmup.PROGRESS_PENDING).exists())
+        self.assertEqual(stat.S_IMODE((
+            self.backups / warmup.PROGRESS_FINAL).stat().st_mode), 0o600)
+        self.assertLess(events.index("fsync"), events.index("noreplace"))
+        self.assertIn("replace", events)
+        self.assertEqual(events[-1], "fsync")
+
+    def test_one_safe_incomplete_pending_tail_is_ignored_from_final(self):
+        final = warmup._publish_progress(
+            self.document, None, **self.arguments)
+        pending = self.backups / warmup.PROGRESS_PENDING
+        pending.write_bytes(b'{"partial"')
+        os.chmod(pending, 0o600)
+        loaded = warmup._load_progress(**self.arguments)
+        self.assertEqual(loaded, final)
+        self.assertFalse(pending.exists())
+
+    def test_initial_incomplete_pending_tail_is_removed_without_adoption(self):
+        pending = self.backups / warmup.PROGRESS_PENDING
+        pending.write_bytes(b"partial")
+        os.chmod(pending, 0o600)
+        self.assertIsNone(warmup._load_progress(**self.arguments))
+        self.assertFalse(pending.exists())
+
+    def test_unsafe_pending_and_mismatched_final_fail_closed(self):
+        pending = self.backups / warmup.PROGRESS_PENDING
+        pending.write_bytes(b"partial")
+        os.chmod(pending, 0o644)
+        with self.assertRaisesRegex(warmup.MaintenanceError, "progress_state_invalid"):
+            warmup._load_progress(**self.arguments)
+        pending.unlink()
+        warmup._publish_progress(self.document, None, **self.arguments)
+        wrong = dict(self.arguments, inventory_identity="4" * 64)
+        with self.assertRaisesRegex(warmup.MaintenanceError, "progress_state_invalid"):
+            warmup._load_progress(**wrong)
+
+    def test_broken_final_symlink_is_not_treated_as_absent(self):
+        (self.backups / warmup.PROGRESS_FINAL).symlink_to("missing")
+        with self.assertRaisesRegex(warmup.MaintenanceError, "progress_state_invalid"):
+            warmup._load_progress(**self.arguments)
+
+    def test_parseable_pending_with_wrong_sequence_fails_closed(self):
+        warmup._publish_progress(self.document, None, **self.arguments)
+        pending_document = warmup._next_progress(
+            self.document, phase="questionable")
+        pending_document["sequence"] += 1
+        pending = self.backups / warmup.PROGRESS_PENDING
+        pending.write_text(json.dumps(
+            pending_document, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8")
+        os.chmod(pending, 0o600)
+        with self.assertRaisesRegex(warmup.MaintenanceError, "progress_state_invalid"):
+            warmup._load_progress(**self.arguments)
+        self.assertTrue(pending.exists())
+
+    def test_invalid_sequence_bitmap_indices_and_unknown_entry_fail_closed(self):
+        cases = [
+            {"sequence": 100_001},
+            {"primary_attempted": "80"},
+            {"primary_indices": [0, 0]},
+            {"inflight": {
+                "phase": "primary", "index": 3,
+                "stable_chapter_identity": "5" * 64,
+            }},
+        ]
+        for updates in cases:
+            document = dict(self.document)
+            document.update(updates)
+            with self.subTest(updates=tuple(updates)):
+                with self.assertRaisesRegex(
+                        warmup.MaintenanceError, "progress_state_invalid"):
+                    warmup._validate_progress(document, **{
+                        key: value for key, value in self.arguments.items()
+                        if key != "backup_root"
+                    })
+        (self.backups / "unknown").write_bytes(b"x")
+        with self.assertRaisesRegex(warmup.MaintenanceError, "progress_state_invalid"):
+            warmup._load_progress(**self.arguments)
+
+    def test_pending_publication_failure_leaves_authoritative_final_unchanged(self):
+        final = warmup._publish_progress(
+            self.document, None, **self.arguments)
+        following = warmup._next_progress(final, phase="questionable")
+        with mock.patch.object(
+                warmup.os, "replace", side_effect=OSError("synthetic")):
+            with self.assertRaisesRegex(
+                    warmup.MaintenanceError, "progress_state_invalid"):
+                warmup._publish_progress(
+                    following, final, **self.arguments)
+        self.assertEqual(warmup._read_progress_file(
+            self.backups / warmup.PROGRESS_FINAL), final)
+
+    def test_initial_directory_fsync_failure_leaves_recoverable_final(self):
+        with mock.patch.object(
+                warmup, "_fsync_directory", side_effect=OSError("synthetic")):
+            with self.assertRaisesRegex(
+                    warmup.MaintenanceError, "progress_state_invalid"):
+                warmup._publish_progress(
+                    self.document, None, **self.arguments)
+        self.assertEqual(warmup._load_progress(**self.arguments), self.document)
+
+    def test_update_file_fsync_failure_preserves_old_final_and_ignores_tail(self):
+        final = warmup._publish_progress(
+            self.document, None, **self.arguments)
+        following = warmup._next_progress(final, phase="questionable")
+        with mock.patch.object(warmup.os, "fsync", side_effect=OSError("synthetic")):
+            with self.assertRaisesRegex(
+                    warmup.MaintenanceError, "progress_state_invalid"):
+                warmup._publish_progress(following, final, **self.arguments)
+        self.assertEqual(warmup._load_progress(**self.arguments), final)
+        self.assertFalse((self.backups / warmup.PROGRESS_PENDING).exists())
+
+    def test_verified_rollback_retires_progress_and_pending_state(self):
+        warmup._publish_progress(self.document, None, **self.arguments)
+        pending = self.backups / warmup.PROGRESS_PENDING
+        pending.write_bytes(b"partial")
+        os.chmod(pending, 0o600)
+        warmup._remove_progress_after_rollback(backup_root=self.backups)
+        self.assertFalse((self.backups / warmup.PROGRESS_FINAL).exists())
+        self.assertFalse(pending.exists())
+
+    def test_rollback_refuses_unsafe_progress_without_removing_it(self):
+        final = self.backups / warmup.PROGRESS_FINAL
+        final.write_bytes(b"unsafe")
+        os.chmod(final, 0o644)
+        with self.assertRaisesRegex(warmup.MaintenanceError, "progress_state_invalid"):
+            warmup._remove_progress_after_rollback(backup_root=self.backups)
+        self.assertTrue(final.exists())
+
+
 class AdmissionTests(unittest.TestCase):
     def args(self, execute=False, **values):
         namespace = argparse.Namespace(
@@ -818,8 +1121,10 @@ class ExecuteOrderingTests(unittest.TestCase):
         self.counts = {
             "eligible": 0, "missing": 0, "legacy_empty": 0,
             "current_empty": 0, "unavailable_empty": 0,
-            "attestations": 0, "probes": 0, "short_media": 0,
-            "legacy_nonempty": 0, "versioned": 0,
+            "legacy_nonempty": 0, "trusted_legacy_nonempty": 0,
+            "re_attestation_required": 0, "unavailable_nonempty": 0,
+            "orphan_retirements": 0, "attestations": 0, "probes": 0,
+            "short_media": 0, "versioned": 0,
         }
         self.args = argparse.Namespace(
             proposal_id="p-20260912T064839Z-04191281", execute=True)
@@ -854,8 +1159,11 @@ class ExecuteOrderingTests(unittest.TestCase):
         def writer(*args, **kwargs):
             events.append("writer")
             self.assertTrue((self.backups / warmup.BASELINE_PIN).exists())
-            return (True, True,
-                    {category: 0 for category in warmup.PROBE_FAILURE_CATEGORIES}, None)
+            return (
+                "complete", True,
+                {category: 0 for category in warmup.PROBE_FAILURE_CATEGORIES},
+                0, None,
+            )
 
         @contextlib.contextmanager
         def no_lock(*args, **kwargs):
@@ -1046,6 +1354,11 @@ class WriterTests(unittest.TestCase):
         self.media = self.media_root / "clip.mp4"
         self.media.write_bytes(b"synthetic media")
         self.database = self.root / "live.sqlite3"
+        self.backups = self.root / "backups"
+        self.backups.mkdir(mode=0o700)
+        self.pin = self.backups / warmup.BASELINE_PIN
+        self.pin.write_text("synthetic-pin", encoding="utf-8")
+        os.chmod(self.pin, 0o600)
         connection = create_database(self.database)
         info = self.media.stat()
         connection.execute(
@@ -1070,25 +1383,31 @@ class WriterTests(unittest.TestCase):
         initial = {
             "eligible": 1, "missing": 1, "legacy_empty": 0,
             "current_empty": 0, "unavailable_empty": 0,
+            "legacy_nonempty": 0, "trusted_legacy_nonempty": 0,
+            "re_attestation_required": 0, "unavailable_nonempty": 0,
+            "orphan_retirements": 0,
             "attestations": 1, "probes": 1, "short_media": 0,
             "versioned": 0,
         }
         completed = analysis or CompletedChapterAnalysis(METHOD_FFPROBE, ())
         with mock.patch.object(warmup, "DATABASE", self.database), mock.patch.object(
                 warmup, "MEDIA_ROOT", self.media_root), mock.patch.object(
-                    warmup, "_eligible_inventory", return_value={os.fspath(self.media): item}), mock.patch.object(
+                    warmup, "BACKUP_ROOT", self.backups), mock.patch.object(
+                warmup, "_eligible_inventory", return_value={os.fspath(self.media): item}), mock.patch.object(
                         warmup, "_service_state", return_value=("loaded", "inactive", "dead", "0")), mock.patch(
                             "fs42.chapter_analysis.analyze_chapters", return_value=completed):
             return warmup._run_writer(
                 "p-20260912T064839Z-04191281", initial, warmup.time.monotonic(),
                 expected_full_digest=full, expected_protected_digest=protected,
+                baseline=self.pin,
             )
 
     def test_writer_publishes_successful_empty_attestation_via_held_descriptor(self):
-        complete, safe, failures, reason = self.run_writer(None)
-        self.assertTrue(complete)
+        status, safe, failures, unresolved, reason = self.run_writer(None)
+        self.assertEqual(status, "complete")
         self.assertTrue(safe)
         self.assertFalse(any(failures.values()))
+        self.assertEqual(unresolved, 0)
         self.assertIsNone(reason)
         connection = sqlite3.connect(self.database)
         try:
@@ -1159,22 +1478,28 @@ class WriterTests(unittest.TestCase):
         initial = {
             "eligible": 1, "missing": 1, "legacy_empty": 0,
             "current_empty": 0, "unavailable_empty": 0,
+            "legacy_nonempty": 0, "trusted_legacy_nonempty": 0,
+            "re_attestation_required": 0, "unavailable_nonempty": 0,
+            "orphan_retirements": 0,
             "attestations": 1, "probes": 1, "short_media": 0, "versioned": 0,
         }
         with mock.patch.object(warmup, "DATABASE", self.database), mock.patch.object(
                 warmup, "MEDIA_ROOT", self.media_root), mock.patch.object(
+                    warmup, "BACKUP_ROOT", self.backups), mock.patch.object(
                     warmup, "_eligible_inventory", return_value={os.fspath(self.media): item}), mock.patch.object(
                         warmup, "_service_state", return_value=("loaded", "inactive", "dead", "0")), mock.patch(
                             "fs42.chapter_analysis.analyze_chapters",
                             side_effect=ChapterAnalysisError("probe_nonzero")):
-            complete, safe, failures, reason = warmup._run_writer(
+            status, safe, failures, unresolved, reason = warmup._run_writer(
                 "p-20260912T064839Z-04191281", initial, warmup.time.monotonic(),
                 expected_full_digest=full, expected_protected_digest=protected,
+                baseline=self.pin,
             )
-        self.assertFalse(complete)
+        self.assertEqual(status, "blocked")
         self.assertTrue(safe)
         self.assertEqual(failures["probe_nonzero"], 1)
-        self.assertEqual(reason, "probe_failures")
+        self.assertEqual(unresolved, 1)
+        self.assertEqual(reason, "re_attestation_unresolved")
         connection = sqlite3.connect(self.database)
         try:
             self.assertIsNone(connection.execute(
@@ -1204,23 +1529,29 @@ class WriterTests(unittest.TestCase):
         initial = {
             "eligible": 1, "missing": 0, "legacy_empty": 2,
             "current_empty": 1, "unavailable_empty": 1,
+            "legacy_nonempty": 0, "trusted_legacy_nonempty": 0,
+            "re_attestation_required": 0, "unavailable_nonempty": 0,
+            "orphan_retirements": 1,
             "attestations": 1, "probes": 1, "short_media": 0,
-            "legacy_nonempty": 0, "versioned": 0,
+            "versioned": 0,
         }
         with mock.patch.object(warmup, "DATABASE", self.database), mock.patch.object(
                 warmup, "MEDIA_ROOT", self.media_root), mock.patch.object(
+                    warmup, "BACKUP_ROOT", self.backups), mock.patch.object(
                     warmup, "_eligible_inventory", return_value={os.fspath(self.media): item}), mock.patch.object(
                         warmup, "_service_state", return_value=("loaded", "inactive", "dead", "0")), mock.patch(
                             "fs42.chapter_analysis.analyze_chapters",
                             return_value=CompletedChapterAnalysis(METHOD_FFPROBE, ())):
-            complete, safe, failures, reason = warmup._run_writer(
+            status, safe, failures, unresolved, reason = warmup._run_writer(
                 "p-20260912T064839Z-04191281", initial, warmup.time.monotonic(),
                 expected_inventory={os.fspath(self.media): item},
                 expected_full_digest=full, expected_protected_digest=protected,
+                baseline=self.pin,
             )
-        self.assertTrue(complete)
+        self.assertEqual(status, "complete")
         self.assertTrue(safe)
         self.assertFalse(any(failures.values()))
+        self.assertEqual(unresolved, 0)
         self.assertIsNone(reason)
         connection = sqlite3.connect(self.database)
         try:
@@ -1230,6 +1561,331 @@ class WriterTests(unittest.TestCase):
             connection.close()
         self.assertEqual(len(rows), 1)
         self.assertEqual(json.loads(rows[0][1])["attestation_version"], 1)
+
+
+class SweepLivenessTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.media_root = self.root / "media"
+        self.media_root.mkdir()
+        self.database = self.root / "live.sqlite3"
+        connection = create_database(self.database)
+        connection.close()
+        self.backups = self.root / "backups"
+        self.backups.mkdir(mode=0o700)
+        self.pin = self.backups / warmup.BASELINE_PIN
+        self.pin.write_text("synthetic-pin", encoding="utf-8")
+        os.chmod(self.pin, 0o600)
+        self.proposal = "p-20260912T064839Z-04191281"
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def dataset(self, *, primary=0, questionable=0,
+                orphan_empty=0, orphan_nonempty=0):
+        inventory = {}
+        connection = sqlite3.connect(self.database)
+        for phase, count in (("primary", primary), ("questionable", questionable)):
+            for index in range(count):
+                prefix = "z-primary" if phase == "primary" else "a-questionable"
+                name = f"{prefix}-{index:03d}.mp4"
+                media = self.media_root / name
+                media.write_bytes(b"synthetic")
+                info = media.stat()
+                path = os.fspath(media)
+                inventory[path] = warmup.MediaItem(
+                    (name,), info.st_size, info.st_mtime_ns, info.st_mtime)
+                connection.execute(
+                    "INSERT INTO file_meta(path,duration,size,last_mod) VALUES(?,?,?,?)",
+                    (path, 600.0, info.st_size, info.st_mtime))
+                if phase == "questionable":
+                    connection.execute(
+                        "INSERT INTO chapter_points VALUES(?,?,?)",
+                        (path, json.dumps([{
+                            "chapter_start": 0, "chapter_end": 601,
+                            "segment_duration": 601,
+                        }]), "old"))
+        for empty, count in ((True, orphan_empty), (False, orphan_nonempty)):
+            prefix = "empty" if empty else "nonempty"
+            for index in range(count):
+                path = os.fspath(self.media_root / f"gone-{prefix}-{index:03d}.mp4")
+                points = "[]" if empty else json.dumps([{
+                    "chapter_start": 0, "chapter_end": 10,
+                    "segment_duration": 10,
+                }])
+                connection.execute(
+                    "INSERT INTO chapter_points VALUES(?,?,?)",
+                    (path, points, "old"))
+        connection.commit()
+        connection.close()
+        return inventory
+
+    def counts(self, inventory):
+        with mock.patch.object(warmup, "MEDIA_ROOT", self.media_root):
+            return warmup._counts_from_private(self.database, inventory)
+
+    def run_writer(self, inventory, analysis, *, publish=None):
+        counts = self.counts(inventory)
+        full, protected = database_digests(self.database)
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(warmup, "DATABASE", self.database))
+        stack.enter_context(mock.patch.object(warmup, "MEDIA_ROOT", self.media_root))
+        stack.enter_context(mock.patch.object(warmup, "BACKUP_ROOT", self.backups))
+        stack.enter_context(mock.patch.object(
+            warmup, "_eligible_inventory", return_value=inventory))
+        stack.enter_context(mock.patch.object(
+            warmup, "_service_state",
+            return_value=("loaded", "inactive", "dead", "0")))
+        stack.enter_context(mock.patch(
+            "fs42.chapter_analysis.analyze_chapters", side_effect=analysis))
+        if publish is not None:
+            stack.enter_context(mock.patch.object(
+                warmup, "_publish_next_progress", side_effect=publish))
+        with stack:
+            result = warmup._run_writer(
+                self.proposal, counts, warmup.time.monotonic(),
+                expected_inventory=inventory, expected_full_digest=full,
+                expected_protected_digest=protected, baseline=self.pin)
+        return counts, result
+
+    def test_primary_sweep_precedes_questionable_even_when_names_sort_later(self):
+        from fs42.chapter_analysis import CompletedChapterAnalysis, METHOD_FFPROBE
+
+        inventory = self.dataset(primary=2, questionable=2)
+        attempted = []
+
+        def analyze(input_path, *args, **kwargs):
+            attempted.append(Path(os.readlink(input_path)).name)
+            return CompletedChapterAnalysis(METHOD_FFPROBE, ())
+
+        unused_counts, outcome = self.run_writer(inventory, analyze)
+        self.assertEqual(outcome[0], "complete")
+        self.assertTrue(all(name.startswith("z-primary-") for name in attempted[:2]))
+        self.assertTrue(all(name.startswith("a-questionable-") for name in attempted[2:]))
+
+    def test_sixteen_operational_failures_do_not_starve_later_identity(self):
+        from fs42.chapter_analysis import ChapterAnalysisError
+
+        inventory = self.dataset(questionable=17)
+        calls = 0
+
+        def fail(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise ChapterAnalysisError("probe_nonzero")
+
+        unused_counts, first = self.run_writer(inventory, fail)
+        self.assertEqual(first[0], "partial")
+        self.assertEqual(first[4], "systemic_analysis_partial")
+        self.assertEqual(calls, 16)
+        unused_counts, second = self.run_writer(inventory, fail)
+        self.assertEqual(second[0], "blocked")
+        self.assertEqual(second[3], 17)
+        self.assertEqual(calls, 17)
+
+    def test_operational_streak_continues_across_phase_boundary(self):
+        from fs42.chapter_analysis import ChapterAnalysisError
+
+        inventory = self.dataset(primary=15, questionable=2)
+        calls = 0
+
+        def fail(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise ChapterAnalysisError("probe_timeout")
+
+        unused_counts, result = self.run_writer(inventory, fail)
+        self.assertEqual(result[0], "partial")
+        self.assertEqual(result[4], "systemic_analysis_partial")
+        self.assertEqual(calls, 16)
+
+    def test_dataset_rejections_reset_circuit_and_complete_full_sweep(self):
+        from fs42.chapter_analysis import ChapterAnalysisError
+
+        inventory = self.dataset(questionable=120)
+        calls = 0
+
+        def reject(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            raise ChapterAnalysisError("chapter_data_invalid")
+
+        unused_counts, outcome = self.run_writer(inventory, reject)
+        self.assertEqual(outcome[0], "blocked")
+        self.assertEqual(outcome[2]["chapter_data_invalid"], 120)
+        self.assertEqual(outcome[3], 120)
+        self.assertEqual(calls, 120)
+        connection = sqlite3.connect(self.database)
+        try:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM chapter_points WHERE points LIKE '[%'"
+            ).fetchone(), (120,))
+        finally:
+            connection.close()
+
+    def test_successful_analysis_resets_consecutive_operational_streak(self):
+        from fs42.chapter_analysis import (
+            ChapterAnalysisError, CompletedChapterAnalysis, METHOD_FFPROBE,
+        )
+
+        inventory = self.dataset(questionable=31)
+        outcomes = [ChapterAnalysisError("probe_nonzero") for unused in range(15)]
+        outcomes.append(CompletedChapterAnalysis(METHOD_FFPROBE, ()))
+        outcomes.extend(
+            ChapterAnalysisError("probe_nonzero") for unused in range(15))
+
+        def analyze(*args, **kwargs):
+            value = outcomes.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        unused_counts, result = self.run_writer(inventory, analyze)
+        self.assertEqual(result[0], "blocked")
+        self.assertEqual(result[2]["probe_nonzero"], 30)
+        self.assertEqual(result[3], 30)
+        self.assertFalse(outcomes)
+
+    def test_inflight_final_is_durable_before_analyzer_entry(self):
+        from fs42.chapter_analysis import CompletedChapterAnalysis, METHOD_FFPROBE
+
+        inventory = self.dataset(primary=1)
+
+        def analyze(*args, **kwargs):
+            state = warmup._read_progress_file(
+                self.backups / warmup.PROGRESS_FINAL)
+            self.assertEqual(state["inflight"]["phase"], "primary")
+            return CompletedChapterAnalysis(METHOD_FFPROBE, ())
+
+        unused_counts, result = self.run_writer(inventory, analyze)
+        self.assertEqual(result[0], "complete")
+
+    def test_inflight_publication_failure_prevents_analysis_and_database_write(self):
+        inventory = self.dataset(primary=1)
+        real_publish = warmup._publish_next_progress
+        analyzer = mock.Mock()
+
+        def fail_inflight(document, *, arguments, **updates):
+            if updates.get("inflight") is not None:
+                raise warmup.MaintenanceError("progress_state_invalid")
+            return real_publish(document, arguments=arguments, **updates)
+
+        with self.assertRaisesRegex(warmup.MaintenanceError, "progress_state_invalid"):
+            self.run_writer(inventory, analyzer, publish=fail_inflight)
+        analyzer.assert_not_called()
+        connection = sqlite3.connect(self.database)
+        try:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM chapter_points").fetchone(), (0,))
+        finally:
+            connection.close()
+
+    def test_crash_after_attestation_commit_reconciles_without_reanalysis(self):
+        from fs42.chapter_analysis import CompletedChapterAnalysis, METHOD_FFPROBE
+
+        inventory = self.dataset(primary=1)
+        real_publish = warmup._publish_next_progress
+        failed = False
+
+        def crash(document, *, arguments, **updates):
+            nonlocal failed
+            if (not failed and (document.get("inflight") or {}).get("phase") == "primary"
+                    and updates.get("inflight", "sentinel") is None):
+                failed = True
+                raise warmup.MaintenanceError("progress_state_invalid")
+            return real_publish(document, arguments=arguments, **updates)
+
+        completed = CompletedChapterAnalysis(METHOD_FFPROBE, ())
+        with self.assertRaisesRegex(warmup.MaintenanceError, "progress_state_invalid"):
+            self.run_writer(
+                inventory, lambda *args, **kwargs: completed, publish=crash)
+        analyzer = mock.Mock(side_effect=AssertionError("must not reanalyze"))
+        unused_counts, result = self.run_writer(inventory, analyzer)
+        self.assertEqual(result[0], "complete")
+        analyzer.assert_not_called()
+
+    def test_questionable_sweep_is_deferred_unstarted_when_full_bound_will_not_fit(self):
+        inventory = self.dataset(questionable=2)
+        analyzer = mock.Mock()
+        with mock.patch.object(warmup, "QUESTIONABLE_ATTEMPT_SECONDS", 10_000):
+            unused_counts, result = self.run_writer(inventory, analyzer)
+        self.assertEqual(result[0], "partial")
+        self.assertEqual(result[4], "deadline_partial")
+        analyzer.assert_not_called()
+        state = warmup._read_progress_file(
+            self.backups / warmup.PROGRESS_FINAL)
+        self.assertEqual(state["questionable_attempted"], "00")
+
+    def test_all_orphans_retire_atomically_and_final_foreign_keys_are_clean(self):
+        analyzer = mock.Mock()
+        inventory = self.dataset(orphan_empty=114, orphan_nonempty=41)
+        counts, result = self.run_writer(inventory, analyzer)
+        self.assertEqual(counts["orphan_retirements"], 155)
+        self.assertEqual(counts["unavailable_empty"], 114)
+        self.assertEqual(counts["unavailable_nonempty"], 41)
+        self.assertEqual(result[0], "complete")
+        analyzer.assert_not_called()
+        connection = sqlite3.connect(self.database)
+        try:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM chapter_points").fetchone(), (0,))
+            self.assertIsNone(connection.execute(
+                "PRAGMA foreign_key_check").fetchone())
+        finally:
+            connection.close()
+
+    def test_crash_after_orphan_commit_reconciles_from_durable_final(self):
+        inventory = self.dataset(orphan_empty=1, orphan_nonempty=1)
+        real_publish = warmup._publish_next_progress
+        failed = False
+
+        def crash(document, *, arguments, **updates):
+            nonlocal failed
+            if (not failed and (document.get("inflight") or {}).get("phase") == "orphans"
+                    and updates.get("inflight", "sentinel") is None):
+                failed = True
+                raise warmup.MaintenanceError("progress_state_invalid")
+            return real_publish(document, arguments=arguments, **updates)
+
+        with self.assertRaisesRegex(warmup.MaintenanceError, "progress_state_invalid"):
+            self.run_writer(inventory, mock.Mock(), publish=crash)
+        connection = sqlite3.connect(self.database)
+        try:
+            self.assertEqual(connection.execute(
+                "SELECT COUNT(*) FROM chapter_points").fetchone(), (0,))
+        finally:
+            connection.close()
+        unused_counts, result = self.run_writer(inventory, mock.Mock())
+        self.assertEqual(result[0], "complete")
+        self.assertFalse((self.backups / warmup.PROGRESS_FINAL).exists())
+
+    def test_progress_and_result_are_redacted(self):
+        from fs42.chapter_analysis import ChapterAnalysisError
+
+        secret = "do-not-persist-this-media-name"
+        inventory = self.dataset(questionable=1)
+        old_path = next(iter(inventory))
+        item = inventory.pop(old_path)
+        new_media = self.media_root / f"{secret}.mp4"
+        Path(old_path).rename(new_media)
+        info = new_media.stat()
+        new_path = os.fspath(new_media)
+        inventory[new_path] = warmup.MediaItem(
+            (new_media.name,), info.st_size, info.st_mtime_ns, info.st_mtime)
+        connection = sqlite3.connect(self.database)
+        connection.execute("UPDATE file_meta SET path=? WHERE path=?", (new_path, old_path))
+        connection.execute("UPDATE chapter_points SET path=? WHERE path=?", (new_path, old_path))
+        connection.commit()
+        connection.close()
+        unused_counts, result = self.run_writer(
+            inventory,
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                ChapterAnalysisError("chapter_data_invalid")))
+        state = (self.backups / warmup.PROGRESS_FINAL).read_text(encoding="utf-8")
+        rendered = json.dumps(result, sort_keys=True)
+        self.assertNotIn(secret, state)
+        self.assertNotIn(secret, rendered)
 
 
 class StaticBoundaryTests(unittest.TestCase):

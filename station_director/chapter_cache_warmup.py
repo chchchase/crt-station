@@ -34,18 +34,23 @@ MEDIA_ROOT = Path("/mnt/t7/CRT-Media")
 BACKUP_ROOT = PROJECT_ROOT / "runtime/director/chapter-cache-backups"
 MAINTENANCE_LOCK = ".chapter-cache-maintenance.lock"
 BASELINE_PIN = "migration-baseline.v1.json"
+PROGRESS_FINAL = "warmup-progress.v1.json"
+PROGRESS_PENDING = ".warmup-progress.v1.pending"
 BACKUP_RE = re.compile(r"chapter-cache-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}\.sqlite3")
 MAX_UNPINNED_BACKUPS = 4
 MAX_BACKUPS = 1 + MAX_UNPINNED_BACKUPS
 MAX_TRANSITION_BACKUPS = MAX_BACKUPS + 1
 MIN_FREE_BYTES = 100 * 1024 * 1024
 MAX_PROBE_FAILURES = 16
+MAX_PROGRESS_IDENTITIES = 10_000
+MAX_PROGRESS_BYTES = 64 * 1024
 PROBE_FAILURE_CATEGORIES = (
     "probe_launch_failed", "probe_timeout", "probe_nonzero", "probe_signaled",
     "probe_output_too_large", "probe_output_invalid", "chapter_data_invalid",
     "probe_cleanup_failed",
 )
 ANALYSIS_TIMEOUT_SECONDS = 30
+QUESTIONABLE_ATTEMPT_SECONDS = ANALYSIS_TIMEOUT_SECONDS + 1
 SERVICE_COMMAND_TIMEOUT_SECONDS = 30
 IN_FLIGHT_OPERATION_ALLOWANCE_SECONDS = (
     ANALYSIS_TIMEOUT_SECONDS + SERVICE_COMMAND_TIMEOUT_SECONDS
@@ -61,7 +66,10 @@ CONTROL_SECONDS = 7200
 ADMISSION_SECONDS = CONTROL_SECONDS - FINALIZATION_SECONDS
 EXPECTED_KEYS = (
     "eligible", "missing", "legacy_empty", "current_empty",
-    "unavailable_empty", "attestations", "probes", "short_media",
+    "unavailable_empty", "legacy_nonempty", "trusted_legacy_nonempty",
+    "re_attestation_required", "unavailable_nonempty",
+    "orphan_retirements", "attestations", "probes", "short_media",
+    "versioned",
 )
 VIDEO_EXTENSIONS = frozenset(
     {".mp4", ".mpg", ".mpeg", ".avi", ".mov", ".mkv", ".ts", ".m4v", ".webm", ".wmv"}
@@ -119,7 +127,7 @@ def _fixed_failure(code):
         "service_state_invalid", "service_restart_failed", "input_identity_changed",
         "media_identity_invalid", "chapter_cache_invalid", "database_write_failed",
         "authorized_change_failed", "probe_failures", "interrupted", "deadline_partial",
-        "rollback_journal_present", "rollback_failed",
+        "rollback_journal_present", "rollback_failed", "progress_state_invalid",
     }
     return code if code in allowed else "database_equivalence_failed"
 
@@ -339,11 +347,27 @@ def _bounded_sqlite(connection, deadline):
             connection.set_progress_handler(None, 0)
 
 
-def _database_checks(connection, *, deadline=None):
+def _database_checks(connection, *, deadline=None,
+                     allowed_chapter_orphans=0):
     with _bounded_sqlite(connection, deadline):
         if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
             raise MaintenanceError("database_integrity_failed")
-        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+        violations = connection.execute("PRAGMA foreign_key_check").fetchmany(100_001)
+        if len(violations) > 100_000:
+            raise MaintenanceError("database_integrity_failed")
+        chapter_orphans = all(
+            len(row) == 4 and row[0] == "chapter_points"
+            and row[2] == "file_meta"
+            for row in violations
+        )
+        if allowed_chapter_orphans is True:
+            if violations and not chapter_orphans:
+                raise MaintenanceError("database_integrity_failed")
+        elif (not isinstance(allowed_chapter_orphans, int)
+                or isinstance(allowed_chapter_orphans, bool)
+                or allowed_chapter_orphans < 0
+                or len(violations) != allowed_chapter_orphans
+                or (violations and not chapter_orphans)):
             raise MaintenanceError("database_integrity_failed")
         required = {"file_meta", "chapter_points", "catalog_entries"}
         present = {row[0] for row in connection.execute(
@@ -438,6 +462,40 @@ def _chapter_table_digest(connection, *, deadline=None):
     return digest.hexdigest()
 
 
+def _validate_legacy_without_duration(value):
+    from fs42.chapter_analysis import ChapterAnalysisError, validate_chapters
+
+    if not isinstance(value, list) or not value:
+        raise MaintenanceError("chapter_cache_invalid")
+    try:
+        ends = [item.get("chapter_end") for item in value if isinstance(item, dict)]
+        if len(ends) != len(value):
+            raise ChapterAnalysisError("chapter_data_invalid")
+        duration = max(float(end) for end in ends)
+        validate_chapters(value, duration)
+    except (TypeError, ValueError, ChapterAnalysisError) as exc:
+        raise MaintenanceError("chapter_cache_invalid") from exc
+
+
+def _is_final_chapter_duration_overrun(value, duration):
+    from fs42.chapter_analysis import ChapterAnalysisError, validate_chapters
+
+    if not isinstance(value, list) or not value:
+        return False
+    try:
+        final_end = value[-1].get("chapter_end")
+        if (not isinstance(final_end, (int, float)) or isinstance(final_end, bool)
+                or not math.isfinite(float(final_end))
+                or float(final_end) <= float(duration)
+                or any(float(item.get("chapter_end")) > float(duration)
+                       for item in value[:-1])):
+            return False
+        validate_chapters(value, float(final_end))
+        return True
+    except (AttributeError, TypeError, ValueError, ChapterAnalysisError):
+        return False
+
+
 def _chapter_counts(connection, eligible, existing_paths, *, deadline=None):
     from fs42.chapter_analysis import (
         COMPLETED_METHODS, METHOD_SHORT, ChapterAnalysisError, validate_chapters,
@@ -482,11 +540,16 @@ def _chapter_counts(connection, eligible, existing_paths, *, deadline=None):
         if value == []:
             counts["current_empty"] += 1
         elif isinstance(value, list) and value:
+            counts["legacy_nonempty"] += 1
             try:
                 validate_chapters(value, metadata[path][0])
             except ChapterAnalysisError as exc:
-                raise MaintenanceError("chapter_cache_invalid") from exc
-            counts["legacy_nonempty"] += 1
+                if not _is_final_chapter_duration_overrun(
+                        value, metadata[path][0]):
+                    raise MaintenanceError("chapter_cache_invalid") from exc
+                counts["re_attestation_required"] += 1
+            else:
+                counts["trusted_legacy_nonempty"] += 1
         elif isinstance(value, dict):
             if set(value) != {"attestation_version", "method", "media_identity", "chapters"}:
                 raise MaintenanceError("chapter_cache_invalid")
@@ -508,34 +571,65 @@ def _chapter_counts(connection, eligible, existing_paths, *, deadline=None):
             counts["versioned"] += 1
         else:
             raise MaintenanceError("chapter_cache_invalid")
+    chapter_rows = connection.execute(
+        "SELECT path,points FROM chapter_points ORDER BY path"
+    ).fetchmany(100_001)
+    if len(chapter_rows) > 100_000:
+        raise MaintenanceError("chapter_cache_invalid")
+    file_meta_paths = {
+        path for path, in connection.execute("SELECT path FROM file_meta")
+    }
     all_empty = set()
-    for path, points in connection.execute("SELECT path,points FROM chapter_points"):
+    for path, points in chapter_rows:
         _check_deadline(deadline)
         try:
-            if json.loads(points) == []:
+            value = json.loads(points)
+            if value == []:
                 all_empty.add(path)
         except (TypeError, json.JSONDecodeError) as exc:
             raise MaintenanceError("chapter_cache_invalid") from exc
+        if path not in file_meta_paths:
+            if path in eligible_paths or path in existing_paths:
+                raise MaintenanceError("chapter_cache_invalid")
+            if value == []:
+                counts["unavailable_empty"] += 1
+            elif isinstance(value, list) and value:
+                _validate_legacy_without_duration(value)
+                counts["unavailable_nonempty"] += 1
+            else:
+                raise MaintenanceError("chapter_cache_invalid")
     counts["legacy_empty"] = len(all_empty)
-    counts["unavailable_empty"] = len(all_empty - existing_paths)
     if counts["legacy_empty"] != counts["current_empty"] + counts["unavailable_empty"]:
         raise MaintenanceError("chapter_cache_invalid")
-    counts["attestations"] = counts["missing"] + counts["current_empty"]
+    counts["orphan_retirements"] = (
+        counts["unavailable_empty"] + counts["unavailable_nonempty"])
+    counts["attestations"] = (
+        counts["missing"] + counts["current_empty"]
+        + counts["re_attestation_required"])
     targets = set()
     for path, raw in stored.items():
         if raw is None:
             targets.add(path)
             continue
         try:
-            if json.loads(raw) == []:
+            value = json.loads(raw)
+            if value == []:
                 targets.add(path)
+            elif isinstance(value, list) and value:
+                try:
+                    validate_chapters(value, metadata[path][0])
+                except ChapterAnalysisError as exc:
+                    if not _is_final_chapter_duration_overrun(
+                            value, metadata[path][0]):
+                        raise MaintenanceError("chapter_cache_invalid") from exc
+                    targets.add(path)
         except (TypeError, json.JSONDecodeError) as exc:
             raise MaintenanceError("chapter_cache_invalid") from exc
     counts["short_media"] = sum(
         0 < metadata[path][0] < 300 for path in targets
     )
     counts["probes"] = counts["attestations"] - counts["short_media"]
-    for key in (*EXPECTED_KEYS, "legacy_nonempty", "versioned"):
+    for key in EXPECTED_KEYS:
         counts.setdefault(key, 0)
     return dict(counts)
 
@@ -827,7 +921,10 @@ def _counts_from_private(private_database, eligible, *, deadline=None):
         connection.execute("PRAGMA query_only=ON")
         connection.execute("BEGIN")
         cached_paths = {path for path, in connection.execute("SELECT path FROM file_meta")}
-        existing = _existing_media_paths(cached_paths)
+        chapter_paths = {
+            path for path, in connection.execute("SELECT path FROM chapter_points")
+        }
+        existing = _existing_media_paths(cached_paths | chapter_paths)
         counts = _chapter_counts(
             connection, eligible, existing, deadline=deadline)
         connection.rollback()
@@ -864,6 +961,397 @@ def _fsync_directory(path):
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _progress_identity(inventory):
+    digest = hashlib.sha256()
+    if len(inventory) > MAX_PROGRESS_IDENTITIES:
+        raise MaintenanceError("progress_state_invalid")
+    for path, item in sorted(inventory.items()):
+        encoded = json.dumps(
+            [path, list(item.relative), item.size, item.mtime_ns],
+            separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big") + encoded)
+    return digest.hexdigest()
+
+
+def _private_file_digest(path, *, maximum=MAX_PROGRESS_BYTES):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > maximum):
+            raise MaintenanceError("progress_state_invalid")
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid,
+                    opened.st_nlink, opened.st_size) != (
+                    info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                    info.st_nlink, info.st_size):
+                raise MaintenanceError("progress_state_invalid")
+            payload = bytearray()
+            while len(payload) <= maximum:
+                block = os.read(descriptor, min(64 * 1024, maximum + 1 - len(payload)))
+                if not block:
+                    break
+                payload.extend(block)
+            if len(payload) != info.st_size:
+                raise MaintenanceError("progress_state_invalid")
+        finally:
+            os.close(descriptor)
+        return hashlib.sha256(bytes(payload)).hexdigest()
+    except MaintenanceError:
+        raise
+    except OSError as exc:
+        raise MaintenanceError("progress_state_invalid") from exc
+
+
+def _empty_bitmap(count):
+    return "00" * ((count + 7) // 8)
+
+
+def _bitmap_has(encoded, index):
+    data = bytes.fromhex(encoded)
+    return bool(data[index // 8] & (1 << (index % 8)))
+
+
+def _bitmap_add(encoded, index):
+    data = bytearray.fromhex(encoded)
+    data[index // 8] |= 1 << (index % 8)
+    return data.hex()
+
+
+def _bitmap_clear(encoded, index):
+    data = bytearray.fromhex(encoded)
+    data[index // 8] &= ~(1 << (index % 8))
+    return data.hex()
+
+
+def _validate_bitmap(encoded, count):
+    if (not isinstance(encoded, str)
+            or len(encoded) != 2 * ((count + 7) // 8)
+            or not re.fullmatch(r"[0-9a-f]*", encoded)):
+        raise MaintenanceError("progress_state_invalid")
+    if count % 8 and encoded:
+        used = count % 8
+        if bytes.fromhex(encoded)[-1] & ~((1 << used) - 1):
+            raise MaintenanceError("progress_state_invalid")
+
+
+def _validate_progress(document, *, proposal_id, baseline_identity,
+                       inventory_identity, inventory_count,
+                       primary_count=None, questionable_count=None):
+    expected = {
+        "version", "sequence", "proposal_id", "baseline_identity",
+        "inventory_identity", "chapter_identity", "phase", "primary_count",
+        "questionable_count", "primary_indices", "questionable_indices",
+        "primary_attempted", "questionable_attempted",
+        "primary_unresolved", "questionable_unresolved", "inflight",
+        "operational_streak", "failures", "dataset_rejections", "unresolved",
+    }
+    if not isinstance(document, dict) or set(document) != expected:
+        raise MaintenanceError("progress_state_invalid")
+    integers = (
+        "sequence", "primary_count", "questionable_count",
+        "operational_streak", "dataset_rejections", "unresolved",
+    )
+    if any(not isinstance(document[key], int) or isinstance(document[key], bool)
+           or document[key] < 0 for key in integers):
+        raise MaintenanceError("progress_state_invalid")
+    if (not isinstance(document["version"], int)
+            or isinstance(document["version"], bool)
+            or document["version"] != 1 or document["sequence"] > 100_000
+            or document["proposal_id"] != proposal_id
+            or document["baseline_identity"] != baseline_identity
+            or document["inventory_identity"] != inventory_identity
+            or (primary_count is not None
+                and document["primary_count"] != primary_count)
+            or (questionable_count is not None
+                and document["questionable_count"] != questionable_count)
+            or inventory_count > MAX_PROGRESS_IDENTITIES
+            or document["operational_streak"] > MAX_PROBE_FAILURES
+            or document["dataset_rejections"] > 100_000
+            or document["phase"] not in {
+                "primary", "questionable", "orphans", "complete", "blocked"
+            }
+            or not isinstance(document["chapter_identity"], str)
+            or not re.fullmatch(r"[0-9a-f]{64}", document["chapter_identity"])
+            or document["unresolved"] > (
+                document["primary_count"] + document["questionable_count"])):
+        raise MaintenanceError("progress_state_invalid")
+    primary_count = document["primary_count"]
+    questionable_count = document["questionable_count"]
+    for key, count in (
+            ("primary_indices", primary_count),
+            ("questionable_indices", questionable_count)):
+        indices = document[key]
+        if (not isinstance(indices, list) or len(indices) != count
+                or indices != sorted(set(indices))
+                or any(not isinstance(index, int) or isinstance(index, bool)
+                       or index < 0 or index >= inventory_count for index in indices)):
+            raise MaintenanceError("progress_state_invalid")
+    if set(document["primary_indices"]) & set(document["questionable_indices"]):
+        raise MaintenanceError("progress_state_invalid")
+    _validate_bitmap(document["primary_attempted"], primary_count)
+    _validate_bitmap(document["questionable_attempted"], questionable_count)
+    _validate_bitmap(document["primary_unresolved"], primary_count)
+    _validate_bitmap(document["questionable_unresolved"], questionable_count)
+    primary_attempted = int.from_bytes(
+        bytes.fromhex(document["primary_attempted"]), "little")
+    questionable_attempted = int.from_bytes(
+        bytes.fromhex(document["questionable_attempted"]), "little")
+    primary_unresolved = int.from_bytes(
+        bytes.fromhex(document["primary_unresolved"]), "little")
+    questionable_unresolved = int.from_bytes(
+        bytes.fromhex(document["questionable_unresolved"]), "little")
+    if ((primary_unresolved & ~primary_attempted)
+            or (questionable_unresolved & ~questionable_attempted)
+            or document["unresolved"] != (
+                primary_unresolved.bit_count()
+                + questionable_unresolved.bit_count())):
+        raise MaintenanceError("progress_state_invalid")
+    failures = document["failures"]
+    if (not isinstance(failures, dict) or set(failures) != set(PROBE_FAILURE_CATEGORIES)
+            or any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                   or value > 100_000 for value in failures.values())):
+        raise MaintenanceError("progress_state_invalid")
+    inflight = document["inflight"]
+    if inflight is not None:
+        if (not isinstance(inflight, dict)
+                or set(inflight) != {"phase", "index", "stable_chapter_identity"}
+                or inflight["phase"] not in {"primary", "questionable", "orphans"}
+                or not isinstance(inflight["index"], int)
+                or isinstance(inflight["index"], bool)
+                or not isinstance(inflight["stable_chapter_identity"], str)
+                or not re.fullmatch(r"[0-9a-f]{64}", inflight["stable_chapter_identity"])):
+            raise MaintenanceError("progress_state_invalid")
+        if inflight["phase"] == "orphans":
+            if inflight["index"] != 0:
+                raise MaintenanceError("progress_state_invalid")
+        else:
+            bound = (primary_count if inflight["phase"] == "primary"
+                     else questionable_count)
+            bitmap = (document["primary_attempted"]
+                      if inflight["phase"] == "primary"
+                      else document["questionable_attempted"])
+            if (inflight["index"] < 0 or inflight["index"] >= bound
+                    or _bitmap_has(bitmap, inflight["index"])):
+                raise MaintenanceError("progress_state_invalid")
+        if document["phase"] != inflight["phase"]:
+            raise MaintenanceError("progress_state_invalid")
+    elif document["phase"] == "orphans":
+        raise MaintenanceError("progress_state_invalid")
+    return document
+
+
+def _read_progress_payload(path):
+    try:
+        info = os.stat(path, follow_symlinks=False)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > MAX_PROGRESS_BYTES):
+            raise MaintenanceError("progress_state_invalid")
+        descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_uid,
+                    opened.st_nlink, opened.st_size) != (
+                    info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                    info.st_nlink, info.st_size):
+                raise MaintenanceError("progress_state_invalid")
+            payload = bytearray()
+            while len(payload) <= MAX_PROGRESS_BYTES:
+                block = os.read(
+                    descriptor,
+                    min(64 * 1024, MAX_PROGRESS_BYTES + 1 - len(payload)))
+                if not block:
+                    break
+                payload.extend(block)
+        finally:
+            os.close(descriptor)
+        if len(payload) != info.st_size:
+            raise MaintenanceError("progress_state_invalid")
+        return bytes(payload)
+    except MaintenanceError:
+        raise
+    except OSError as exc:
+        raise MaintenanceError("progress_state_invalid") from exc
+
+
+def _read_progress_file(path):
+    try:
+        return json.loads(_read_progress_payload(path).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MaintenanceError("progress_state_invalid") from exc
+
+
+def _recover_progress_tail(*, final_document=None, validation_arguments,
+                           backup_root=None):
+    backup_root = BACKUP_ROOT if backup_root is None else Path(backup_root)
+    pending = backup_root / PROGRESS_PENDING
+    try:
+        info = os.stat(pending, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size > MAX_PROGRESS_BYTES):
+        raise MaintenanceError("progress_state_invalid")
+    payload = _read_progress_payload(pending)
+    try:
+        pending_document = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pending_document = None
+    if pending_document is not None:
+        pending_document = _validate_progress(
+            pending_document, **validation_arguments)
+        expected_sequence = (
+            0 if final_document is None else final_document["sequence"] + 1)
+        if pending_document["sequence"] != expected_sequence:
+            raise MaintenanceError("progress_state_invalid")
+    try:
+        os.unlink(pending)
+        _fsync_directory(backup_root)
+    except OSError as exc:
+        raise MaintenanceError("progress_state_invalid") from exc
+
+
+def _load_progress(*, proposal_id, baseline_identity, inventory_identity,
+                   inventory_count, primary_count=None,
+                   questionable_count=None, backup_root=None):
+    backup_root = BACKUP_ROOT if backup_root is None else Path(backup_root)
+    _ensure_private_directory(backup_root)
+    entries = list(backup_root.iterdir())
+    if len(entries) > 64:
+        raise MaintenanceError("progress_state_invalid")
+    allowed = {PROGRESS_FINAL, PROGRESS_PENDING, BASELINE_PIN}
+    names = set()
+    for path in entries:
+        if path.name in names:
+            raise MaintenanceError("progress_state_invalid")
+        names.add(path.name)
+        if path.name not in allowed and not BACKUP_RE.fullmatch(path.name):
+            raise MaintenanceError("progress_state_invalid")
+    final = backup_root / PROGRESS_FINAL
+    document = None
+    if PROGRESS_FINAL in names:
+        document = _validate_progress(
+            _read_progress_file(final), proposal_id=proposal_id,
+            baseline_identity=baseline_identity,
+            inventory_identity=inventory_identity, inventory_count=inventory_count,
+            primary_count=primary_count, questionable_count=questionable_count)
+    _recover_progress_tail(
+        final_document=document,
+        validation_arguments={
+            "proposal_id": proposal_id,
+            "baseline_identity": baseline_identity,
+            "inventory_identity": inventory_identity,
+            "inventory_count": inventory_count,
+            "primary_count": primary_count,
+            "questionable_count": questionable_count,
+        },
+        backup_root=backup_root)
+    return document
+
+
+def _publish_progress(document, previous=None, *, backup_root=None,
+                      proposal_id, baseline_identity, inventory_identity,
+                      inventory_count, primary_count=None,
+                      questionable_count=None):
+    backup_root = BACKUP_ROOT if backup_root is None else Path(backup_root)
+    validated = _validate_progress(
+        document, proposal_id=proposal_id, baseline_identity=baseline_identity,
+        inventory_identity=inventory_identity, inventory_count=inventory_count,
+        primary_count=primary_count,
+        questionable_count=questionable_count)
+    if previous is not None and validated["sequence"] != previous["sequence"] + 1:
+        raise MaintenanceError("progress_state_invalid")
+    payload = json.dumps(
+        validated, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(payload) > MAX_PROGRESS_BYTES:
+        raise MaintenanceError("progress_state_invalid")
+    pending = backup_root / PROGRESS_PENDING
+    final = backup_root / PROGRESS_FINAL
+    try:
+        descriptor = os.open(
+            pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            _write_all(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if _read_progress_file(pending) != validated:
+            raise MaintenanceError("progress_state_invalid")
+        if previous is None:
+            _rename_noreplace(pending, final)
+        else:
+            current = _read_progress_file(final)
+            if current != previous:
+                raise MaintenanceError("progress_state_invalid")
+            os.replace(pending, final)
+        _fsync_directory(backup_root)
+        return validated
+    except MaintenanceError:
+        raise
+    except OSError as exc:
+        raise MaintenanceError("progress_state_invalid") from exc
+
+
+def _remove_progress(document, *, backup_root=None):
+    backup_root = BACKUP_ROOT if backup_root is None else Path(backup_root)
+    final = backup_root / PROGRESS_FINAL
+    if _read_progress_file(final) != document:
+        raise MaintenanceError("progress_state_invalid")
+    try:
+        os.unlink(final)
+        _fsync_directory(backup_root)
+    except OSError as exc:
+        raise MaintenanceError("progress_state_invalid") from exc
+
+
+def _remove_progress_after_rollback(*, backup_root=None):
+    backup_root = BACKUP_ROOT if backup_root is None else Path(backup_root)
+    _verify_progress_file_identities(backup_root=backup_root)
+    paths = []
+    for name in (PROGRESS_PENDING, PROGRESS_FINAL):
+        path = backup_root / name
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > MAX_PROGRESS_BYTES):
+            raise MaintenanceError("progress_state_invalid")
+        paths.append(path)
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            raise MaintenanceError("progress_state_invalid") from exc
+    if paths:
+        _fsync_directory(backup_root)
+
+
+def _verify_progress_file_identities(*, backup_root=None):
+    backup_root = BACKUP_ROOT if backup_root is None else Path(backup_root)
+    for name in (PROGRESS_PENDING, PROGRESS_FINAL):
+        path = backup_root / name
+        try:
+            info = os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size > MAX_PROGRESS_BYTES):
+            raise MaintenanceError("progress_state_invalid")
 
 
 def _ensure_private_directory(path):
@@ -930,8 +1418,8 @@ def _verified_equivalent(left_path, right_path, *, deadline=None):
     try:
         left.execute("PRAGMA query_only=ON")
         right.execute("PRAGMA query_only=ON")
-        _database_checks(left, deadline=deadline)
-        _database_checks(right, deadline=deadline)
+        _database_checks(left, deadline=deadline, allowed_chapter_orphans=True)
+        _database_checks(right, deadline=deadline, allowed_chapter_orphans=True)
         if (_logical_digest(left, deadline=deadline)
                 != _logical_digest(right, deadline=deadline)):
             raise MaintenanceError("database_equivalence_failed")
@@ -981,6 +1469,12 @@ def _retention_inventory(backup_root=None):
                     or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
                 raise MaintenanceError("backup_invalid")
             pin = path
+        elif path.name in {PROGRESS_FINAL, PROGRESS_PENDING}:
+            info = os.stat(path, follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_size > MAX_PROGRESS_BYTES):
+                raise MaintenanceError("progress_state_invalid")
         else:
             # Pending files, sidecars, and every unknown entry require an
             # explicit operator decision.  They are never silently consumed.
@@ -999,7 +1493,8 @@ def _verify_rollback_point(path, *, deadline=None):
         connection = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
         try:
             connection.execute("PRAGMA query_only=ON")
-            _database_checks(connection, deadline=deadline)
+            _database_checks(
+                connection, deadline=deadline, allowed_chapter_orphans=True)
         finally:
             connection.close()
     except MaintenanceError:
@@ -1207,7 +1702,7 @@ def _verify_baseline_pin(*, backup_root=None):
         raise MaintenanceError("baseline_invalid")
     connection = sqlite3.connect(f"file:{backup}?mode=ro&immutable=1", uri=True)
     try:
-        _database_checks(connection)
+        _database_checks(connection, allowed_chapter_orphans=True)
         if _logical_digest(connection) != document["logical_identity"]:
             raise MaintenanceError("baseline_invalid")
         if _chapter_table_digest(connection) != document["chapter_identity"]:
@@ -1345,6 +1840,8 @@ def execute(args, expected):
     was_running = False
     safe_to_restart = False
     operation_complete = False
+    operation_status = "partial"
+    unresolved = 0
     partial_reason = "deadline_partial"
     failure_counts = {category: 0 for category in PROBE_FAILURE_CATEGORIES}
     with _director_validation_lock(secure):
@@ -1371,7 +1868,15 @@ def execute(args, expected):
                         baseline = _verify_baseline_pin()
                         _recover_retention_transition(
                             baseline, deadline=admission_deadline)
+                        _load_progress(
+                            proposal_id=args.proposal_id,
+                            baseline_identity=_private_file_digest(pin),
+                            inventory_identity=_progress_identity(inventory),
+                            inventory_count=len(inventory))
                     elif counts.get("versioned", 0):
+                        raise MaintenanceError("baseline_missing")
+                    elif ((BACKUP_ROOT / PROGRESS_FINAL).exists()
+                          or (BACKUP_ROOT / PROGRESS_PENDING).exists()):
                         raise MaintenanceError("baseline_missing")
 
                     # The backup remains unpublished while all integrity,
@@ -1385,8 +1890,12 @@ def execute(args, expected):
                     try:
                         source.execute("PRAGMA query_only=ON")
                         candidate.execute("PRAGMA query_only=ON")
-                        _database_checks(source, deadline=admission_deadline)
-                        _database_checks(candidate, deadline=admission_deadline)
+                        _database_checks(
+                            source, deadline=admission_deadline,
+                            allowed_chapter_orphans=counts["orphan_retirements"])
+                        _database_checks(
+                            candidate, deadline=admission_deadline,
+                            allowed_chapter_orphans=counts["orphan_retirements"])
                         source_counts = _counts_from_private(
                             generation.database, inventory,
                             deadline=admission_deadline)
@@ -1445,14 +1954,16 @@ def execute(args, expected):
                         raise MaintenanceError("input_identity_changed")
                     if time.monotonic() < admission_deadline:
                         safe_to_restart = False
-                        (operation_complete, safe_to_restart, failure_counts,
-                         partial_reason) = _run_writer(
+                        (operation_status, safe_to_restart, failure_counts,
+                         unresolved, partial_reason) = _run_writer(
                             args.proposal_id, counts, started,
                             expected_inventory=inventory,
                             expected_full_digest=source_logical,
                             expected_protected_digest=protected_logical,
                             verification_deadline=verification_deadline,
+                            baseline=baseline,
                         )
+                        operation_complete = operation_status == "complete"
             except MaintenanceError as exc:
                 if exc.code in {
                     "database_integrity_failed", "database_equivalence_failed",
@@ -1465,8 +1976,9 @@ def execute(args, expected):
                 if was_running and safe_to_restart:
                     _restart_service()
     return {
-        "status": "complete" if operation_complete else "partial",
+        "status": operation_status,
         **counts, "failures": failure_counts,
+        "unresolved": unresolved,
         "partial_reason": None if operation_complete else partial_reason,
     }
 
@@ -1528,12 +2040,14 @@ def rollback(args, expected):
                     ) != generation.live_identity:
                         raise MaintenanceError("input_identity_changed")
                     _check_deadline(admission_deadline)
+                    _verify_progress_file_identities()
                     safe_to_restart = False
                     _run_rollback(
                         baseline, expected_full_digest=expected_full,
                         expected_protected_digest=expected_protected,
                         verification_deadline=verification_deadline,
                     )
+                    _remove_progress_after_rollback()
                     safe_to_restart = True
             except MaintenanceError as exc:
                 if exc.code in {
@@ -1575,8 +2089,12 @@ def _run_rollback(baseline, *, expected_full_digest, expected_protected_digest,
     source = sqlite3.connect(f"file:{baseline}?mode=ro&immutable=1", uri=True)
     try:
         source.execute("PRAGMA query_only=ON")
-        _database_checks(source, deadline=verification_deadline)
-        _database_checks(live, deadline=verification_deadline)
+        _database_checks(
+            source, deadline=verification_deadline,
+            allowed_chapter_orphans=True)
+        _database_checks(
+            live, deadline=verification_deadline,
+            allowed_chapter_orphans=True)
         if _logical_digest(
                 live, deadline=verification_deadline) != expected_full_digest:
             raise MaintenanceError("database_equivalence_failed")
@@ -1596,7 +2114,9 @@ def _run_rollback(baseline, *, expected_full_digest, expected_protected_digest,
         except Exception:
             live.rollback()
             raise
-        _database_checks(live, deadline=verification_deadline)
+        _database_checks(
+            live, deadline=verification_deadline,
+            allowed_chapter_orphans=True)
         if _logical_digest(
                 live, exclude_tables={"chapter_points"},
                 deadline=verification_deadline) != expected_protected_digest:
@@ -1614,126 +2134,514 @@ def _run_rollback(baseline, *, expected_full_digest, expected_protected_digest,
         live.close()
 
 
+def _chapter_digest_excluding(connection, excluded=()):
+    from station_director.preservation import canonical_sqlite_value
+
+    excluded = frozenset(excluded)
+    digest = hashlib.sha256()
+    count = 0
+    for row in connection.execute(
+            "SELECT path,points,last_updated FROM chapter_points ORDER BY path"):
+        if row[0] in excluded:
+            continue
+        count += 1
+        if count > 100_000:
+            raise MaintenanceError("chapter_cache_invalid")
+        encoded = b"".join(canonical_sqlite_value(value) for value in row)
+        if len(encoded) > 1024 * 1024:
+            raise MaintenanceError("chapter_cache_invalid")
+        digest.update(len(encoded).to_bytes(8, "big") + encoded)
+    digest.update(count.to_bytes(8, "big"))
+    return digest.hexdigest()
+
+
+def _writer_row_state(connection, path, item):
+    from fs42.chapter_analysis import (
+        COMPLETED_METHODS, METHOD_SHORT, ChapterAnalysisError, validate_chapters,
+    )
+
+    row = connection.execute(
+        "SELECT points FROM chapter_points WHERE path=?", (path,)).fetchone()
+    if row is None:
+        return {"status": "missing", "raw": None}
+    raw = row[0]
+    duration_row = connection.execute(
+        "SELECT duration FROM file_meta WHERE path=?", (path,)).fetchone()
+    if duration_row is None:
+        raise MaintenanceError("chapter_cache_invalid")
+    try:
+        value = json.loads(raw)
+        if isinstance(value, list):
+            if not value:
+                return {"status": "legacy_empty", "raw": raw}
+            try:
+                validate_chapters(value, duration_row[0])
+            except ChapterAnalysisError as exc:
+                if not _is_final_chapter_duration_overrun(
+                        value, duration_row[0]):
+                    raise MaintenanceError("chapter_cache_invalid") from exc
+                return {"status": "re_attestation_required", "raw": raw}
+            return {"status": "legacy_nonempty", "raw": raw}
+        if (not isinstance(value, dict)
+                or set(value) != {
+                    "attestation_version", "method", "media_identity", "chapters"
+                }):
+            raise MaintenanceError("chapter_cache_invalid")
+        identity = value["media_identity"]
+        if (value["attestation_version"] != 1
+                or value["method"] not in COMPLETED_METHODS
+                or not isinstance(identity, dict)
+                or set(identity) != {"size", "mtime_ns"}
+                or identity != {"size": item.size, "mtime_ns": item.mtime_ns}):
+            raise MaintenanceError("chapter_cache_invalid")
+        chapters = validate_chapters(value["chapters"], duration_row[0])
+        if value["method"] == METHOD_SHORT and (chapters or duration_row[0] >= 300):
+            raise MaintenanceError("chapter_cache_invalid")
+        return {"status": "trusted_v1", "raw": raw}
+    except MaintenanceError:
+        raise
+    except (TypeError, KeyError, json.JSONDecodeError, ChapterAnalysisError) as exc:
+        raise MaintenanceError("chapter_cache_invalid") from exc
+
+
+def _writer_targets(connection, inventory):
+    primary = []
+    questionable = []
+    for path, item in sorted(inventory.items()):
+        previous = _writer_row_state(connection, path, item)
+        if previous["status"] in {"missing", "legacy_empty"}:
+            primary.append(path)
+        elif previous["status"] == "re_attestation_required":
+            questionable.append(path)
+    return tuple(primary), tuple(questionable)
+
+
+def _verified_orphan_rows(connection, inventory, root_fd):
+    rows = connection.execute(
+        "SELECT c.path,c.points,c.last_updated FROM chapter_points AS c "
+        "LEFT JOIN file_meta AS f ON f.path=c.path WHERE f.path IS NULL "
+        "ORDER BY c.path"
+    ).fetchmany(100_001)
+    if len(rows) > 100_000:
+        raise MaintenanceError("chapter_cache_invalid")
+    verified = []
+    for path, raw, last_updated in rows:
+        if path in inventory:
+            raise MaintenanceError("chapter_cache_invalid")
+        try:
+            value = json.loads(raw)
+            if value != []:
+                _validate_legacy_without_duration(value)
+            components = _relative_media_path(path)
+            with _open_media(root_fd, components):
+                raise MaintenanceError("chapter_cache_invalid")
+        except FileNotFoundError:
+            verified.append((path, raw, last_updated))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise MaintenanceError("chapter_cache_invalid") from exc
+        except OSError as exc:
+            raise MaintenanceError("media_identity_invalid") from exc
+    return tuple(verified)
+
+
+def _new_progress(proposal_id, baseline_identity, inventory_identity,
+                  chapter_identity, primary_indices, questionable_indices):
+    primary_count = len(primary_indices)
+    questionable_count = len(questionable_indices)
+    return {
+        "version": 1,
+        "sequence": 0,
+        "proposal_id": proposal_id,
+        "baseline_identity": baseline_identity,
+        "inventory_identity": inventory_identity,
+        "chapter_identity": chapter_identity,
+        "phase": "primary",
+        "primary_count": primary_count,
+        "questionable_count": questionable_count,
+        "primary_indices": list(primary_indices),
+        "questionable_indices": list(questionable_indices),
+        "primary_attempted": _empty_bitmap(primary_count),
+        "questionable_attempted": _empty_bitmap(questionable_count),
+        "primary_unresolved": _empty_bitmap(primary_count),
+        "questionable_unresolved": _empty_bitmap(questionable_count),
+        "inflight": None,
+        "operational_streak": 0,
+        "failures": {category: 0 for category in PROBE_FAILURE_CATEGORIES},
+        "dataset_rejections": 0,
+        "unresolved": 0,
+    }
+
+
+def _next_progress(document, **updates):
+    following = json.loads(json.dumps(document))
+    following.update(updates)
+    following["sequence"] = document["sequence"] + 1
+    return following
+
+
+def _progress_arguments(proposal_id, baseline_identity, inventory_identity,
+                        inventory_count, primary_count=None,
+                        questionable_count=None):
+    return {
+        "proposal_id": proposal_id,
+        "baseline_identity": baseline_identity,
+        "inventory_identity": inventory_identity,
+        "inventory_count": inventory_count,
+        "primary_count": primary_count,
+        "questionable_count": questionable_count,
+    }
+
+
+def _publish_next_progress(document, *, arguments, **updates):
+    following = _next_progress(document, **updates)
+    return _publish_progress(following, document, **arguments)
+
+
+def _reconcile_inflight(connection, document, primary, questionable, inventory,
+                        orphans, *, arguments, root_fd):
+    inflight = document["inflight"]
+    if inflight is None:
+        if _chapter_table_digest(connection) != document["chapter_identity"]:
+            raise MaintenanceError("progress_state_invalid")
+        return document
+    if inflight["phase"] == "orphans":
+        current_identity = _chapter_table_digest(connection)
+        if current_identity == document["chapter_identity"]:
+            return document
+        if current_identity != inflight["stable_chapter_identity"]:
+            raise MaintenanceError("progress_state_invalid")
+        _database_checks(connection)
+        phase = "blocked" if document["unresolved"] else "complete"
+        return _publish_next_progress(
+            document, arguments=arguments, phase=phase, inflight=None,
+            chapter_identity=_chapter_table_digest(connection),
+            operational_streak=0)
+    targets = primary if inflight["phase"] == "primary" else questionable
+    path = targets[inflight["index"]]
+    if (_chapter_digest_excluding(connection, {path})
+            != inflight["stable_chapter_identity"]):
+        raise MaintenanceError("progress_state_invalid")
+    current = _writer_row_state(connection, path, inventory[path])
+    original_statuses = (
+        {"missing", "legacy_empty"} if inflight["phase"] == "primary"
+        else {"re_attestation_required"}
+    )
+    if current["status"] in original_statuses:
+        if _chapter_table_digest(connection) != document["chapter_identity"]:
+            raise MaintenanceError("progress_state_invalid")
+        return document
+    if current["status"] != "trusted_v1":
+        raise MaintenanceError("progress_state_invalid")
+    bitmap_key = inflight["phase"] + "_attempted"
+    resolved_key = inflight["phase"] + "_unresolved"
+    index = inflight["index"]
+    return _publish_next_progress(
+        document, arguments=arguments,
+        **{
+            bitmap_key: _bitmap_add(document[bitmap_key], index),
+            resolved_key: _bitmap_clear(document[resolved_key], index),
+            "chapter_identity": _chapter_table_digest(connection),
+            "inflight": None,
+            "operational_streak": 0,
+        })
+
+
+def _verify_progress_target_states(connection, document, primary, questionable,
+                                   inventory):
+    for phase, targets, original in (
+            ("primary", primary, {"missing", "legacy_empty"}),
+            ("questionable", questionable, {"re_attestation_required"})):
+        attempted = document[phase + "_attempted"]
+        unresolved = document[phase + "_unresolved"]
+        for index, path in enumerate(targets):
+            state = _writer_row_state(connection, path, inventory[path])["status"]
+            if _bitmap_has(attempted, index) and not _bitmap_has(unresolved, index):
+                if state != "trusted_v1":
+                    raise MaintenanceError("progress_state_invalid")
+            elif state not in original:
+                raise MaintenanceError("progress_state_invalid")
+
+
 def _run_writer(proposal_id, initial_counts, started, *, expected_inventory=None,
                 expected_full_digest, expected_protected_digest,
-                verification_deadline=None):
+                verification_deadline=None, baseline=None):
     from fs42.chapter_analysis import ChapterAnalysisError, analyze_chapters
     from fs42.fluid_statements import FluidStatements
 
     inventory = _eligible_inventory(proposal_id)
     if expected_inventory is not None and inventory != expected_inventory:
         raise MaintenanceError("input_identity_changed")
+    if baseline is None:
+        raise MaintenanceError("baseline_invalid")
+    baseline_identity = _private_file_digest(BACKUP_ROOT / BASELINE_PIN)
+    inventory_identity = _progress_identity(inventory)
     connection = sqlite3.connect(DATABASE)
-    failures = 0
-    failure_counts = Counter()
-    complete = True
     try:
-        _database_checks(connection, deadline=verification_deadline)
+        _database_checks(
+            connection, deadline=verification_deadline,
+            allowed_chapter_orphans=initial_counts["orphan_retirements"])
         if _logical_digest(
                 connection, deadline=verification_deadline) != expected_full_digest:
             raise MaintenanceError("database_equivalence_failed")
         connection.set_authorizer(_writer_authorizer)
         with _open_root() as root_fd:
-            for path, item in sorted(inventory.items()):
-                if (time.monotonic() - started >= ADMISSION_SECONDS
-                        or failures >= MAX_PROBE_FAILURES):
-                    complete = False
-                    break
-                try:
-                    previous = FluidStatements.classify_chapter_points(connection, path)
-                except ValueError as exc:
-                    raise MaintenanceError("chapter_cache_invalid") from exc
-                if previous["status"] in {"trusted_v1", "legacy_nonempty"}:
-                    continue
-                state = _service_state()
-                if state[1:3] != ("inactive", "dead") or state[3] != "0":
-                    raise MaintenanceError("service_state_invalid")
-                try:
-                    with _open_media(root_fd, item.relative) as (media_fd, info):
-                        if (info.st_size, info.st_mtime_ns) != (item.size, item.mtime_ns):
-                            raise MaintenanceError("input_identity_changed")
-                        row = connection.execute(
-                            "SELECT duration FROM file_meta WHERE path=?", (path,)
-                        ).fetchone()
-                        if row is None:
-                            raise MaintenanceError("chapter_cache_invalid")
-                        analysis = analyze_chapters(
-                            f"/proc/self/fd/{media_fd}", row[0],
-                            timeout=ANALYSIS_TIMEOUT_SECONDS, pass_fds=(media_fd,))
-                        final_info = os.fstat(media_fd)
-                        if (final_info.st_size, final_info.st_mtime_ns) != (
-                                info.st_size, info.st_mtime_ns):
-                            raise MaintenanceError("input_identity_changed")
-                        try:
-                            with connection:
-                                FluidStatements.add_chapter_points(
-                                    connection, path, analysis, final_info, previous,
-                                    baseline_verified=True)
-                        except (sqlite3.Error, RuntimeError, ValueError) as exc:
-                            raise MaintenanceError("database_write_failed") from exc
-                except ChapterAnalysisError as exc:
-                    failures += 1
-                    failure_counts[exc.category] += 1
-
-            # Retire only legacy empty rows whose canonical media identity is
-            # now absent.  Unsafe identities fail closed rather than being
-            # mistaken for unavailable media.
-            empty_rows = connection.execute(
-                "SELECT path,points FROM chapter_points").fetchmany(100_001)
-            if len(empty_rows) > 100_000:
+            current_primary, current_questionable = _writer_targets(
+                connection, inventory)
+            if (len(current_primary)
+                    != initial_counts["missing"] + initial_counts["current_empty"]
+                    or len(current_questionable)
+                    != initial_counts["re_attestation_required"]):
                 raise MaintenanceError("chapter_cache_invalid")
-            for path, raw in empty_rows:
-                try:
-                    empty = json.loads(raw) == []
-                except (TypeError, json.JSONDecodeError) as exc:
-                    raise MaintenanceError("chapter_cache_invalid") from exc
-                if not empty:
-                    continue
-                try:
-                    components = _relative_media_path(path)
-                    with _open_media(root_fd, components):
+            orphans = _verified_orphan_rows(connection, inventory, root_fd)
+            if len(orphans) != initial_counts["orphan_retirements"]:
+                raise MaintenanceError("chapter_cache_invalid")
+            ordered_inventory = tuple(sorted(inventory))
+            inventory_indexes = {
+                path: index for index, path in enumerate(ordered_inventory)
+            }
+            arguments = _progress_arguments(
+                proposal_id, baseline_identity, inventory_identity,
+                len(ordered_inventory))
+            progress = _load_progress(**arguments)
+            if progress is None:
+                primary_indices = tuple(
+                    inventory_indexes[path] for path in current_primary)
+                questionable_indices = tuple(
+                    inventory_indexes[path] for path in current_questionable)
+                progress = _new_progress(
+                    proposal_id, baseline_identity, inventory_identity,
+                    _chapter_table_digest(connection), primary_indices,
+                    questionable_indices)
+                publication_arguments = dict(
+                    arguments, primary_count=len(primary_indices),
+                    questionable_count=len(questionable_indices))
+                progress = _publish_progress(
+                    progress, None, **publication_arguments)
+            else:
+                publication_arguments = dict(
+                    arguments, primary_count=progress["primary_count"],
+                    questionable_count=progress["questionable_count"])
+            primary = tuple(
+                ordered_inventory[index] for index in progress["primary_indices"])
+            questionable = tuple(
+                ordered_inventory[index]
+                for index in progress["questionable_indices"])
+            if (not set(current_primary).issubset(primary)
+                    or not set(current_questionable).issubset(questionable)):
+                raise MaintenanceError("progress_state_invalid")
+            progress = _reconcile_inflight(
+                connection, progress, primary, questionable, inventory,
+                orphans, arguments=publication_arguments, root_fd=root_fd)
+            arguments = publication_arguments
+            _verify_progress_target_states(
+                connection, progress, primary, questionable, inventory)
+
+            # A prior complete sweep is explicitly retriable, but only its
+            # unresolved identities are reopened. Resolved work remains fixed.
+            if progress["phase"] == "blocked":
+                updates = {
+                    "phase": "primary", "operational_streak": 0,
+                    "unresolved": 0, "dataset_rejections": 0,
+                    "primary_unresolved": _empty_bitmap(len(primary)),
+                    "questionable_unresolved": _empty_bitmap(len(questionable)),
+                }
+                for phase in ("primary", "questionable"):
+                    attempted = bytearray.fromhex(progress[phase + "_attempted"])
+                    unresolved = bytes.fromhex(progress[phase + "_unresolved"])
+                    for index, value in enumerate(unresolved):
+                        attempted[index] &= ~value
+                    updates[phase + "_attempted"] = attempted.hex()
+                progress = _publish_next_progress(
+                    progress, arguments=arguments, **updates)
+
+            partial_reason = None
+            skip_sweeps = progress["phase"] in {"orphans", "complete"}
+            phases = (("primary", primary), ("questionable", questionable))
+            for phase, targets in phases:
+                if skip_sweeps:
+                    break
+                attempted_key = phase + "_attempted"
+                unresolved_key = phase + "_unresolved"
+                if phase == "questionable":
+                    remaining = sum(
+                        not _bitmap_has(progress[attempted_key], index)
+                        for index in range(len(targets)))
+                    if (remaining and time.monotonic()
+                            + remaining * QUESTIONABLE_ATTEMPT_SECONDS
+                            >= started + ADMISSION_SECONDS):
+                        partial_reason = "deadline_partial"
+                        break
+                if progress["phase"] != phase:
+                    progress = _publish_next_progress(
+                        progress, arguments=arguments, phase=phase)
+                if progress["operational_streak"] >= MAX_PROBE_FAILURES:
+                    progress = _publish_next_progress(
+                        progress, arguments=arguments, operational_streak=0)
+                for index, path in enumerate(targets):
+                    if _bitmap_has(progress[attempted_key], index):
                         continue
-                except FileNotFoundError:
-                    with connection:
-                        changed = connection.execute(
-                            "DELETE FROM chapter_points WHERE path=? AND points=?", (path, raw)
-                        )
-                        if changed.rowcount != 1:
-                            raise MaintenanceError("database_write_failed")
-                except OSError as exc:
-                    raise MaintenanceError("media_identity_invalid") from exc
-        _database_checks(connection, deadline=verification_deadline)
+                    if time.monotonic() >= started + ADMISSION_SECONDS:
+                        partial_reason = "deadline_partial"
+                        break
+                    item = inventory[path]
+                    stable = _chapter_digest_excluding(connection, {path})
+                    progress = _publish_next_progress(
+                        progress, arguments=arguments,
+                        inflight={
+                            "phase": phase, "index": index,
+                            "stable_chapter_identity": stable,
+                        })
+                    state = _service_state()
+                    if state[1:3] != ("inactive", "dead") or state[3] != "0":
+                        raise MaintenanceError("service_state_invalid")
+                    category = None
+                    completed = False
+                    try:
+                        previous = _writer_row_state(connection, path, item)
+                        with _open_media(root_fd, item.relative) as (media_fd, info):
+                            if (info.st_size, info.st_mtime_ns) != (
+                                    item.size, item.mtime_ns):
+                                raise MaintenanceError("input_identity_changed")
+                            row = connection.execute(
+                                "SELECT duration FROM file_meta WHERE path=?", (path,)
+                            ).fetchone()
+                            if row is None:
+                                raise MaintenanceError("chapter_cache_invalid")
+                            analysis = analyze_chapters(
+                                f"/proc/self/fd/{media_fd}", row[0],
+                                timeout=ANALYSIS_TIMEOUT_SECONDS,
+                                pass_fds=(media_fd,))
+                            completed = True
+                            final_info = os.fstat(media_fd)
+                            if (final_info.st_size, final_info.st_mtime_ns) != (
+                                    info.st_size, info.st_mtime_ns):
+                                raise MaintenanceError("input_identity_changed")
+                            try:
+                                with connection:
+                                    FluidStatements.add_chapter_points(
+                                        connection, path, analysis, final_info,
+                                        previous, baseline_verified=True,
+                                        replace_questionable=(phase == "questionable"))
+                            except (sqlite3.Error, RuntimeError, ValueError) as exc:
+                                raise MaintenanceError("database_write_failed") from exc
+                    except ChapterAnalysisError as exc:
+                        category = exc.category
+                    except OSError as exc:
+                        raise MaintenanceError("media_identity_invalid") from exc
+
+                    failures = dict(progress["failures"])
+                    unresolved_bitmap = progress[unresolved_key]
+                    unresolved = progress["unresolved"]
+                    dataset_rejections = progress["dataset_rejections"]
+                    streak = progress["operational_streak"]
+                    if category is None and completed:
+                        streak = 0
+                    elif category == "chapter_data_invalid":
+                        failures[category] += 1
+                        dataset_rejections += 1
+                        unresolved_bitmap = _bitmap_add(unresolved_bitmap, index)
+                        unresolved += 1
+                        streak = 0
+                    elif category is not None:
+                        failures[category] += 1
+                        unresolved_bitmap = _bitmap_add(unresolved_bitmap, index)
+                        unresolved += 1
+                        streak += 1
+                    progress = _publish_next_progress(
+                        progress, arguments=arguments,
+                        **{
+                            attempted_key: _bitmap_add(
+                                progress[attempted_key], index),
+                            unresolved_key: unresolved_bitmap,
+                            "chapter_identity": _chapter_table_digest(connection),
+                            "inflight": None, "operational_streak": streak,
+                            "failures": failures,
+                            "dataset_rejections": dataset_rejections,
+                            "unresolved": unresolved,
+                        })
+                    if streak >= MAX_PROBE_FAILURES:
+                        partial_reason = "systemic_analysis_partial"
+                        break
+                if partial_reason is not None:
+                    break
+
+            all_attempted = all(
+                _bitmap_has(progress[phase + "_attempted"], index)
+                for phase, targets in phases for index in range(len(targets)))
+            if partial_reason is None and all_attempted and progress["phase"] != "complete":
+                if progress["phase"] != "orphans":
+                    progress = _publish_next_progress(
+                        progress, arguments=arguments, phase="orphans",
+                        inflight={
+                            "phase": "orphans", "index": 0,
+                            "stable_chapter_identity": _chapter_digest_excluding(
+                                connection, {row[0] for row in orphans}),
+                        })
+                current_orphans = _verified_orphan_rows(
+                    connection, inventory, root_fd)
+                if current_orphans:
+                    if current_orphans != orphans:
+                        raise MaintenanceError("progress_state_invalid")
+                    try:
+                        with connection:
+                            for path, raw, last_updated in orphans:
+                                changed = connection.execute(
+                                    "DELETE FROM chapter_points WHERE path=? "
+                                    "AND points=? AND last_updated=?",
+                                    (path, raw, last_updated))
+                                if changed.rowcount != 1:
+                                    raise MaintenanceError("database_write_failed")
+                    except sqlite3.Error as exc:
+                        raise MaintenanceError("database_write_failed") from exc
+                if _verified_orphan_rows(connection, inventory, root_fd):
+                    raise MaintenanceError("database_write_failed")
+                _database_checks(connection, deadline=verification_deadline)
+                phase = "blocked" if progress["unresolved"] else "complete"
+                progress = _publish_next_progress(
+                    progress, arguments=arguments, phase=phase, inflight=None,
+                    chapter_identity=_chapter_table_digest(connection),
+                    operational_streak=0)
+            elif partial_reason is None and not skip_sweeps:
+                partial_reason = "deadline_partial"
+
+        _database_checks(
+            connection, deadline=verification_deadline,
+            allowed_chapter_orphans=(
+                0 if progress["phase"] in {"complete", "blocked"}
+                else initial_counts["orphan_retirements"]))
         if _logical_digest(
                 connection, exclude_tables={"chapter_points"},
                 deadline=verification_deadline) != expected_protected_digest:
             raise MaintenanceError("authorized_change_failed")
         final_counts = _chapter_counts(
-            connection, inventory, _existing_media_paths({
-                path for path, in connection.execute("SELECT path FROM file_meta")
-            }), deadline=verification_deadline,
+            connection, inventory, _existing_media_paths(
+                {path for path, in connection.execute("SELECT path FROM file_meta")}
+                | {path for path, in connection.execute(
+                    "SELECT path FROM chapter_points")}),
+            deadline=verification_deadline,
         )
-        if complete and failures == 0 and (
+        if progress["phase"] == "complete" and (
                 final_counts.get("missing", 0) != 0
                 or final_counts.get("current_empty", 0) != 0
                 or final_counts.get("unavailable_empty", 0) != 0
+                or final_counts.get("unavailable_nonempty", 0) != 0
+                or final_counts.get("re_attestation_required", 0) != 0
                 or final_counts.get("versioned", 0)
                 < initial_counts.get("versioned", 0) + initial_counts["attestations"]):
             raise MaintenanceError("authorized_change_failed")
         if _eligible_inventory(proposal_id) != inventory:
             raise MaintenanceError("input_identity_changed")
-        successful = (
-            complete and failures == 0
-            and time.monotonic() - started < ADMISSION_SECONDS
-        )
+        successful = progress["phase"] == "complete"
+        blocked = progress["phase"] == "blocked"
+        if successful:
+            _remove_progress(progress)
         return (
-            successful,
+            "complete" if successful else "blocked" if blocked else "partial",
             True,
-            {
-                category: failure_counts.get(category, 0)
-                for category in PROBE_FAILURE_CATEGORIES
-            },
+            dict(progress["failures"]),
+            progress["unresolved"],
             None if successful else (
-                "probe_failures" if failures else "deadline_partial"),
+                "re_attestation_unresolved" if blocked else partial_reason),
         )
     except sqlite3.DatabaseError as exc:
         raise MaintenanceError("database_write_failed") from exc

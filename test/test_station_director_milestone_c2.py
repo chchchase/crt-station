@@ -394,6 +394,7 @@ def complete_worker_child_main(stage_text, media_text, project_text):
         "fs42_loaded": any(name == "fs42" or name.startswith("fs42.") for name in sys.modules),
         "cache_size": len(ShowCatalog._fluid_cache_scanned),
         "status": result["status"], "failure": result["failure"],
+        "scheduler_invoked": result["scheduler_invoked"],
         "response_schema_version": result["schema_version"],
         "guide_validation": result.get("guide_validation"),
         "catalog_paths": catalog_paths,
@@ -2504,7 +2505,9 @@ class DualRunLifecycleTests(unittest.TestCase):
 
 
 class NativeTwoProcessIntegrationTests(unittest.TestCase):
-    def _complete_dual_run(self, root, *, alter_second=False, alter_guide_second=False, execute=None):
+    def _complete_dual_run(self, root, *, alter_second=False,
+                           alter_guide_second=False, invalid_legacy_chapters=False,
+                           execute=None):
         media = root / "media"
         content = media / "synthetic" / "Synthetic"
         content.mkdir(parents=True)
@@ -2518,6 +2521,18 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
             )
         shutil.copy2(content / "other.mp4", media / "synthetic/replacement.mp4")
         project = synthetic_project(root, media)
+        if invalid_legacy_chapters:
+            connection = sqlite3.connect(project / "runtime/fs42_fluid.db")
+            try:
+                connection.execute(
+                    "UPDATE chapter_points SET points=?",
+                    (json.dumps([{
+                        "chapter_start": 0, "chapter_end": 3601,
+                        "segment_duration": 3601,
+                    }]),))
+                connection.commit()
+            finally:
+                connection.close()
         proposal = base_proposal()
         proposal["directives"] = [{
             "type": "theme", "name": "synthetic", "channel": 2,
@@ -2646,6 +2661,17 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
             self.assertTrue(all(item["guide_validation"]["status"] == "pass" for item in details))
             self.assertEqual(result["schema_version"], 3)
             self.assertEqual([item["response_schema_version"] for item in details], [3, 3])
+
+    def test_strict_invalid_legacy_chapters_remain_unavailable_to_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, details = self._complete_dual_run(
+                Path(directory), invalid_legacy_chapters=True)
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["failure"]["code"], "c1_run_failed")
+            self.assertEqual(len(details), 1)
+            self.assertEqual(
+                details[0]["failure"]["code"], "catalog_metadata_unavailable")
+            self.assertFalse(details[0]["scheduler_invoked"])
 
     def test_complete_genuine_lifecycle_detects_selected_media_difference(self):
         with tempfile.TemporaryDirectory() as directory:

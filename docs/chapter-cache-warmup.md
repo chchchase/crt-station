@@ -3,7 +3,7 @@
 This is a dedicated, resumable maintenance operation for chapter metadata. It
 does not generate schedules or rebuild normal catalog rows. Its only logical
 database changes are completed `chapter_points` attestations and retirement of
-confirmed-unavailable legacy empty rows; SQLite transaction and sidecar changes
+confirmed-unavailable legacy rows; SQLite transaction and sidecar changes
 are unavoidable bookkeeping.
 
 ## Admission and output
@@ -26,9 +26,11 @@ counting must agree; otherwise the provisional counts are discarded. Committed
 WAL-only rows are therefore included without allowing a read-only SQLite open
 to alter live SHM.
 
-Execution requires `--execute` and eight confirmation values printed by the immediately
+Execution requires `--execute` and every confirmation value printed by the immediately
 preceding plan: `eligible`, `missing`, `legacy_empty`, `current_empty`,
-`unavailable_empty`, `attestations`, `probes`, and `short_media`. These are
+`unavailable_empty`, `legacy_nonempty`, `trusted_legacy_nonempty`,
+`re_attestation_required`, `unavailable_nonempty`, `orphan_retirements`,
+`attestations`, `probes`, `short_media`, and `versioned`. These are
 recounted authoritatively after verified service shutdown; any mismatch rejects
 before backup or writes. The plan also reports legacy-nonempty and versioned-row
 counts. Execution reports every fixed probe-failure category, including zeros.
@@ -40,13 +42,17 @@ The reviewed inventory had 8,880 extension-supported files in the media tree
 and 4,479 root `file_meta` cache rows. Those counts describe different sets:
 the first is a filesystem extension inventory, while the second is existing
 cache state and can include neither every projected candidate nor only projected
-candidates. The audited Channels 2 through 7 projection contained 7,801
+candidates. The audited Channels 2 through 7 projection contained 4,173
 deduplicated eligible identities. Candidate paths are projected and deduplicated
 by their canonical media-root-relative identity; when multiple channels refer
 to the same identity, it is analyzed once. The approved maintenance population
-contains 3,322
-missing rows plus 654 ambiguous legacy empty rows, or 3,976 identities requiring
-fresh attestation, and 114 confirmed-unavailable legacy empty rows to retire.
+contains 3,322 missing rows plus 654 ambiguous legacy empty rows and 120
+strict-invalid legacy nonempty rows, or 4,096 identities requiring fresh
+attestation. It also contains 114 unavailable empty and 41 unavailable nonempty
+legacy orphans, all 155 of which are retired after the durable backup and pin.
+Of the 4,096 attestations, 151 short-media results require no probe and 3,945
+require bounded analysis. The remaining 77 eligible legacy nonempty rows are
+strictly valid and remain unchanged.
 Execution still requires the live authoritative totals to match the operator's
 explicit confirmations.
 
@@ -126,25 +132,61 @@ rechecked. The version-1 envelope records only the method, exact size/mtime
 identity, and chapter list. Native readers validate and unwrap it, so an envelope
 never reaches callers that expect the historical raw list.
 
-Legacy nonempty lists remain readable. Every eligible legacy empty list is
-ambiguous and is re-analyzed; every missing eligible row is analyzed; a legacy
-empty row is deleted only when descriptor-relative traversal confirms that its
-canonical media file is absent. Any other legacy-empty population is rejected.
+Strictly valid legacy nonempty lists remain readable. Every eligible legacy
+empty list is ambiguous and is re-analyzed; every missing eligible row is
+analyzed. A legacy nonempty list that fails the strict duration/range validator
+is never clipped or trusted: it is re-attested and replaced only after a
+successful strict analysis. `chapter_data_invalid` leaves the exact legacy row
+unchanged. Every chapter orphan is retired only when it lacks `file_meta`, is
+not eligible, and descriptor-relative traversal confirms its canonical media
+file is absent. Both empty and structurally valid nonempty legacy orphans are
+verified exactly before their one-transaction retirement. The final foreign-key
+check must contain zero violations.
 Future ordinary scans use the same completed-result type, so analysis failures
 cannot recreate false empty attestations.
 
 The command stops admitting new analyses after 6,960 seconds and reserves 240
 seconds within a 7,200-second control window for post-write integrity and
-authorized-change checks plus service-state finalization. Sixteen analysis
-failures also end an invocation as a clean partial. A clean verified partial is
-resumable and automatically restarts the service if it was initially running.
+authorized-change checks plus service-state finalization. Missing and
+legacy-empty targets form the first deterministic sweep. Only after every first-
+phase target has been attempted may the questionable legacy-nonempty sweep
+begin, and that second sweep begins only when its full worst-case bounded probe
+time fits before the admission cutoff.
+
+The systemic circuit opens after exactly 16 consecutive operational analysis
+failures. Any completed parsed result resets the streak; `chapter_data_invalid`
+also resets it because it is a dataset rejection, not an operational failure.
+The failed identity is durably marked before the command advances. A later
+invocation resets an opened circuit and resumes after the marked identities, so
+persistent failures cannot starve later candidates. A deadline/circuit partial
+is distinct from a completed sweep that still has unresolved identities; the
+latter returns `blocked` with `re_attestation_unresolved` and a bounded count.
+It can be explicitly rerun, in which case only unresolved identities are
+reopened for another sweep.
+
+Sweep progress is private and value-free. The only names are
+`warmup-progress.v1.json` and `.warmup-progress.v1.pending`. It stores bounded
+versioned sequence data, ordered-inventory indices and bitmaps, fixed category
+counts, proposal/baseline/inventory digests, and chapter-table digests—never a
+media path, media identity, probe output, or exception. The initial final state
+uses exclusive pending creation, file fsync, no-replace publication, and
+directory fsync. Updates use exclusive pending creation, full validation, file
+fsync, atomic final replacement, and directory fsync. Only the durable final is
+authoritative. Exactly one metadata-safe pending tail can be discarded during
+explicit recovery; unknown entries, unsafe identities, invalid sequence or
+binding, or inconsistent bitmaps fail closed. An inflight final state is durable
+before media analysis or orphan retirement. Recovery compares the saved stable
+chapter digest and actual database state, never a pending update.
+
+A clean verified partial is resumable and automatically restarts the service if
+it was initially running.
 Any uncertain integrity, unauthorized change, service state, or cleanup leaves
 the service stopped for operator review. SIGKILL and power loss cannot execute
 cleanup; the durable per-result transactions and pre-write backup make a later
 invocation resumable.
 
-At 30 seconds per probe, 3,976 full probe attempts have a strict serial upper
-bound near 33.1 hours, so multiple two-hour invocations may be required. Actual
+At 30 seconds per probe, 3,945 full probe attempts have a strict serial upper
+bound near 32.9 hours, so multiple two-hour invocations may be required. Actual
 time should be materially lower for quick chapter-only probes and short media.
 Temporary space is bounded by the live main+WAL generation's raw copy, working
 copy, pending logical backup, one disk-backed verification spool, and 100 MiB

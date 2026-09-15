@@ -403,14 +403,18 @@ class FluidStatements:
     @staticmethod
     def add_chapter_points(connection: sqlite3.Connection, path: str,
                            analysis: CompletedChapterAnalysis, info,
-                           previous=None, *, baseline_verified=False):
+                           previous=None, *, baseline_verified=False,
+                           replace_questionable=False):
         """Publish one completed analysis; the caller owns the transaction."""
         if not isinstance(analysis, CompletedChapterAnalysis):
             raise TypeError("a completed chapter analysis is required")
         if not baseline_verified and not FluidStatements._chapter_baseline_is_durable():
             raise RuntimeError("chapter migration baseline is unavailable")
         previous = previous or FluidStatements.classify_chapter_points(connection, path)
-        if previous["status"] not in {"missing", "legacy_empty"}:
+        replaceable = {"missing", "legacy_empty"}
+        if replace_questionable:
+            replaceable.add("re_attestation_required")
+        if previous["status"] not in replaceable:
             raise ValueError("chapter attestation is not replaceable")
         envelope = {
             "attestation_version": 1,
