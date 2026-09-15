@@ -3,7 +3,17 @@ import sqlite3
 import datetime
 import os
 import json
-from fs42.media_processor import MediaProcessor
+import math
+import re
+import stat
+from pathlib import Path
+from fs42.chapter_analysis import (
+    COMPLETED_METHODS,
+    METHOD_SHORT,
+    CompletedChapterAnalysis,
+    ChapterAnalysisError,
+    validate_chapters,
+)
 from fs42.fluid_objects import FileRepoEntry
 from fs42.scheduling_context import (
     ValidationCatalogMetadataUnavailable,
@@ -129,6 +139,7 @@ class FluidStatements:
 
     @staticmethod
     def refresh_video_meta(connection: sqlite3.Connection, repo_entry: FileRepoEntry):
+        from fs42.media_processor import MediaProcessor
 
         metadata = MediaProcessor.extract_metadata(repo_entry.path, 'video')
         new_meta = json.dumps(metadata) if metadata else ""
@@ -173,6 +184,7 @@ class FluidStatements:
         if in_validation_mode():
             raise ValidationCatalogMetadataUnavailable(
                 "validation cannot refresh media metadata")
+        from fs42.media_processor import MediaProcessor
         cursor = connection.cursor()
         now = scheduling_now()
 
@@ -202,6 +214,7 @@ class FluidStatements:
         if in_validation_mode():
             raise ValidationCatalogMetadataUnavailable(
                 "validation cannot generate media metadata")
+        from fs42.media_processor import MediaProcessor
         cursor = connection.cursor()
         now = scheduling_now()
 
@@ -259,31 +272,176 @@ class FluidStatements:
         connection.commit()
 
     @staticmethod
-    def add_chapter_points(connection: sqlite3.Connection, path: str, points: dict):
-        """Add or update the chapter points for this file"""
-        cursor = connection.cursor()
+    def _chapter_lookup_path(path):
+        return (FluidStatements.validation_cache_path(path)
+                if in_validation_mode() else path)
+
+    @staticmethod
+    def _chapter_identity_path(path):
+        if not in_validation_mode():
+            return path
+        normalized = os.path.normpath(os.fspath(path))
+        context_root = os.path.normpath(current_validation_context().media_root)
+        if normalized == "/media":
+            return context_root
+        if normalized.startswith("/media/"):
+            return context_root + normalized[len("/media"):]
+        return path
+
+    @staticmethod
+    def _chapter_duration(connection, lookup_path):
+        row = connection.execute(
+            "SELECT duration FROM file_meta WHERE path=?", (lookup_path,)
+        ).fetchone()
+        if (row is None or not isinstance(row[0], (int, float))
+                or isinstance(row[0], bool) or not math.isfinite(row[0])
+                or row[0] <= 0):
+            raise ValueError("chapter metadata has no valid cached duration")
+        return float(row[0])
+
+    @staticmethod
+    def _chapter_baseline_is_durable():
+        root = Path(__file__).resolve().parents[1]
+        backup_root = root / "runtime/director/chapter-cache-backups"
+        target = backup_root / "migration-baseline.v1.json"
+        descriptor = None
+        try:
+            root_info = os.stat(backup_root, follow_symlinks=False)
+            if (not stat.S_ISDIR(root_info.st_mode)
+                    or root_info.st_uid != os.geteuid()
+                    or stat.S_IMODE(root_info.st_mode) != 0o700):
+                return False
+            descriptor = os.open(
+                target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600
+                    or info.st_size > 4096):
+                return False
+            document = json.loads(os.read(descriptor, 4097))
+            if (not isinstance(document, dict) or set(document) != {
+                    "version", "state", "backup_id", "logical_identity",
+                    "chapter_identity"}
+                    or document["version"] != 1 or document["state"] != "pinned"
+                    or not isinstance(document["backup_id"], str)
+                    or not re.fullmatch(
+                        r"chapter-cache-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}\.sqlite3",
+                        document["backup_id"])
+                    or not isinstance(document["logical_identity"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", document["logical_identity"])
+                    or not isinstance(document["chapter_identity"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", document["chapter_identity"])):
+                return False
+            backup = os.stat(
+                backup_root / document["backup_id"], follow_symlinks=False)
+            return (
+                stat.S_ISREG(backup.st_mode) and backup.st_uid == os.geteuid()
+                and backup.st_nlink == 1 and stat.S_IMODE(backup.st_mode) == 0o600
+            )
+        except (OSError, TypeError, json.JSONDecodeError):
+            return False
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    @staticmethod
+    def classify_chapter_points(connection: sqlite3.Connection, path: str,
+                                *, lookup_path=None):
+        """Classify stored chapter data without exposing an envelope to callers."""
+        lookup_path = (FluidStatements._chapter_lookup_path(path)
+                       if lookup_path is None else lookup_path)
+        row = connection.execute(
+            "SELECT points FROM chapter_points WHERE path=?", (lookup_path,)
+        ).fetchone()
+        if row is None:
+            return {"status": "missing", "chapters": [], "raw": None}
+        raw = row[0]
+        try:
+            loaded = json.loads(raw)
+            duration = FluidStatements._chapter_duration(connection, lookup_path)
+            if isinstance(loaded, list):
+                if not loaded:
+                    return {"status": "legacy_empty", "chapters": [], "raw": raw}
+                chapters = validate_chapters(loaded, duration)
+                return {
+                    "status": "legacy_nonempty",
+                    "chapters": [dict(item) for item in chapters],
+                    "raw": raw,
+                }
+            if not isinstance(loaded, dict) or set(loaded) != {
+                "attestation_version", "method", "media_identity", "chapters"
+            }:
+                raise ValueError("invalid chapter attestation")
+            if loaded["attestation_version"] != 1 or loaded["method"] not in COMPLETED_METHODS:
+                raise ValueError("unknown chapter attestation")
+            identity = loaded["media_identity"]
+            if (
+                not isinstance(identity, dict) or set(identity) != {"size", "mtime_ns"}
+                or not isinstance(identity["size"], int) or isinstance(identity["size"], bool)
+                or identity["size"] < 0
+                or not isinstance(identity["mtime_ns"], int)
+                or isinstance(identity["mtime_ns"], bool)
+            ):
+                raise ValueError("invalid chapter attestation identity")
+            info = os.stat(FluidStatements._chapter_identity_path(path))
+            if (info.st_size, info.st_mtime_ns) != (
+                    identity["size"], identity["mtime_ns"]):
+                raise ValueError("stale chapter attestation identity")
+            chapters = validate_chapters(loaded["chapters"], duration)
+            if loaded["method"] == METHOD_SHORT and (chapters or duration >= 5 * 60):
+                raise ValueError("invalid short-media chapter attestation")
+            return {
+                "status": "trusted_v1",
+                "chapters": [dict(item) for item in chapters],
+                "raw": raw,
+            }
+        except (OSError, TypeError, json.JSONDecodeError, ChapterAnalysisError) as exc:
+            raise ValueError("invalid chapter attestation") from exc
+
+    @staticmethod
+    def add_chapter_points(connection: sqlite3.Connection, path: str,
+                           analysis: CompletedChapterAnalysis, info,
+                           previous=None, *, baseline_verified=False):
+        """Publish one completed analysis; the caller owns the transaction."""
+        if not isinstance(analysis, CompletedChapterAnalysis):
+            raise TypeError("a completed chapter analysis is required")
+        if not baseline_verified and not FluidStatements._chapter_baseline_is_durable():
+            raise RuntimeError("chapter migration baseline is unavailable")
+        previous = previous or FluidStatements.classify_chapter_points(connection, path)
+        if previous["status"] not in {"missing", "legacy_empty"}:
+            raise ValueError("chapter attestation is not replaceable")
+        envelope = {
+            "attestation_version": 1,
+            "method": analysis.method,
+            "media_identity": {
+                "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns,
+            },
+            "chapters": analysis.as_list(),
+        }
+        encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
         now = scheduling_now()
-        json_points = json.dumps(points)
-        cursor.execute("REPLACE INTO chapter_points VALUES(?, ?, ?)", (path, json_points, now))
-        cursor.close()
-        connection.commit()
+        if previous["status"] == "missing":
+            connection.execute(
+                "INSERT INTO chapter_points(path,points,last_updated) VALUES(?,?,?)",
+                (path, encoded, now),
+            )
+        else:
+            changed = connection.execute(
+                "UPDATE chapter_points SET points=?,last_updated=? "
+                "WHERE path=? AND points=?",
+                (encoded, now, path, previous["raw"]),
+            )
+            if changed.rowcount != 1:
+                raise RuntimeError("chapter attestation changed concurrently")
 
     @staticmethod
     def get_chapter_points(connection: sqlite3.Connection, path: str) -> dict:
         """Get the chapter points for this file. Returns {} if no chapters or never scanned."""
-        cursor = connection.cursor()
-        lookup_path = (FluidStatements.validation_cache_path(path)
-                       if in_validation_mode() else path)
-        cursor.execute("SELECT points FROM chapter_points WHERE path=?", (lookup_path,))
-        row = cursor.fetchone()
-        result = {}
-        if row:
-            loaded = json.loads(row[0])
-            # Return {} if empty list (file was scanned but has no chapters)
-            # This way schedule build sees it as "no usable chapters"
-            result = loaded if loaded else {}
-        cursor.close()
-        return result
+        classified = FluidStatements.classify_chapter_points(connection, path)
+        return classified["chapters"] or {}
 
     @staticmethod
     def delete_chapter_points(connection: sqlite3.Connection, path: str):

@@ -11,6 +11,7 @@ from fs42.scheduling_context import (
     ValidationCatalogMetadataUnavailable,
     in_validation_mode,
 )
+from fs42.chapter_analysis import ChapterAnalysisError, analyze_chapters
 from fs42.station_manager import StationManager
 
 class FluidBuilder:
@@ -117,17 +118,35 @@ class FluidBuilder:
                 rfp = os.path.realpath(file)
                 if rfp in cached_files:
                     cached = cached_files[rfp]
-                    if FluidStatements.get_chapter_points(connection, rfp):
+                    try:
+                        previous = FluidStatements.classify_chapter_points(
+                            connection, rfp)
+                    except ValueError:
+                        self._l.error("Stored chapter metadata is invalid")
+                        continue
+                    if previous["status"] in {"trusted_v1", "legacy_nonempty"}:
                         self._l.info(f"Chapters already exist for {rfp}")
                     else:
-                        chapters = MediaProcessor.chapter_detect(rfp, cached.duration)
-                        if chapters:
-                            FluidStatements.add_chapter_points(connection, rfp, chapters)
-                        else:
-                            self._l.info(f"No chapters found in {rfp}")
+                        if not FluidStatements._chapter_baseline_is_durable():
+                            self._l.info(
+                                "Chapter scan deferred until migration baseline is durable")
+                            continue
+                        try:
+                            before = os.stat(rfp)
+                            analysis = analyze_chapters(rfp, cached.duration)
+                            info = os.stat(rfp)
+                            if (before.st_dev, before.st_ino, before.st_size,
+                                    before.st_mtime_ns) != (
+                                    info.st_dev, info.st_ino, info.st_size,
+                                    info.st_mtime_ns):
+                                raise ChapterAnalysisError("chapter_data_invalid")
+                            with connection:
+                                FluidStatements.add_chapter_points(
+                                    connection, rfp, analysis, info, previous)
+                        except (ChapterAnalysisError, OSError, RuntimeError):
+                            self._l.error("Chapter analysis failed")
                 else:
                     self._l.warning(f"{rfp} is not in catalog cache - not adding chapter points.")
-            connection.commit()
         finally:
             connection.close()
 
@@ -143,25 +162,43 @@ class FluidBuilder:
         """Scan chapter markers for a list of catalog entries that don't have them yet"""
         connection = sqlite3.connect(self.db_path)
         try:
-            cursor = connection.cursor()
             for entry in entries:
                 if hasattr(entry, 'realpath') and entry.realpath:
-                    # Check if we've already scanned this file (row exists in table)
-                    chapter_path = (FluidStatements.validation_cache_path(entry.realpath)
-                                    if in_validation_mode() else entry.realpath)
-                    cursor.execute("SELECT path FROM chapter_points WHERE path=?", (chapter_path,))
-                    if not cursor.fetchone():  # Never scanned before
+                    try:
+                        previous = FluidStatements.classify_chapter_points(
+                            connection, entry.realpath)
+                    except ValueError as exc:
                         if in_validation_mode():
                             raise ValidationCatalogMetadataUnavailable(
-                                "cached chapter metadata is missing")
-                        # Scan for chapters
-                        chapters = MediaProcessor.chapter_detect(entry.realpath, entry.duration)
-                        # Always store result, even if empty or None
-                        FluidStatements.add_chapter_points(connection, entry.realpath, chapters if chapters else [])
-                        if chapters:
-                            self._l.info(f"Added {len(chapters)} chapters for {entry.realpath}")
-            cursor.close()
-            connection.commit()
+                                "cached chapter metadata is invalid") from exc
+                        self._l.error("Stored chapter metadata is invalid")
+                        continue
+                    if previous["status"] in {"trusted_v1", "legacy_nonempty"}:
+                        continue
+                    if in_validation_mode():
+                        raise ValidationCatalogMetadataUnavailable(
+                            "cached chapter metadata is missing")
+                    if not FluidStatements._chapter_baseline_is_durable():
+                        self._l.info(
+                            "Chapter scan deferred until migration baseline is durable")
+                        continue
+                    try:
+                        before = os.stat(entry.realpath)
+                        analysis = analyze_chapters(entry.realpath, entry.duration)
+                        info = os.stat(entry.realpath)
+                        if (before.st_dev, before.st_ino, before.st_size,
+                                before.st_mtime_ns) != (
+                                info.st_dev, info.st_ino, info.st_size,
+                                info.st_mtime_ns):
+                            raise ChapterAnalysisError("chapter_data_invalid")
+                        with connection:
+                            FluidStatements.add_chapter_points(
+                                connection, entry.realpath, analysis, info, previous)
+                        if analysis.chapters:
+                            self._l.info(
+                                f"Added {len(analysis.chapters)} chapters for media")
+                    except (ChapterAnalysisError, OSError, RuntimeError):
+                        self._l.error("Chapter analysis failed")
         finally:
             connection.close()
 

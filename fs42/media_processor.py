@@ -543,65 +543,20 @@ class MediaProcessor:
     def chapter_detect(fname, base_duration):
         from fs42.scheduling_context import block_validation_media_runtime
         block_validation_media_runtime()
-        import subprocess
-        import json
-
         _l = logging.getLogger("MEDIA")
-
-        if base_duration < timings.MIN_5:
-            _l.info(f"Skipping chapter markers in less than 5 minutes: {fname}")
-            return None
-
-        _l.info(f"Detecting chapter markers in {fname}")
-
+        from fs42.chapter_analysis import (
+            ChapterAnalysisError,
+            METHOD_SHORT,
+            analyze_chapters,
+        )
         try:
-            # Use ffprobe with -show_chapters to extract chapter information
-            result = subprocess.run(
-                ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_chapters", fname],
-                capture_output=True,
-                text=True,
-            )
-
-            probed = json.loads(result.stdout)
-
-            chapters = []
-            if "chapters" in probed and len(probed["chapters"]) > 0:
-                for chapter in probed["chapters"]:
-                    chapter_info = {
-                        "chapter_start": float(chapter["start_time"]),
-                        "chapter_end": float(chapter["end_time"]),
-                    }
-
-                    # Add title if available
-                    if "tags" in chapter and "title" in chapter["tags"]:
-                        chapter_info["title"] = chapter["tags"]["title"]
-
-                    chapters.append(chapter_info)
-
-                _l.info(f"Found {len(chapters)} chapter markers in {fname}")
-
-                # ensure coverage starts at 0 - handles containers (e.g. MKV) where
-                # the first chapter marker doesn't have to start at 0
-                if chapters[0]["chapter_start"] > 0:
-                    chapters.insert(0, {
-                        "chapter_start": 0.0,
-                        "chapter_end": chapters[0]["chapter_start"],
-                    })
-
-                # Calculate segment durations
-                for i in range(len(chapters)):
-                    if i < len(chapters) - 1:
-                        chapters[i]["segment_duration"] = chapters[i + 1]["chapter_start"] - chapters[i]["chapter_start"]
-                    else:
-                        chapters[i]["segment_duration"] = base_duration - chapters[i]["chapter_start"]
-
-                return chapters
-            else:
-                _l.info(f"No chapter markers found in {fname}")
-                return []
-
-        except Exception as e:
-            _l.error(f"Error detecting chapter markers in {fname}")
-            _l.exception(e)
-
-        return None
+            result = analyze_chapters(fname, base_duration)
+        except ChapterAnalysisError:
+            _l.error("Chapter analysis failed")
+            return None
+        if result.method == METHOD_SHORT:
+            _l.info("Skipping chapter markers in media shorter than five minutes")
+            return None
+        chapters = result.as_list()
+        _l.info("Chapter analysis completed")
+        return chapters

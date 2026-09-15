@@ -139,6 +139,13 @@ Signal handlers are installed only in the main thread after invocation, proposal
 
 C3b2 was deliberately limited to changing the master constant after C3b1 was committed and pushed, a fresh normal-SSH `./director isolation preflight --profile native-single-run` succeeded and its full report was reviewed, and the complete synthetic/static audit was repeated. Real dry runs remain read-only and should be launched from a normal SSH session, preferably inside `tmux`; their immutable reports must be reviewed before relying on the result.
 
+Chapter metadata maintenance is deliberately separate from validation and
+schedule generation. The dedicated, externally gated, default-read-only
+chapter-cache command, its versioned successful-scan attestations, WAL-safe
+backup ordering, resumption rules, and downgrade procedure are specified in
+[`chapter-cache-warmup.md`](chapter-cache-warmup.md). It must not be executed
+from Codex or as part of a validation run.
+
 Before the first production validation, remove group-write permission from the three trusted path ancestors with these non-recursive commands:
 
 ```bash

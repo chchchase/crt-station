@@ -440,7 +440,15 @@ def synthetic_project(root, media):
             )
             connection.execute(
                 "INSERT INTO chapter_points VALUES (?,?,?)",
-                (cached, "[]", now),
+                (cached, json.dumps({
+                    "attestation_version": 1,
+                    "method": "ffprobe_show_chapters_v1",
+                    "media_identity": {
+                        "size": info.st_size,
+                        "mtime_ns": info.st_mtime_ns,
+                    },
+                    "chapters": [],
+                }, sort_keys=True, separators=(",", ":")), now),
             )
         connection.commit()
     finally:
