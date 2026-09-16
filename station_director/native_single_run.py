@@ -340,15 +340,16 @@ def _sequence_restored(function):
                     scheduler_invoked=restoration.get("scheduler_invoked", False),
                 )
             except BaseException as exc:
-                original = (
-                    f"{type(primary).__name__}: {primary}" if primary is not None else None
-                )
+                if primary is not None:
+                    # Preserve the original diagnostic (including cancellation).
+                    # This local marker is fixed and is not a protocol extension.
+                    primary.restoration_failure = "sequence_restore_failure"
+                    raise primary from primary.__cause__
                 raise NativeRunError(
                     "sequence_restore_failure", str(exc), phase="preservation",
                     scheduler_invoked=restoration.get("scheduler_invoked", False),
-                    original_failure=original,
                     restoration_failure=f"{type(exc).__name__}: {exc}",
-                ) from (primary or exc)
+                ) from exc
         if primary is not None:
             raise primary
         return result

@@ -92,6 +92,185 @@ from test.test_station_director_milestone_b2 import (
 ROOT = Path(__file__).parents[1]
 
 
+class SyntheticSequenceRestoreTests(unittest.TestCase):
+    """Exercise only restoration helpers; never enter a native scheduling run."""
+
+    def setUp(self):
+        from station_director import native_single_run as native
+        from station_director import staged_schedule as staged
+        self.native, self.staged = native, staged
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.database = Path(self.directory.name) / "synthetic.sqlite"
+        self.connection = create_database(self.database)
+        self.addCleanup(self.connection.close)
+        self.connection.execute("PRAGMA foreign_keys=ON")
+
+    def populate(self, *, entries=True, groups=True):
+        for identifier, station in ((1, "Action"), (2, "Watch In Order")):
+            self.connection.execute(
+                "INSERT INTO named_sequence VALUES (?,?,?,?,?,?,?,?,?)",
+                (identifier, station, "synthetic", "tag", 0.125, 0.875,
+                 3, 1, None if identifier == 1 else b"synthetic-blob"))
+            if entries:
+                self.connection.execute(
+                    "INSERT INTO sequence_entries VALUES (?,?,?,?)",
+                    (identifier, "synthetic-entry", 0, identifier))
+            if groups:
+                self.connection.execute(
+                    "INSERT INTO sequence_group_state VALUES (?,?,?,?)",
+                    (station, "synthetic", "parent", "active"))
+        self.connection.commit()
+
+    def snapshot(self):
+        return self.staged.capture_protected_state(
+            self.connection, ["Action"], ["Watch In Order"])
+
+    def test_round_trips_types_order_foreign_keys_and_protected_channel(self):
+        self.populate()
+        snapshot = self.snapshot()
+        operations = []
+        # Retain only fixed operation/table identifiers, never expanded SQL.
+        def trace(statement):
+            for operation in ("DELETE FROM", "INSERT INTO"):
+                for table in ("sequence_entries", "sequence_group_state", "named_sequence"):
+                    if statement.startswith(f'{operation} "{table}"'):
+                        marker = (operation, table)
+                        if not operations or operations[-1] != marker:
+                            operations.append(marker)
+        self.connection.set_trace_callback(trace)
+        for unused in range(4):
+            operations.clear()
+            self.connection.execute(
+                "UPDATE named_sequence SET current_index=99 WHERE station='Action'")
+            self.connection.commit()
+            self.staged.restore_sequence_state(self.connection, snapshot)
+            self.connection.commit()
+            self.staged.assert_protected_state(self.connection, snapshot)
+            self.assertEqual(self.connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            self.assertEqual(operations, [
+                ("DELETE FROM", "sequence_entries"),
+                ("DELETE FROM", "sequence_group_state"),
+                ("DELETE FROM", "named_sequence"),
+                ("INSERT INTO", "named_sequence"),
+                ("INSERT INTO", "sequence_entries"),
+                ("INSERT INTO", "sequence_group_state"),
+            ])
+        self.native._restore_sequences(self.database, snapshot)
+        self.staged.assert_protected_state(self.connection, snapshot)
+
+    def test_empty_and_partially_populated_tables(self):
+        for entries, groups in ((False, False), (False, True), (True, False), (True, True)):
+            with self.subTest(entries=entries, groups=groups):
+                for table in ("sequence_entries", "sequence_group_state", "named_sequence"):
+                    self.connection.execute(f'DELETE FROM "{table}"')
+                self.connection.commit()
+                empty = self.snapshot()
+                self.native._restore_sequences(self.database, empty)
+                self.staged.assert_protected_state(self.connection, empty)
+                self.populate(entries=entries, groups=groups)
+                snapshot = self.snapshot()
+                self.native._restore_sequences(self.database, snapshot)
+                self.staged.assert_protected_state(self.connection, snapshot)
+
+    def test_delete_and_insert_failures_roll_back(self):
+        self.populate()
+        snapshot = self.snapshot()
+        for operation in ("DELETE", "INSERT"):
+            with self.subTest(operation=operation):
+                self.connection.execute(
+                    f"CREATE TRIGGER synthetic_failure BEFORE {operation} ON sequence_entries "
+                    "BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+                self.connection.commit()
+                with self.assertRaises(self.native.NativeRunError) as caught:
+                    self.native._restore_sequences(self.database, snapshot)
+                self.assertEqual(caught.exception.code, "sequence_restore_failure")
+                self.assertIsInstance(caught.exception.__cause__, sqlite3.IntegrityError)
+                self.staged.assert_protected_state(self.connection, snapshot)
+                self.connection.execute("DROP TRIGGER synthetic_failure")
+                self.connection.commit()
+
+    def test_schema_mismatch_rolls_back(self):
+        self.populate()
+        snapshot = self.snapshot()
+        self.connection.execute("ALTER TABLE named_sequence ADD COLUMN synthetic TEXT")
+        self.connection.commit()
+        before = self.snapshot()
+        with self.assertRaises(self.native.NativeRunError) as caught:
+            self.native._restore_sequences(self.database, snapshot)
+        self.assertIsInstance(caught.exception.__cause__, self.staged.StagedScheduleError)
+        self.staged.assert_protected_state(self.connection, before)
+
+    def test_commit_failure_rolls_back(self):
+        self.populate()
+        snapshot = self.snapshot()
+        connection = sqlite3.connect(self.database)
+        proxy = Mock(wraps=connection)
+        proxy.commit.side_effect = sqlite3.OperationalError("synthetic commit failure")
+        try:
+            with patch.object(self.native.sqlite3, "connect", return_value=proxy):
+                with self.assertRaises(self.native.NativeRunError) as caught:
+                    self.native._restore_sequences(self.database, snapshot)
+            self.assertEqual(caught.exception.code, "sequence_restore_failure")
+            proxy.rollback.assert_called_once()
+            proxy.close.assert_called_once()
+            self.staged.assert_protected_state(self.connection, snapshot)
+        finally:
+            connection.close()
+
+    def test_exact_typed_row_verification_failure(self):
+        self.populate()
+        snapshot = self.snapshot()
+        verify = self.staged.assert_protected_state
+        def mismatch(connection, state):
+            connection.execute("UPDATE named_sequence SET parent_tag=CAST('synthetic-blob' AS TEXT) WHERE id=2")
+            verify(connection, state)
+        with patch.object(self.native, "assert_protected_state", side_effect=mismatch):
+            with self.assertRaises(self.native.NativeRunError) as caught:
+                self.native._restore_sequences(self.database, snapshot)
+        self.assertIsInstance(caught.exception.__cause__, self.staged.StagedScheduleError)
+        self.staged.assert_protected_state(self.connection, snapshot)
+
+    def test_primary_failure_is_not_replaced_by_restoration_failure(self):
+        self.populate()
+        snapshot = self.snapshot()
+        primary = self.native.NativeRunError(
+            "scheduler_failure", "synthetic primary", phase="scheduler",
+            scheduler_invoked=True)
+        @self.native._sequence_restored
+        def synthetic_operation(request, attestation, restoration):
+            restoration.update(database=self.database, protected=snapshot,
+                               scheduler_invoked=True)
+            self.connection.execute(
+                "CREATE TRIGGER synthetic_failure BEFORE INSERT ON sequence_entries "
+                "BEGIN SELECT RAISE(ABORT, 'synthetic secondary'); END")
+            self.connection.commit()
+            raise primary
+        with self.assertRaises(self.native.NativeRunError) as caught:
+            synthetic_operation({}, None)
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(caught.exception.restoration_failure, "sequence_restore_failure")
+
+    def test_primary_cause_and_cancellation_survive_secondary_failure(self):
+        for kind in (RuntimeError, KeyboardInterrupt, SystemExit):
+            with self.subTest(kind=kind.__name__):
+                primary = kind("synthetic primary")
+                cause = ValueError("synthetic original cause")
+                primary.__cause__ = cause
+                @self.native._sequence_restored
+                def operation(request, attestation, restoration):
+                    restoration.update(database=self.database, protected={})
+                    raise primary
+                with patch.object(self.native, "_restore_sequences",
+                                  side_effect=RuntimeError("synthetic secondary")):
+                    with self.assertRaises(kind) as caught:
+                        operation({}, None)
+                self.assertIs(caught.exception, primary)
+                self.assertIs(caught.exception.__cause__, cause)
+                self.assertEqual(primary.restoration_failure, "sequence_restore_failure")
+                self.assertTrue(primary.__suppress_context__)
+
+
 def publish_completed_worker_checkpoints(stage):
     with CheckpointWriter(stage) as writer:
         for state in (
@@ -1666,7 +1845,7 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                 self.assertTrue(restore.called)
                 self.assertEqual(self._sequence_rows(database), before)
 
-    def test_restoration_failure_records_original_and_secondary_failure(self):
+    def test_restoration_failure_preserves_original_and_fixed_secondary_outcome(self):
         from station_director import native_single_run as native
 
         with tempfile.TemporaryDirectory() as directory:
@@ -1679,11 +1858,11 @@ class SyntheticNativeEngineTests(unittest.TestCase):
             ), patch.object(
                 native, "_restore_sequences", side_effect=RuntimeError("restore-phase")
             ):
-                with self.assertRaises(native.NativeRunError) as caught:
+                with self.assertRaises(RuntimeError) as caught:
                     native.execute_native_single_run(request, test_attestation(request))
-            self.assertEqual(caught.exception.code, "sequence_restore_failure")
-            self.assertIn("original-phase", caught.exception.original_failure)
-            self.assertIn("restore-phase", caught.exception.restoration_failure)
+            self.assertEqual(str(caught.exception), "original-phase")
+            self.assertEqual(caught.exception.restoration_failure, "sequence_restore_failure")
+            self.assertTrue(caught.exception.__suppress_context__)
 
     def _cross_channel_fixture(self, root, *, collide=True, reversed_order=False,
                                seams=("2026-09-14 06:00:00", "2026-09-14 07:00:00"),
