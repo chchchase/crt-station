@@ -273,6 +273,24 @@ def effect_evidence(rows, mapping, directive):
             'series_digest': digest(directive['series']), 'blocks': evidence}
 
 
+def _catalog_reference_semantics(semantics):
+    """Export-only comparison; never change general normalization or bindings."""
+    row = dict(semantics['row'])
+    for name in ('created_at', 'updated_at'):
+        value = row.pop(name)
+        # Existing nullable live timestamps stay null. Text must be a bounded,
+        # valid naive SQLite/ISO datetime; no coercion of numbers or booleans.
+        if value is not None:
+            if (not isinstance(value, str)
+                    or not re.fullmatch(r'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?', value)):
+                raise ArtifactError('candidate_invalid')
+            try:
+                datetime.fromisoformat(value)
+            except ValueError:
+                raise ArtifactError('candidate_invalid') from None
+    return _canonical({'row': row, 'media_records': semantics['media_records']})
+
+
 def export_candidate(stage, response, proposal, policy):
     directives = proposal['directives']
     if (proposal['assignment_changes'] or proposal['exclusions'] or len(directives) != 1
@@ -292,15 +310,34 @@ def export_candidate(stage, response, proposal, policy):
         # The narrowly checked historical/staging alias pair below is the only
         # permitted exception to one-to-one physical catalog IDs.
         by_semantic = {}
+        by_reference = {}
+        allocation_floor = max(old, default=0)
         for ident, (row, semantics) in old.items():
             by_semantic.setdefault(_canonical(semantics), []).append(ident)
+            if not _catalog_descriptor(row):
+                by_reference.setdefault(_catalog_reference_semantics(semantics), []).append(ident)
         mapping = {}
         used = set()
         for ident, (row, semantics) in new.items():
+            ordinary = not _catalog_descriptor(row)
+            reference_key = _catalog_reference_semantics(semantics) if ordinary else None
             matches = by_semantic.get(_canonical(semantics), [])
             target = ident if ident in matches else matches[0] if len(matches) == 1 else None
+            if not matches and ordinary and row['station'] == channel and ident > allocation_floor:
+                expected = canonical_media_mapping(row.get('realpath') or row['path'],
+                                                   allow_sandbox=True).sandbox_path
+                # Production reconciliation allocates rebuilt rows above the
+                # baseline IDs with both paths set to their sandbox form.
+                if row['path'] == row['realpath'] == expected:
+                    if any(row[name] is None for name in ('created_at', 'updated_at')):
+                        raise ArtifactError('candidate_invalid')
+                    fallback = by_reference.get(reference_key, [])
+                    if len(fallback) > 1:
+                        raise ArtifactError('candidate_catalog_mapping_ambiguous')
+                    if len(fallback) == 1:
+                        target = fallback[0]
             if target is None:
-                # Classify only after the unchanged rejection predicate fires.
+                # Classify only after both supported matching routes reject.
                 # Row-only equivalence never authorizes a catalog mapping.
                 if matches:
                     code = 'candidate_catalog_mapping_ambiguous'
@@ -311,7 +348,8 @@ def export_candidate(stage, response, proposal, policy):
                     code = 'candidate_catalog_no_semantic_match'
                 raise ArtifactError(code)
             used.add(target)
-            mapping[ident] = {'validated_id': ident, 'live_id': target, 'semantics': semantics}
+            mapping[ident] = {'validated_id': ident, 'live_id': target,
+                              'semantics': copy.deepcopy(old[target][1])}
         if used != set(old):
             raise ArtifactError('candidate_catalog_baseline_id_unmapped')
         # Reconciliation preserves exact historical host rows and may add one

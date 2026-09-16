@@ -320,3 +320,28 @@ reports. Classification occurs only after an existing rejection predicate
 fires; matching catalog fields alone never authorizes a mapping. All baseline
 catalog IDs and complete metadata equivalence are still required. These
 categories do not prove live data changed and do not permit catalog writes.
+
+### Timestamp-only reference mapping
+
+Candidate export tries exact catalog matches first. Only when none exists may
+a rebuilt ordinary-media row map to a unique existing baseline row with every
+canonical field and associated metadata equal except catalog `created_at` and
+`updated_at`. Rebuilt rows must belong to the affected channel, have IDs above
+the baseline catalog maximum, and have both paths in their expected sandbox
+form, as production reconciliation creates them. Ambiguous fallback matches
+are rejected, without a same-ID preference.
+
+Ordinary catalog timestamps must be valid naive SQLite/ISO datetime text (space
+or T separator, optional one-to-six fractional digits); nullable baseline
+timestamps remain null. Rebuilt rows using the fallback require non-null
+timestamps. Numbers, booleans, blobs, invalid dates, and timezone-bearing text
+are rejected, not coerced.
+
+Each candidate mapping contains the baseline row's complete semantics and
+original timestamps, never the staged timestamps. Only schedule references are
+translated; no catalog updates are exported. Descriptor matching, complete
+baseline-ID coverage, exact protected originals, and alias provenance checks
+remain unchanged. General normalization, two-run comparisons, database
+fingerprints, source-stability checks, metadata equivalence, timing proof, and
+approval bindings remain timestamp-sensitive and unchanged. This exception
+does not implement or authorize live application.

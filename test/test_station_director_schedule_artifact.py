@@ -98,6 +98,222 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(doc['schedule']['rows'][0]['content_json'], '1')
         self.assertIn((100, 1), [(r['validated_id'], r['live_id']) for r in doc['schedule']['catalog_mapping']])
 
+    def production_clock_rebuild(self, *, protected=False):
+        from datetime import datetime
+        from contextlib import closing
+        from fs42.catalog_entry import CatalogEntry
+        from fs42.catalog_api import CatalogAPI
+        from fs42.scheduling_context import ValidationSchedulingContext, activate_validation_context
+        from station_director.staged_schedule import catalog_allocation_floor
+        def write(database, root, clock):
+            entries = [CatalogEntry(root + '/a.mp4', 3600.0, 'synthetic-series'),
+                       CatalogEntry(root + '/ad.mp4', 3600.0, 'commercial', content_type='commercial')]
+            for entry in entries:
+                entry.realpath = entry.path
+            context = ValidationSchedulingContext(clock, datetime(2026, 9, 22, 20),
+                                                  datetime(2026, 9, 29, 20), 42)
+            with patch('fs42.catalog_io.StationManager',
+                       return_value=SimpleNamespace(server_conf={'db_path': str(database)})), \
+                    activate_validation_context(context):
+                CatalogAPI.set_entries({'network_name': 'Action'}, entries)
+        write(self.databases[0], '/mnt/t7/CRT-Media', datetime(2026, 9, 1))
+        with closing(sqlite3.connect(self.databases[0])) as connection:
+            for name in ('a.mp4', 'ad.mp4'):
+                connection.execute('INSERT INTO file_meta(path,duration,size,last_mod,meta) VALUES(?,?,?,?,?)',
+                                   ('/mnt/t7/CRT-Media/' + name, 3600.0, 1, 1.0, '{}'))
+            columns, original = capture_catalog_rows(connection, 'Action')
+            metadata = capture_catalog_media_metadata(connection, original, columns)
+            floor = catalog_allocation_floor(connection)
+            feature = next(row[0] for row in original if row[columns.index('tag')] == 'synthetic-series')
+            if protected:
+                insert_block(connection, 'Action', '2026-09-22 18:00:00', '2026-09-22 19:00:00',
+                             feature, '/mnt/t7/CRT-Media/a.mp4')
+            connection.commit()
+            with closing(sqlite3.connect(self.databases[1])) as destination:
+                connection.backup(destination)
+        write(self.databases[1], '/media', datetime(2026, 9, 22, 20))
+        with closing(sqlite3.connect(self.databases[1])) as connection:
+            columns, generated = capture_catalog_rows(connection, 'Action')
+            generated_metadata = capture_catalog_media_metadata(connection, generated, columns)
+            reconcile_catalog(connection, 'Action', [dict(zip(columns, row)) for row in generated],
+                              {feature} if protected else set(), original_rows=original,
+                              original_media_metadata=metadata, generated_media_metadata=generated_metadata,
+                              allocation_floor=floor)
+            ref = connection.execute("SELECT id FROM catalog_entries WHERE path='/media/a.mp4'").fetchone()[0]
+            insert_block(connection, 'Action', '2026-09-22 20:00:00', '2026-09-22 21:00:00',
+                         ref, '/media/a.mp4')
+            connection.commit()
+        return feature, ref
+
+    def test_production_clock_only_mapping_preserves_live_semantics(self):
+        from contextlib import closing
+        live_id, staged_id = self.production_clock_rebuild()
+        before = [p.read_bytes() for p in self.databases]
+        with closing(sqlite3.connect(self.databases[0])) as connection:
+            baseline = artifact._catalog(connection)
+        with closing(sqlite3.connect(self.databases[1])) as connection:
+            staged = artifact._catalog(connection)
+        old, new = baseline[live_id][1], staged[staged_id][1]
+        self.assertEqual(sorted(k for k in old['row'] if old['row'][k] != new['row'][k]),
+                         ['created_at', 'updated_at'])
+        self.assertNotEqual(artifact._canonical(old), artifact._canonical(new))
+        document = self.document()
+        artifact.validate_candidate(document)
+        schedule = document['schedule']
+        member = next(m for m in schedule['catalog_mapping'] if m['validated_id'] == staged_id)
+        self.assertEqual(member['live_id'], live_id)
+        self.assertEqual(member['semantics'], old)
+        self.assertEqual(schedule['rows'][0]['content_json'], str(live_id))
+        self.assertEqual(schedule['effect']['blocks'][0]['features'],
+                         [{'start': '2026-09-22 20:00:00', 'end': '2026-09-22 21:00:00'}])
+        from fs42.catalog_entry import CatalogEntry
+        from fs42.liquid_io import LiquidIO
+        from fs42.guide_payloads import _listing_projection
+        with closing(sqlite3.connect(self.databases[1])) as connection:
+            staged_block = connection.execute('SELECT * FROM liquid_blocks').fetchone()
+            staged_catalog = connection.execute('SELECT * FROM catalog_entries WHERE id=?', (staged_id,)).fetchone()
+        with closing(sqlite3.connect(self.databases[0])) as connection:
+            live_catalog = connection.execute('SELECT * FROM catalog_entries WHERE id=?', (live_id,)).fetchone()
+        translated = schedule['rows'][0]
+        rendered = [
+            LiquidIO._build_block_from_row(staged_block, {staged_id: CatalogEntry.from_db_row(staged_catalog)},
+                                          normalize_titles=False),
+            LiquidIO._build_block_from_row(tuple(translated[k] for k in artifact.BLOCK_COLUMNS),
+                                          {live_id: CatalogEntry.from_db_row(live_catalog)},
+                                          normalize_titles=False)]
+        self.assertEqual(_listing_projection(rendered[:1], True),
+                         _listing_projection(rendered[1:], True))
+        self.assertEqual(artifact._block_playback(dict(zip(artifact.BLOCK_COLUMNS, staged_block)),
+                                               allow_descriptors=False)[1],
+                         artifact._block_playback(translated, allow_descriptors=False)[1])
+        self.assertEqual(before, [p.read_bytes() for p in self.databases])
+
+    def test_production_clock_protected_alias_retains_exact_original(self):
+        from contextlib import closing
+        live_id, staged_id = self.production_clock_rebuild(protected=True)
+        before = [p.read_bytes() for p in self.databases]
+        schedule = self.export()
+        members = [m for m in schedule['catalog_mapping'] if m['live_id'] == live_id]
+        self.assertEqual({m['validated_id'] for m in members}, {live_id, staged_id})
+        self.assertEqual(members[0]['semantics'], members[1]['semantics'])
+        with closing(sqlite3.connect(self.databases[0])) as connection:
+            old = artifact._catalog(connection)[live_id]
+        with closing(sqlite3.connect(self.databases[1])) as connection:
+            self.assertEqual(artifact._catalog(connection)[live_id][0], old[0])
+        self.assertEqual(members[0]['semantics'], old[1])
+        self.assertEqual(before, [p.read_bytes() for p in self.databases])
+
+    def test_timestamp_fallback_rejects_each_other_catalog_field(self):
+        from contextlib import closing
+        unused_live, staged_id = self.production_clock_rebuild()
+        cases = {
+            'station': 'Other', 'path': '/media/different.mp4', 'title': 'Different',
+            'duration': 3599.0, 'tag': 'different', 'count': 1, 'hints': '[]',
+            'realpath': '/media/different.mp4', 'content_type': 'commercial', 'media_type': 'audio',
+        }
+        with closing(sqlite3.connect(self.databases[1])) as connection:
+            columns = [r[1] for r in connection.execute('PRAGMA table_info(catalog_entries)')]
+            original = dict(zip(columns, connection.execute(
+                'SELECT * FROM catalog_entries WHERE id=?', (staged_id,)).fetchone()))
+        self.assertEqual(set(cases), set(original) - {'id', 'created_at', 'updated_at'})
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                self.update(f'UPDATE catalog_entries SET {field}=? WHERE id=?', (value, staged_id))
+                try:
+                    with self.assertRaises(artifact.ArtifactError):
+                        self.export()
+                finally:
+                    self.update(f'UPDATE catalog_entries SET {field}=? WHERE id=?',
+                                (original[field], staged_id))
+        artifact.validate_candidate(self.document())
+
+    def test_timestamp_fallback_preserves_all_metadata_checks(self):
+        self.production_clock_rebuild()
+        for table in ('file_meta', 'break_points', 'chapter_points'):
+            with self.subTest(table=table):
+                if table == 'file_meta':
+                    self.update('UPDATE file_meta SET duration=duration+1')
+                else:
+                    self.update(f'INSERT INTO {table}(path,points) VALUES(?,?)',
+                                ('/mnt/t7/CRT-Media/a.mp4', '[]'))
+                try:
+                    with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_metadata_changed'):
+                        self.export()
+                finally:
+                    if table == 'file_meta':
+                        self.update('UPDATE file_meta SET duration=duration-1')
+                    else:
+                        self.update(f'DELETE FROM {table}')
+
+    def test_timestamp_fallback_ambiguous_but_exact_matches_still_win(self):
+        self.duplicate_catalog(0, 1, 3)
+        self.update("UPDATE catalog_entries SET updated_at='2026-09-02 00:00:00' WHERE id=3", sides=(0,))
+        self.duplicate_catalog(1, 1, 3)
+        self.update("UPDATE catalog_entries SET updated_at='2026-09-02 00:00:00' WHERE id=3")
+        # Both same-ID exact matches win despite the timestamp-free ambiguity.
+        artifact.validate_candidate(self.document())
+        self.update('DELETE FROM catalog_entries WHERE id=3')
+        self.update("UPDATE catalog_entries SET id=4,updated_at='2026-09-22 20:00:00' WHERE id=1")
+        self.update("UPDATE liquid_blocks SET content_json='4'")
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_catalog_mapping_ambiguous'):
+            self.export()
+
+    def test_timestamp_fallback_rejects_malformed_and_unproven_rows(self):
+        unused_live, staged_id = self.production_clock_rebuild()
+        malformed = (None, True, 1, 1.5, b'invalid', '', 'invalid',
+                     '2026-02-30 12:00:00', '2026-09-22', '2026-09-22 20:00:00+00:00')
+        for field in ('created_at', 'updated_at'):
+            for value in malformed:
+                with self.subTest(field=field, value_type=type(value).__name__):
+                    self.update(f'UPDATE catalog_entries SET {field}=? WHERE id=?', (value, staged_id))
+                    with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_invalid'):
+                        self.export()
+            self.update(f'UPDATE catalog_entries SET {field}=? WHERE id=?',
+                        ('2026-09-22 20:00:00', staged_id))
+        # A timestamp mutation without a newly allocated sandbox row is not
+        # evidence of a production rebuild.
+        self.update('UPDATE catalog_entries SET id=? WHERE id=?', (unused_live, staged_id))
+        with self.assertRaises(artifact.ArtifactError):
+            self.export()
+
+    def test_nullable_baseline_timestamps_remain_unchanged(self):
+        live_id, staged_id = self.production_clock_rebuild()
+        self.update('UPDATE catalog_entries SET created_at=NULL,updated_at=NULL WHERE id=?',
+                    (live_id,), sides=(0,))
+        member = next(m for m in self.export()['catalog_mapping'] if m['validated_id'] == staged_id)
+        self.assertIsNone(member['semantics']['row']['created_at'])
+        self.assertIsNone(member['semantics']['row']['updated_at'])
+
+    def test_each_timestamp_individually_and_malformed_baseline(self):
+        live_id, staged_id = self.production_clock_rebuild()
+        for field in ('created_at', 'updated_at'):
+            self.update(f'UPDATE catalog_entries SET {field}=? WHERE id=?',
+                        ('2026-09-01 00:00:00', staged_id))
+            member = next(m for m in self.export()['catalog_mapping'] if m['validated_id'] == staged_id)
+            self.assertEqual(member['live_id'], live_id)
+            self.assertEqual(member['semantics']['row'][field], '2026-09-01 00:00:00')
+            self.update(f'UPDATE catalog_entries SET {field}=? WHERE id=?',
+                        ('2026-09-22 20:00:00', staged_id))
+        self.update("UPDATE catalog_entries SET created_at='invalid' WHERE id=?", (live_id,), sides=(0,))
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_invalid'):
+            self.export()
+
+    def test_timestamp_change_still_changes_normalization_and_fingerprint(self):
+        from contextlib import closing
+        from station_director.schedule_normalization import canonical_catalog_semantics
+        from station_director.preservation import fingerprint_database
+        with closing(sqlite3.connect(self.databases[1])) as connection:
+            columns = [r[1] for r in connection.execute('PRAGMA table_info(catalog_entries)')]
+            row = connection.execute('SELECT * FROM catalog_entries WHERE id=1').fetchone()
+            before = canonical_catalog_semantics(connection, columns, row)
+        fingerprint = fingerprint_database(self.databases[1])['logical']['digest']
+        self.update("UPDATE catalog_entries SET updated_at='2026-09-22 20:00:00' WHERE id=1")
+        with closing(sqlite3.connect(self.databases[1])) as connection:
+            row = connection.execute('SELECT * FROM catalog_entries WHERE id=1').fetchone()
+            after = canonical_catalog_semantics(connection, columns, row)
+        self.assertNotEqual(artifact._canonical(before), artifact._canonical(after))
+        self.assertNotEqual(fingerprint, fingerprint_database(self.databases[1])['logical']['digest'])
+
     def duplicate_catalog(self, side, source_id, target_id):
         connection = sqlite3.connect(self.databases[side])
         try:
@@ -258,6 +474,9 @@ class ArtifactTests(unittest.TestCase):
                     (':autobump:=synthetic-private', AUTOBUMP_CATALOG_TAG), sides=(0, 1))
         artifact.validate_candidate(self.document())
         self.assertNotIn('synthetic-private', json.dumps(self.document()))
+        self.update("UPDATE catalog_entries SET id=20,updated_at='2026-09-22 20:00:00' WHERE id=2")
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_catalog_no_semantic_match'):
+            self.export()
 
     def test_delayed_block_start_is_supported_not_exact_start(self):
         self.response['channels'][0]['regeneration_start'] = '2026-09-22 20:16:00'
