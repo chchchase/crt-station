@@ -18,7 +18,7 @@ from station_director.path_safety import canonical_media_mapping
 from station_director.preservation import readonly_database
 from station_director.schedule_normalization import (
     _block_playback, _canonical, _catalog_descriptor, _columns, _parse_json,
-    _quote, canonical_catalog_semantics,
+    _quote, _metadata_for_path, canonical_catalog_semantics,
 )
 from station_director.single_run_protocol import strict_json_loads, validate_document
 
@@ -103,8 +103,24 @@ def _rows(connection, table, limit=MAX_CATALOG):
 
 def _catalog(connection):
     columns, rows = _rows(connection, 'catalog_entries')
-    return {row['id']: (row, canonical_catalog_semantics(
-        connection, columns, tuple(row[c] for c in columns))) for row in rows}
+    metadata_paths = {}
+    for table in ('file_meta', 'break_points', 'chapter_points'):
+        unused, metadata_rows = _rows(connection, table)
+        for metadata in metadata_rows:
+            path = metadata['path']
+            identity = canonical_media_mapping(path, allow_sandbox=True).logical_identity
+            if identity in metadata_paths and metadata_paths[identity] != path:
+                raise ArtifactError('candidate_metadata_ambiguous')
+            metadata_paths[identity] = path
+    result = {}
+    for row in rows:
+        semantics = canonical_catalog_semantics(connection, columns, tuple(row[c] for c in columns))
+        if not _catalog_descriptor(row):
+            identity = canonical_media_mapping(row.get('realpath') or row['path'], allow_sandbox=True).logical_identity
+            if identity in metadata_paths:
+                semantics['media_records'] = _metadata_for_path(connection, metadata_paths[identity])
+        result[row['id']] = (row, semantics)
+    return result
 
 
 def _semantic_descriptor(row):
@@ -237,7 +253,9 @@ def export_candidate(stage, response, proposal, policy):
         old, new = _catalog(baseline), _catalog(proposed)
         if _metadata(baseline) != _metadata(proposed):
             raise ArtifactError('candidate_metadata_changed')
-        # Require a bijection of complete existing semantics, including metadata.
+        # Require unambiguous complete existing semantics, including metadata.
+        # The narrowly checked historical/staging alias pair below is the only
+        # permitted exception to one-to-one physical catalog IDs.
         by_semantic = {}
         for ident, (row, semantics) in old.items():
             by_semantic.setdefault(_canonical(semantics), []).append(ident)
@@ -246,12 +264,40 @@ def export_candidate(stage, response, proposal, policy):
         for ident, (row, semantics) in new.items():
             matches = by_semantic.get(_canonical(semantics), [])
             target = ident if ident in matches else matches[0] if len(matches) == 1 else None
-            if target is None or target in used:
+            if target is None:
                 raise ArtifactError('candidate_catalog_changed')
             used.add(target)
             mapping[ident] = {'validated_id': ident, 'live_id': target, 'semantics': semantics}
         if used != set(old):
             raise ArtifactError('candidate_catalog_changed')
+        # Reconciliation preserves exact historical host rows and may add one
+        # /media alias for generated playback. Only that proven pair may share
+        # a live ID; do not admit arbitrary duplicate/ambiguous catalog changes.
+        boundary = datetime.fromisoformat(proposal['week_start']).replace(tzinfo=None).isoformat(' ')
+        unused_columns, baseline_rows = _rows(baseline, 'liquid_blocks', MAX_CATALOG)
+        protected = set()
+        for retained in baseline_rows:
+            if retained['station'] == channel and retained['start_time'] < boundary:
+                refs, unused_plan, unused_descriptor = _block_playback(retained, allow_descriptors=True)
+                protected.update(refs)
+        groups = {}
+        allocation_floor = max(old, default=0)
+        for ident, entry in mapping.items():
+            groups.setdefault(entry['live_id'], []).append(ident)
+        for target, ids in groups.items():
+            if len(ids) == 1:
+                continue
+            aliases = [ident for ident in ids if ident != target]
+            if (len(ids) != 2 or target not in ids or target not in protected
+                    or _canonical(new[target][0]) != _canonical(old[target][0])
+                    or len(aliases) != 1 or aliases[0] <= allocation_floor
+                    or _catalog_descriptor(new[aliases[0]][0])):
+                raise ArtifactError('candidate_catalog_changed')
+            alias = new[aliases[0]][0]
+            expected = canonical_media_mapping(old[target][0].get('realpath') or old[target][0]['path'], allow_sandbox=True).sandbox_path
+            if (alias['path'] != expected or alias['realpath'] != expected
+                    or (old[target][0].get('realpath') or old[target][0]['path']).startswith('/media/')):
+                raise ArtifactError('candidate_catalog_changed')
         columns, all_rows = _rows(proposed, 'liquid_blocks', MAX_CATALOG)
         if tuple(columns) != BLOCK_COLUMNS:
             raise ArtifactError('candidate_schema_unsupported')
@@ -289,7 +335,6 @@ def export_candidate(stage, response, proposal, policy):
             raise ArtifactError('candidate_reference_invalid')
         live_mapping = {v['live_id']: v for v in mapping.values()}
         evidence = effect_evidence(translated, live_mapping, directive)
-        unused_columns, baseline_rows = _rows(baseline, 'liquid_blocks', MAX_CATALOG)
         earlier = sorted((r for r in baseline_rows if r['station'] == channel and r['start_time'] >= boundary),
                          key=lambda r: (r['start_time'], r['id']))
         if _schedule_semantics(earlier) == _schedule_semantics(translated):
@@ -309,10 +354,19 @@ def validate_candidate(document):
         payload = document['schedule']
         rows = payload['rows']
         mapping = {m['live_id']: m for m in payload['catalog_mapping']}
-        if (len(mapping) != len(payload['catalog_mapping'])
-                or len({m['validated_id'] for m in payload['catalog_mapping']}) != len(mapping)
+        if (len({m['validated_id'] for m in payload['catalog_mapping']}) != len(payload['catalog_mapping'])
                 or len({r['id'] for r in rows}) != len(rows)):
             raise ArtifactError()
+        groups = {}
+        for member in payload['catalog_mapping']:
+            groups.setdefault(member['live_id'], []).append(member)
+        allocation_floor = max(mapping, default=0)
+        for live_id, members in groups.items():
+            if len(members) > 1 and (len(members) != 2
+                    or sum(m['validated_id'] == live_id for m in members) != 1
+                    or any(m['validated_id'] != live_id and m['validated_id'] <= allocation_floor for m in members)
+                    or _canonical(members[0]['semantics']) != _canonical(members[1]['semantics'])):
+                raise ArtifactError()
         span = payload['range']
         mark = _time(span['regeneration_start'])
         if _time(span['proposal_boundary']) > mark or mark >= _time(span['effective_horizon']):

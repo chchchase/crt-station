@@ -417,5 +417,200 @@ class ArtifactTests(unittest.TestCase):
         candidate.publish.assert_called_once()
 
 
+# End-to-end regression: production projection, reconciliation and fingerprints.
+import copy
+import json
+import sqlite3
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+from station_director.schedule_artifact import CandidatePreparation, ArtifactError
+from station_director.schedule_normalization import normalize_completed_run
+from station_director.preservation import (capture_media_manifest, fingerprint_database,
+    fingerprint_json_files, protected_json_paths)
+from station_director.validation_context import (canonical_seed_inputs, derive_validation_context,
+    logical_media_manifest_fingerprint, logical_protected_configuration_fingerprint)
+from station_director.single_run_protocol import (bind_request, validate_document,
+    validate_response_semantics, REQUEST_SCHEMA, RESPONSE_SCHEMA_V4)
+from station_director.worker_bootstrap import finalize_work_tree
+from station_director.staged_schedule import (capture_catalog_rows,
+    capture_catalog_media_metadata, reconcile_catalog)
+from test.test_station_director_milestone_c1 import request_for
+from test.test_station_director_milestone_c2 import insert_catalog, response, write_test_guide
+from test.test_station_director_milestone_b2 import create_database, insert_block
+
+ROOT = Path('/home/chaseanderegg/FieldStation42')
+
+
+def production_alias_fixture(root, revision_root):
+    stage = root / 'stage'; stage.mkdir()
+    media = root / 'media'; media.mkdir()
+    request = request_for(stage, media)
+    (media / 'ad.mp4').write_bytes(b'synthetic-commercial')
+    source = stage / 'source'
+    database = source / 'runtime/fs42_fluid.db'
+    con = create_database(database)
+    try:
+        insert_catalog(con, 1, '/mnt/t7/CRT-Media/show.mp4', tag='Synthetic')
+        insert_catalog(con, 2, 'catalog/crt_media/ad.mp4', realpath='/mnt/t7/CRT-Media/ad.mp4',
+                       tag='commercial', content_type='commercial')
+        for name in ('show.mp4', 'ad.mp4'):
+            info = (media / name).stat()
+            con.execute('INSERT INTO file_meta(path,duration,size,last_mod,meta) VALUES(?,?,?,?,?)',
+                        ('/mnt/t7/CRT-Media/' + name, 3600.0, info.st_size, info.st_mtime, '{}'))
+        insert_block(con, 'Action', '2026-09-14 05:00:00', '2026-09-14 06:00:00',
+                     1, '/mnt/t7/CRT-Media/show.mp4')
+        con.commit()
+    finally:
+        con.close()
+    proposal = request['proposal']
+    proposal['directives'] = [{'type':'date_slot', 'channel':2, 'date':'2026-09-14',
+                               'hour':6, 'series':'Synthetic'}]
+    policy = request['policy']
+    manifest = capture_media_manifest(media, spool_directory=stage)
+    try:
+        configuration = logical_protected_configuration_fingerprint(protected_json_paths(source))['digest']
+        database_digest = fingerprint_database(database)['logical']['digest']
+        logical_media = logical_media_manifest_fingerprint(manifest)['digest']
+        physical = fingerprint_json_files(protected_json_paths(source))['digest']
+        request['seed_inputs'] = canonical_seed_inputs(configuration, database_digest, logical_media)
+        request['validation_context'] = derive_validation_context(proposal, policy, request['seed_inputs'])
+        request['input_fingerprints'] = {
+            'original_logical_configuration_fingerprint': configuration,
+            'original_logical_database_fingerprint': database_digest,
+            'logical_media_manifest_fingerprint': logical_media,
+            'live_physical_configuration_fingerprint': physical,
+            'staged_source_physical_configuration_fingerprint': physical}
+        request = bind_request(request)
+        validate_document(request, REQUEST_SCHEMA)
+        finalized, held = finalize_work_tree(request, stage, media, ROOT)
+        held.close()
+        work = stage / 'work/runtime/fs42_fluid.db'
+        con = sqlite3.connect(work)
+        try:
+            columns, originals = capture_catalog_rows(con, 'Action')
+            metadata = capture_catalog_media_metadata(con, originals, columns)
+            generated = [dict(zip(columns, row)) for row in originals]
+            from station_director.path_safety import canonical_media_mapping
+            for row in generated:
+                path = canonical_media_mapping(row['realpath'] or row['path']).sandbox_path
+                row['path'] = row['realpath'] = path
+            generated_metadata = capture_catalog_media_metadata(
+                con, [tuple(row[c] for c in columns) for row in generated], columns)
+            # Production reconciliation itself creates the /media alias for a
+            # protected host-path row; unchanged metadata stays host-keyed.
+            active = reconcile_catalog(con, 'Action', generated, {1},
+                original_rows=originals, original_media_metadata=metadata,
+                generated_media_metadata=generated_metadata)
+            feature = con.execute("SELECT id FROM catalog_entries WHERE path='/media/show.mp4'").fetchone()[0]
+            from datetime import datetime, timedelta
+            for hour in range(168):
+                start = datetime(2026, 9, 14, 6) + timedelta(hours=hour)
+                insert_block(con, 'Action', start.isoformat(' '),
+                             (start + timedelta(hours=1)).isoformat(' '), feature, '/media/show.mp4')
+            plan = [{'path':'/media/ad.mp4', 'duration':60, 'skip':0, 'is_stream':False,
+                     'content_type':'commercial', 'media_type':'video'},
+                    {'path':'/media/show.mp4', 'duration':3540, 'skip':0, 'is_stream':False,
+                     'content_type':'feature', 'media_type':'video'}]
+            con.execute('UPDATE liquid_blocks SET plan_json=? WHERE start_time=?',
+                        (json.dumps(plan), '2026-09-14 06:00:00'))
+            con.commit()
+        finally:
+            con.close()
+        accepted = response('a'); accepted['schema_version'] = 4
+        accepted['run_id'] = request['run_id']; accepted['proposal_id'] = proposal['proposal_id']
+        accepted['validation_context'] = {k:request['validation_context'][k]
+                                         for k in ('input_fingerprint','requested_seed','effective_seed')}
+        accepted['verification']['fingerprints'].update(request['input_fingerprints'])
+        accepted['verification']['fingerprints'].update({k:finalized[k] for k in
+            ('projected_configuration_fingerprint','working_database_fingerprint')})
+        accepted['channels'][0].update(effective_horizon='2026-09-21 06:00:00',
+                                     regeneration_start='2026-09-14 06:00:00',
+                                     retained_blocks=1, generated_blocks=168, final_blocks=169)
+        validate_document(accepted, RESPONSE_SCHEMA_V4)
+        validate_response_semantics(accepted)
+        write_test_guide(stage)
+        normalize_completed_run(stage, database, accepted, '2026-09-14 06:00:00')
+        normalized = True
+        preparation = CandidatePreparation(revision_root)
+        preparation.begin(proposal, policy, 'v-20260916T000000000000Z-' + 'a'*32)
+        life = SimpleNamespace(stage=stage, request=request)
+        # Same shared-capture fields consumed by production; manifest and all
+        # fingerprints were computed by the real helpers above.
+        from station_director.dual_run import SharedCapture, _space_requirement
+        capture = SharedCapture(
+            configuration, database_digest, logical_media,
+            fingerprint_json_files(protected_json_paths(source)),
+            fingerprint_database(database), manifest, logical_media_manifest_fingerprint(manifest),
+            _space_requirement(database, 0), stage)
+        preparation.capture(life, accepted, capture)
+        return preparation, stage, normalized, accepted
+    finally:
+        manifest.close()
+
+
+class ProductionAliasExportTests(unittest.TestCase):
+    def test_protected_host_catalog_and_generated_alias_export(self):
+        import subprocess
+        with tempfile.TemporaryDirectory(prefix='fs42-alias-regression-', dir='/tmp') as temp:
+            root = Path(temp)
+            revision = root / 'revision'
+            # A clean local clone supplies real revision checks without committing
+            # or mocking code/input fingerprint helpers. No remote is contacted.
+            subprocess.run(['git', 'clone', '--quiet', '--shared', str(ROOT), str(revision)],
+                           check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            preparation, stage, normalized, accepted = production_alias_fixture(root, revision)
+            self.assertTrue(normalized)
+            schedule = preparation.exports[0]['schedule']
+            self.assertEqual(schedule['rows'][0]['content_json'], '1')
+            aliases = [m for m in schedule['catalog_mapping'] if m['live_id'] == 1]
+            self.assertEqual(len(aliases), 2)
+            self.assertEqual(aliases[0]['semantics'], aliases[1]['semantics'])
+            self.assertIsNotNone(aliases[0]['semantics']['media_records']['file_meta'])
+            self.assertEqual(schedule['effect']['blocks'][0]['features'][0]['start'],
+                             '2026-09-14 06:01:00')
+            document = {'schema_version': 1, 'proposal_id': preparation.proposal['proposal_id'],
+                        'proposal_digest': artifact.digest(preparation.proposal),
+                        'policy_digest': artifact.digest(preparation.policy),
+                        'code_revision': preparation.revision, 'validation_run': preparation.run_id,
+                        'validation_report_digest': 'a' * 64, 'normalized_digest': 'b' * 64,
+                        'directive': preparation.proposal['directives'][0], **preparation.exports[0]}
+            artifact.validate_candidate(document)
+            duplicate = copy.deepcopy(document)
+            duplicate['schedule']['catalog_mapping'].append(copy.deepcopy(aliases[-1]))
+            with self.assertRaises(artifact.ArtifactError):
+                artifact.validate_candidate(duplicate)
+            altered = copy.deepcopy(document)
+            pair = [m for m in altered['schedule']['catalog_mapping'] if m['live_id'] == 1]
+            pair[-1]['semantics']['row']['duration'] += 1
+            with self.assertRaises(artifact.ArtifactError):
+                artifact.validate_candidate(altered)
+            from contextlib import closing
+            with closing(sqlite3.connect(stage / 'work/runtime/fs42_fluid.db')) as writer:
+                writer.execute('UPDATE file_meta SET size=size+1')
+                writer.commit()
+            try:
+                with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_metadata_changed'):
+                    artifact.export_candidate(stage, accepted, preparation.proposal, preparation.policy)
+            finally:
+                writer = sqlite3.connect(stage / 'work/runtime/fs42_fluid.db')
+                try:
+                    writer.execute('UPDATE file_meta SET size=size-1')
+                    writer.commit()
+                finally:
+                    writer.close()
+            with closing(sqlite3.connect(stage / 'work/runtime/fs42_fluid.db')) as writer:
+                writer.execute("INSERT INTO file_meta(path,duration,size) VALUES('/media/show.mp4',3600,9)")
+                writer.commit()
+                with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_metadata_ambiguous'):
+                    artifact.export_candidate(stage, accepted, preparation.proposal, preparation.policy)
+                writer.execute("DELETE FROM file_meta WHERE path='/media/show.mp4'")
+                writer.execute("UPDATE catalog_entries SET duration=duration+1 WHERE path='/media/show.mp4'")
+                writer.commit()
+                with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_catalog_changed'):
+                    artifact.export_candidate(stage, accepted, preparation.proposal, preparation.policy)
+
+
 if __name__ == '__main__':
     unittest.main()

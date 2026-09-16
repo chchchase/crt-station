@@ -173,10 +173,17 @@ It requires a clean tracked worktree and records the exact Git revision; new
 untracked Python implementation files in the native/Director packages are rejected.
 
 This first checkpoint supports one date-slot directive on one ordinary channel,
-without assignments or exclusions. It requires a bijection to existing catalog
+without assignments or exclusions. It requires an unambiguous mapping to existing catalog
 semantics and unchanged file/break/chapter metadata, including negative chapter
 attestations. Ambiguous catalog mappings, catalog additions/removals, metadata
-changes, and a no-change replacement are rejected. Catalog IDs are translated to
+changes, and a no-change replacement are rejected. A protected, exact historical
+host-path row and its freshly allocated `/media` staging alias may map to the
+same existing live ID, only with identical complete semantics. Metadata is
+resolved through an unambiguous canonical media identity; missing exact-path
+metadata on a staging alias is not treated as missing live metadata. Conflicting
+or ambiguous metadata aliases fail closed. Native numeric cache timestamps are
+retained as numbers, without coercion or exclusion from equivalence checks.
+Catalog IDs are translated to
 existing baseline IDs; known media references are translated through the existing
 confinement mapper, with logical-equivalence checks. Unknown auxiliary sandbox
 references fail closed. Retained AutoBump history remains protected and is not

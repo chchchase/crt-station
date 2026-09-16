@@ -611,6 +611,7 @@
         "first_added": {
           "type": [
             "string",
+            "number",
             "null"
           ],
           "maxLength": 2097152
@@ -618,6 +619,7 @@
         "last_mod": {
           "type": [
             "string",
+            "number",
             "null"
           ],
           "maxLength": 2097152
@@ -625,6 +627,7 @@
         "last_checked": {
           "type": [
             "string",
+            "number",
             "null"
           ],
           "maxLength": 2097152
@@ -632,6 +635,7 @@
         "last_updated": {
           "type": [
             "string",
+            "number",
             "null"
           ],
           "maxLength": 2097152
@@ -667,6 +671,7 @@
         "last_updated": {
           "type": [
             "string",
+            "number",
             "null"
           ],
           "maxLength": 2097152
