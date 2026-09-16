@@ -76,6 +76,10 @@ def build_parser():
     schedule_commands.add_parser("list", help="List saved proposals")
     show = schedule_commands.add_parser("show", help="Display a proposal"); show.add_argument("proposal_id")
     validate = schedule_commands.add_parser("validate", help="Validate in an isolated staging workspace"); validate.add_argument("proposal_id")
+    prepare = schedule_commands.add_parser("prepare", help="Validate twice and prepare an immutable schedule candidate; never apply")
+    prepare.add_argument("proposal_id")
+    inspect = schedule_commands.add_parser("inspect-candidate", help="Inspect a private candidate without live reads")
+    inspect.add_argument("digest")
     compare = schedule_commands.add_parser("compare", help="Display the saved current/proposed comparison"); compare.add_argument("proposal_id")
     archive = schedule_commands.add_parser("archive", help="Archive an unapplied proposal"); archive.add_argument("proposal_id"); archive.add_argument("--confirm", required=True)
     return parser
@@ -145,7 +149,16 @@ def main(argv=None):
             print(f"Text: {text_path.relative_to(ROOT)}")
             return 0 if report["result"] == "PASS" else 1
 
-        if args.command == "schedule" and args.schedule_command == "validate":
+        if args.command == "schedule" and args.schedule_command == "inspect-candidate":
+            from station_director.schedule_artifact import inspect_candidate
+            try:
+                print_json(inspect_candidate(args.digest))
+                return 0
+            except Exception:
+                print('error: candidate inspection failed', file=sys.stderr)
+                return 1
+
+        if args.command == "schedule" and args.schedule_command in ("validate", "prepare"):
             if not validation_control.SCHEDULE_VALIDATION_ENABLED:
                 print(validation_control.DISABLED_MESSAGE)
                 return 1
@@ -156,8 +169,18 @@ def main(argv=None):
             from station_director.validation_coordinator import (
                 render_cli_outcome, validate_saved_proposal,
             )
-            outcome = validate_saved_proposal(args.proposal_id)
+            candidate = None
+            if args.schedule_command == 'prepare':
+                from station_director.schedule_artifact import CandidatePreparation
+                candidate = CandidatePreparation()
+            outcome = validate_saved_proposal(args.proposal_id, **(
+                {'candidate': candidate} if candidate is not None else {}))
             sys.stdout.write(render_cli_outcome(outcome))
+            if candidate is not None:
+                if candidate.summary is None:
+                    print('Candidate: not published')
+                    return 1
+                print_json(candidate.summary)
             return 0 if outcome.state == "passed" else 1
 
         policy = load_policy(args.policy)

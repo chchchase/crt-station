@@ -162,6 +162,84 @@ The stage-backed C1 `/tmp` mount is a new isolation variant. The shared launcher
 
 There is deliberately no apply or rollback command. Archiving requires the exact proposal ID as confirmation and only moves Director-owned proposal files.
 
+### Immutable application candidates (checkpoint 1)
+
+`./director schedule prepare PROPOSAL_ID` runs the same genuine, isolated two-run
+validation as `schedule validate`, with an additional bounded candidate export.
+It never applies a schedule, stops playback, or writes the live database. The
+normal validation command is unchanged. Preparation has the same enabled gate,
+normal-SSH admission, lock, confinement, preservation, and cleanup requirements.
+It requires a clean tracked worktree and records the exact Git revision; new
+untracked Python implementation files in the native/Director packages are rejected.
+
+This first checkpoint supports one date-slot directive on one ordinary channel,
+without assignments or exclusions. It requires a bijection to existing catalog
+semantics and unchanged file/break/chapter metadata, including negative chapter
+attestations. Ambiguous catalog mappings, catalog additions/removals, metadata
+changes, and a no-change replacement are rejected. Catalog IDs are translated to
+existing baseline IDs; known media references are translated through the existing
+confinement mapper, with logical-equivalence checks. Unknown auxiliary sandbox
+references fail closed. Retained AutoBump history remains protected and is not
+copied into the replacement range; generated AutoBump remains forbidden.
+
+Each accepted worker's schedule is exported in memory before stage cleanup.
+The two exports must match. A candidate is published only after reproducibility,
+all source-stability checkpoints, both cleanups, and durable successful report
+publication. No failed staging database is retained. Candidate failure never
+makes an ordinary validation silently eligible for application.
+
+The date-slot directive is an **hour-of-block-selection rule**, not an exact
+feature start appointment. `SlotReader.get_slot()` uses the current block-start
+hour; `LiquidSchedule._fluid()` advances to the previous block's end before its
+next decision. A crossing block can delay or entirely skip an hour. Evidence
+therefore requires at least one generated ordinary `LiquidBlock` starting in the
+requested hour, and every block starting in that hour must reference the requested
+catalog tag and have matching feature playback paths. Presence in a title, an
+earlier block merely overlapping the hour, or one matching block among wrong-tag
+blocks is not proof. Fallback output with a different tag is rejected. Clip/loop/
+web effect shapes and ambiguous/nonexistent DST times are unsupported for now.
+
+Feature intervals come from the actual generated playback plan: block start plus
+the cumulative entry durations, including opening material and intervening
+commercials. They are scheduled times, not measurements of player execution.
+The inspector lists each feature segment's start/end rather than pretending the
+feature starts exactly on the hour or runs uninterrupted. Nonpositive, nonfinite,
+unbounded, or block-overrunning plan durations fail closed. No exact-start timing
+requirement is introduced; an exact-start product would need a separate operator
+decision and is not implemented here.
+
+`./director schedule inspect-candidate SHA256` reads only the private candidate
+and its bound immutable validation report. It verifies size, ownership, mode,
+single-link regular-file identity, schema, semantic checks, content-addressed
+digest, and report binding. It displays the digest, proposal/run/revision, actual
+replacement boundary/seam/horizon/end, requested channel/date/hour and tag digest,
+and scheduled feature intervals. It does not print media names, paths, titles,
+catalog rows, or raw errors. There is no approval or application command yet.
+
+Candidates live at `runtime/director/candidates/SHA256.json`, mode 0600 beneath
+private owned directories. Publication uses descriptor-relative no-follow access,
+exclusive temporary creation, fsync, and atomic no-replace rename. Limits are
+16 MiB per artifact, 10,000 replacement rows, 50,000 scanned rows per table and
+catalog mappings, and 100 directory entries; capacity exhaustion rejects rather
+than deleting older candidates. Temporary publication files are removed on caught
+failure/interruption; an uncatchable crash may leave a private `.pending-*` file,
+which inspection cannot accept. There is no automatic crash cleanup/resumption.
+
+Bindings include the exact canonical proposal digest, typed policy digest, clean
+code revision, logical configuration/database/media fingerprints, physical
+configuration and media-manifest fingerprints, typed schedule/catalog semantics,
+metadata digests, replacement range, effect evidence, and successful report and
+normalized-run digests. The private artifact contains the necessary schedule data;
+only the operator summary is redacted. Media fingerprints retain existing metadata
+identity semantics, not full media-byte hashing. A content hash is not a signature
+against a malicious process running as the same Unix user.
+
+An artifact is evidence for a future approval, not permission to mutate live state.
+This checkpoint implements no writer, stale-input-at-apply check, backup, recovery,
+rollback, service coordination, or race-closing mechanism. Those remain separately
+reviewed work. A successful historical validation cannot supply missing schedule
+rows; preparing a candidate necessarily regenerates and validates both runs.
+
 ### First preservation failure detail
 
 C1 response v4, C2 result v4, and immutable validation report v6 carry a required

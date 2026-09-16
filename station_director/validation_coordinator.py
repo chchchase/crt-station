@@ -602,7 +602,7 @@ def _finalization_budget_exhausted(result, admission_cutoff, control_deadline, *
                  or current + MANDATORY_FINALIZATION_REQUIRED_SECONDS
                  >= control_deadline))
 
-def validate_saved_proposal(proposal_id):
+def validate_saved_proposal(proposal_id, *, candidate=None):
     """Run the complete public flow only when the checked-in gate is true."""
     if not validation_control.SCHEDULE_VALIDATION_ENABLED:
         return disabled_outcome()
@@ -639,6 +639,8 @@ def validate_saved_proposal(proposal_id):
                 publish_validation_report,
             )
             run_id = create_validation_run_id()
+            if candidate is not None:
+                candidate.begin(proposal, policy, run_id)
             control_started = time.monotonic()
             admission_cutoff = (
                 control_started + EXECUTION_ADMISSION_CUTOFF_SECONDS)
@@ -665,6 +667,8 @@ def validate_saved_proposal(proposal_id):
                             control_started=control_started,
                             admission_cutoff=admission_cutoff,
                             control_deadline=control_deadline,
+                            **({'candidate_exporter': candidate.capture}
+                               if candidate is not None else {}),
                         )
                         validate_document(result, RESULT_SCHEMA)
                         _validate_result_semantics(result)
@@ -697,6 +701,9 @@ def validate_saved_proposal(proposal_id):
                         return _outcome_from_result(
                             proposal_id, run_id, result,
                             publication_error=exc)
+                    if candidate is not None and result['status'] == 'success':
+                        cancellation.checkpoint()
+                        candidate.publish(result, publication)
                     return _outcome_from_result(
                         proposal_id, run_id, result, publication)
             except (ValidationCancellation, KeyboardInterrupt):

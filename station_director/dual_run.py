@@ -756,6 +756,7 @@ def _validate_result_semantics(result):
 def run_dual_comparison(
     project_root, source_root, media_root, proposal, policy, comparison_id, *,
     control_started=None, admission_cutoff=None, control_deadline=None,
+    candidate_exporter=None,
 ):
     """Execute C2 internally. This function is intentionally not CLI-routed."""
     started = time.monotonic() if control_started is None else control_started
@@ -883,6 +884,15 @@ def run_dual_comparison(
                     category=f"run_{index}",
                 ) from exc
             normalized.append(normalized_run)
+            if candidate_exporter is not None:
+                # Export while the accepted stage still exists. The coordinator
+                # alone may publish, after final stability and stage cleanup.
+                try:
+                    candidate_exporter(lifecycle, response, scope.capture)
+                except Exception as exc:
+                    _raise_if_cancelled(exc)
+                    raise DualRunError('normalization', 'normalization_failed',
+                                       'Application candidate export rejected.') from None
             try:
                 admit("baseline_comparison", BASELINE_COMPARISON_ALLOWANCE_SECONDS)
                 baseline_summaries.append(compare_baseline_to_proposed(
