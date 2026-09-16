@@ -1,5 +1,6 @@
 """One staged native schedule run. Import this module only after attestation."""
 
+import copy
 import importlib
 import json
 import os
@@ -10,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fs42.catalog import ShowCatalog
+from fs42.config_processor import ConfigProcessor
 from fs42.liquid_schedule import LiquidSchedule
 from fs42.liquid_io import LiquidIO
 from fs42.scheduling_context import (
@@ -259,24 +261,36 @@ def _map_catalog_in_memory(schedule):
 @preservation_check("_validate_final_cross_channel_exclusions", "check_failed")
 def _validate_final_cross_channel_exclusions(projected, histories):
     """Fail if the final schedule violates native sibling exclusion semantics."""
-    liquid_io = LiquidIO()
-    ordered = sorted(histories)
-    for index, left_name in enumerate(ordered):
-        left = projected[left_name]["station_conf"]
+    # Projected documents still contain day-template names; native tag
+    # extraction consumes preprocessed configurations. Never mutate bindings.
+    configs = {
+        name: ConfigProcessor.preprocess(copy.deepcopy(data["station_conf"]))
+        for name, data in projected.items()
+        if data["station_conf"].get("network_type", "standard") == "standard"
+    }
+    liquid_io = None
+    # Histories describe regenerated channels only. Unaffected standard siblings
+    # still constrain each affected channel throughout its regenerated range.
+    for left_name in sorted(histories):
+        left = configs[left_name]
         left_dir = os.path.realpath(left.get("content_dir", ""))
         left_tags = LiquidSchedule._get_station_tags(left)
-        for right_name in ordered[index + 1:]:
-            right = projected[right_name]["station_conf"]
+        for right_name in sorted(configs):
+            if right_name == left_name:
+                continue
+            right = configs[right_name]
             if (
                 not left_dir
                 or os.path.realpath(right.get("content_dir", "")) != left_dir
                 or not (left_tags & LiquidSchedule._get_station_tags(right))
             ):
                 continue
-            start = max(histories[left_name].regeneration_start, histories[right_name].regeneration_start)
-            end = min(histories[left_name].effective_horizon, histories[right_name].effective_horizon)
+            start = histories[left_name].regeneration_start
+            end = histories[left_name].effective_horizon
             if start >= end:
                 continue
+            if liquid_io is None:
+                liquid_io = LiquidIO()
             left_blocks = liquid_io.query_liquid_blocks(left_name, start, end)
             right_blocks = liquid_io.query_liquid_blocks(right_name, start, end)
             for first in left_blocks:

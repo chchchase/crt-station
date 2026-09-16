@@ -1,4 +1,5 @@
 import ast
+import copy
 import io
 import json
 import os
@@ -431,6 +432,145 @@ class PreservationDetailTests(unittest.TestCase):
                 with self.assertRaises(staged.StagedScheduleError) as caught:
                     staged.coverage_report(Mock(), history)
             self.assertEqual(caught.exception.preservation_detail["category"], category)
+
+
+class FinalExclusionInitializationTests(unittest.TestCase):
+    """Real LiquidIO initialization; every SQLite open is fixture-confined."""
+
+    def setUp(self):
+        from fs42.station_manager import StationManager
+        from station_director import native_single_run as native
+        self.native = native
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "runtime").mkdir()
+        (self.root / "confs").mkdir()
+        self.database = self.root / "runtime/fs42_fluid.db"
+        self.connection = create_database(self.database)
+        self.addCleanup(self.connection.close)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        previous = os.getcwd()
+        os.chdir(self.root)
+        stack.callback(os.chdir, previous)
+        stack.enter_context(patch.object(StationManager, "_StationManager__we_are_all_one", {}))
+        stack.enter_context(patch.object(StationManager, "_initialized", False))
+        stack.enter_context(patch.object(StationManager, "stations", []))
+        real_connect = sqlite3.connect
+        self.opens = []
+        def confined_connect(path, *args, **kwargs):
+            self.assertEqual(Path(path).resolve(), self.database)
+            self.opens.append(Path(path).resolve())
+            return real_connect(path, *args, **kwargs)
+        stack.enter_context(patch.object(sqlite3, "connect", side_effect=confined_connect))
+        self.projected = {}
+        for number, name in ((2, "Action"), (8, "Watch In Order")):
+            conf = {"network_name": name, "channel_number": number, "network_type": "standard",
+                    "content_dir": str(self.root / "media"), "day_templates": {"daily": {"6": {"tags": "Shared"}}}}
+            for day in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"):
+                conf[day] = "daily"
+            self.projected[name] = {"station_conf": conf}
+        self.histories = {"Action": types.SimpleNamespace(
+            regeneration_start="2026-09-21 06:00:00", effective_horizon="2026-09-22 06:00:00")}
+
+    def add_block(self, identifier, name, start, end, *, sequence=False):
+        path = str(self.root / "media/synthetic.mp4")
+        row = catalog_row(name, path, "Synthetic", "Shared")
+        self.connection.execute(
+            "INSERT INTO catalog_entries (id,station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (identifier, *row.values()))
+        insert_block(self.connection, name, start, end, identifier, path)
+        if sequence:
+            self.connection.execute("UPDATE liquid_blocks SET sequence_key=? WHERE station=?", ('["synthetic"]', name))
+        self.connection.commit()
+
+    def test_actual_liquid_io_initializes_only_fixture_database(self):
+        liquid_io = self.native.LiquidIO()
+        self.assertEqual(Path(liquid_io.db_path).resolve(), self.database)
+        self.assertTrue(self.opens)
+
+    def test_valid_raw_day_templates_and_single_channel_empty_pairs(self):
+        self.projected.pop("Watch In Order")
+        before = copy.deepcopy(self.projected)
+        self.native._validate_final_cross_channel_exclusions(self.projected, self.histories)
+        self.assertEqual(self.projected, before)
+        self.assertEqual(self.opens, [])
+
+    def test_unaffected_standard_sibling_collision_is_not_skipped(self):
+        self.add_block(1, "Action", "2026-09-21 08:00:00", "2026-09-21 10:00:00")
+        self.add_block(2, "Watch In Order", "2026-09-21 09:00:00", "2026-09-21 11:00:00")
+        # Processed weekdays isolate the pair-selection defect from template expansion.
+        from fs42.config_processor import ConfigProcessor
+        self.projected = {name: {"station_conf": ConfigProcessor.preprocess(copy.deepcopy(data["station_conf"]))}
+                          for name, data in self.projected.items()}
+        with self.assertRaises(Exception) as caught:
+            self.native._validate_final_cross_channel_exclusions(self.projected, self.histories)
+        self.assertEqual(caught.exception.preservation_detail["category"], "collision")
+
+    def test_raw_templates_collide_without_mutating_config_or_rows(self):
+        self.add_block(1, "Action", "2026-09-21 08:00:00", "2026-09-21 10:00:00")
+        self.add_block(2, "Watch In Order", "2026-09-21 09:00:00", "2026-09-21 11:00:00")
+        before_config = copy.deepcopy(self.projected)
+        before_rows = self.connection.execute("SELECT * FROM liquid_blocks ORDER BY id").fetchall()
+        with self.assertRaises(Exception) as caught:
+            self.native._validate_final_cross_channel_exclusions(self.projected, self.histories)
+        self.assertEqual(caught.exception.preservation_detail, {
+            "helper": "_validate_final_cross_channel_exclusions", "category": "collision", "content_scope": None})
+        self.assertTrue(self.opens)
+        self.assertEqual(self.projected, before_config)
+        self.assertEqual(self.connection.execute("SELECT * FROM liquid_blocks ORDER BY id").fetchall(), before_rows)
+
+    def test_genuinely_empty_exclusion_sets_do_not_initialize_io(self):
+        for case in ("no_affected", "different_tags", "different_directory", "nonstandard_sibling", "empty_range"):
+            with self.subTest(case=case):
+                projected, histories = copy.deepcopy(self.projected), copy.deepcopy(self.histories)
+                sibling = projected["Watch In Order"]["station_conf"]
+                if case == "no_affected":
+                    histories = {}
+                elif case == "different_tags":
+                    sibling["day_templates"]["daily"]["6"]["tags"] = "Other"
+                elif case == "different_directory":
+                    sibling["content_dir"] = str(self.root / "other-media")
+                elif case == "nonstandard_sibling":
+                    sibling["network_type"] = "web"
+                else:
+                    histories["Action"].effective_horizon = histories["Action"].regeneration_start
+                self.native._validate_final_cross_channel_exclusions(projected, histories)
+                self.assertEqual(self.opens, [])
+
+    def test_invalid_template_still_fails_closed_before_io(self):
+        self.projected["Action"]["station_conf"]["monday"] = "undefined"
+        with self.assertRaises(Exception) as caught:
+            self.native._validate_final_cross_channel_exclusions(self.projected, self.histories)
+        self.assertEqual(caught.exception.preservation_detail["category"], "check_failed")
+        self.assertEqual(self.opens, [])
+
+    def test_existing_sequence_exemption_is_preserved_on_either_side(self):
+        self.add_block(1, "Action", "2026-09-21 08:00:00", "2026-09-21 10:00:00", sequence=True)
+        self.add_block(2, "Watch In Order", "2026-09-21 09:00:00", "2026-09-21 11:00:00")
+        self.native._validate_final_cross_channel_exclusions(self.projected, self.histories)
+        self.connection.execute("UPDATE liquid_blocks SET sequence_key=NULL WHERE station='Action'")
+        self.connection.execute("UPDATE liquid_blocks SET sequence_key=? WHERE station='Watch In Order'", ('["synthetic"]',))
+        self.connection.commit()
+        self.native._validate_final_cross_channel_exclusions(self.projected, self.histories)
+        self.assertTrue(self.opens)
+
+    def test_historical_collision_outside_affected_range_is_not_rejected(self):
+        self.add_block(1, "Action", "2026-09-20 08:00:00", "2026-09-20 10:00:00")
+        self.add_block(2, "Watch In Order", "2026-09-20 09:00:00", "2026-09-20 11:00:00")
+        self.native._validate_final_cross_channel_exclusions(self.projected, self.histories)
+        self.assertTrue(self.opens)
+
+    def test_affected_range_also_checks_other_affected_channels_retained_rows(self):
+        self.add_block(1, "Action", "2026-09-21 08:00:00", "2026-09-21 10:00:00")
+        self.add_block(2, "Watch In Order", "2026-09-21 09:00:00", "2026-09-21 11:00:00")
+        # The second history is later: taking the intersection would miss this.
+        self.histories["Watch In Order"] = types.SimpleNamespace(
+            regeneration_start="2026-09-22 06:00:00", effective_horizon="2026-09-23 06:00:00")
+        with self.assertRaises(Exception) as caught:
+            self.native._validate_final_cross_channel_exclusions(self.projected, self.histories)
+        self.assertEqual(caught.exception.preservation_detail["category"], "collision")
 
 
 class WorkerCheckpointTests(unittest.TestCase):
