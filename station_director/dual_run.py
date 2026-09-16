@@ -892,6 +892,7 @@ def run_dual_comparison(
                 except Exception as exc:
                     _raise_if_cancelled(exc)
                     from station_director.schedule_artifact import candidate_export_error_category
+                    # Includes fixed catalog subclasses; never copy exception text.
                     raise DualRunError(
                         'normalization', 'normalization_failed',
                         'Application candidate export rejected.',

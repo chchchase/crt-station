@@ -98,6 +98,117 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(doc['schedule']['rows'][0]['content_json'], '1')
         self.assertIn((100, 1), [(r['validated_id'], r['live_id']) for r in doc['schedule']['catalog_mapping']])
 
+    def duplicate_catalog(self, side, source_id, target_id):
+        connection = sqlite3.connect(self.databases[side])
+        try:
+            columns = [row[1] for row in connection.execute('PRAGMA table_info(catalog_entries)')
+                       if row[1] != 'id']
+            names = ','.join(columns)
+            # Distinct physical path, identical logical identity; retain the
+            # production station/tag/path uniqueness constraint.
+            selected = ','.join(
+                "replace(path, '/media/', '/mnt/t7/CRT-Media/')" if name == 'path' else name
+                for name in columns)
+            connection.execute(
+                f'INSERT INTO catalog_entries(id,{names}) SELECT ?,{selected} FROM catalog_entries WHERE id=?',
+                (target_id, source_id))
+            connection.commit()
+        finally:
+            connection.close()
+
+    def assert_catalog_failure_published(self, expected):
+        """Actual capture/export rejection through C2 and immutable publication."""
+        from test import test_station_director_milestone_c2 as c2
+        from station_director import reporting, validation_coordinator as coordinator
+        fixture = c2.DualRunLifecycleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        events = []
+        scope = fixture._scope(self.root, events)
+        scope.lifecycles[0].stage = self.stage
+        preparation = artifact.CandidatePreparation(self.root)
+        with patch.object(artifact, 'code_revision', return_value='a' * 40):
+            preparation.begin(PROPOSAL, POLICY, RUN)
+            with patch('station_director.dual_run._prepare_scope', return_value=scope), \
+                    patch('station_director.dual_run.launch_single_run'), \
+                    patch('station_director.dual_run.inspect_single_run', return_value=self.response), \
+                    patch('station_director.dual_run._assert_inputs_stable', side_effect=lambda a,b,c,k:
+                          {'checkpoint': k, 'passed': True, 'changed_categories': []}), \
+                    patch('station_director.dual_run.normalize_completed_run', return_value=SimpleNamespace()):
+                result = c2.run_dual_comparison(
+                    self.root, self.root, self.root, PROPOSAL, POLICY, RUN,
+                    candidate_exporter=preparation.capture)
+        self.assertEqual(result['failure']['code'], 'normalization_failed')
+        self.assertEqual(result['failure']['category'], expected)
+        self.assertIn('cleanup', events)
+        self.assertIn('close-capture', events)
+        self.assertNotIn('settle-2', events)
+        self.assertEqual(preparation.exports, [])
+        self.assertIsNone(preparation.summary)
+        proposal = dict(PROPOSAL, schema_version=2)
+        report = reporting.build_validation_report(proposal, result, RUN, '2026-09-16T08:00:00Z')
+        with patch.object(reporting, 'PROJECT_ROOT', self.root), \
+                patch.object(reporting, 'VALIDATIONS_ROOT', self.root / 'runtime/director/validations'):
+            publication = reporting.publish_validation_report(report)
+        directory = self.root / 'runtime/director/validations' / PROPOSAL['proposal_id'] / RUN
+        raw = (directory / 'validation.json').read_text()
+        text = (directory / 'validation.txt').read_text()
+        self.assertEqual(json.loads(raw)['findings']['errors'][0]['candidate_export_category'], expected)
+        output = coordinator.render_cli_outcome(
+            coordinator._outcome_from_result(PROPOSAL['proposal_id'], RUN, result, publication))
+        for rendered in (raw, text, output):
+            self.assertIn(expected, rendered)
+            for secret in ('/media/', '/mnt/', 'a.mp4', 'synthetic-series', 'SELECT '):
+                self.assertNotIn(secret, rendered)
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_not_approvable'):
+            preparation.publish(result, publication)
+        self.assertFalse((self.root / 'runtime/director/candidates').exists())
+
+    def test_catalog_no_semantic_match_actual_branch(self):
+        self.update('UPDATE catalog_entries SET duration=3599 WHERE id=1')
+        self.assert_catalog_failure_published('candidate_catalog_no_semantic_match')
+
+    def test_catalog_metadata_association_actual_branch(self):
+        # Defensive fault injection: identical global tables and catalog fields,
+        # but inconsistent extracted metadata association. Do not weaken the
+        # real global metadata-equality check to manufacture a valid input.
+        original = artifact._catalog
+        calls = []
+        def inconsistent_association(connection):
+            result = original(connection)
+            calls.append(True)
+            if len(calls) == 2:
+                result[1][1]['media_records']['file_meta'] = {'duration': 123.0}
+            return result
+        with patch.object(artifact, '_catalog', side_effect=inconsistent_association):
+            self.assert_catalog_failure_published('candidate_catalog_metadata_association_mismatch')
+
+    def test_catalog_ambiguous_mapping_actual_branch(self):
+        self.duplicate_catalog(0, 1, 3)
+        self.update('UPDATE catalog_entries SET id=4 WHERE id=1')
+        self.assert_catalog_failure_published('candidate_catalog_mapping_ambiguous')
+
+    def test_catalog_baseline_unmapped_actual_branch(self):
+        self.update('DELETE FROM catalog_entries WHERE id=2')
+        self.assert_catalog_failure_published('candidate_catalog_baseline_id_unmapped')
+
+    def test_catalog_invalid_alias_pair_actual_branch(self):
+        self.duplicate_catalog(1, 1, 3)
+        self.assert_catalog_failure_published('candidate_catalog_alias_pair_invalid')
+
+    def test_catalog_invalid_alias_path_actual_branch(self):
+        self.duplicate_catalog(1, 1, 3)
+        connection = sqlite3.connect(self.databases[0])
+        try:
+            insert_block(connection, 'Action', '2026-09-22 18:00:00',
+                         '2026-09-22 19:00:00', 1, '/media/a.mp4')
+            connection.commit()
+        finally:
+            connection.close()
+        # Shape/protection checks pass; duplicating an already-sandbox original
+        # is not the permitted historical-host/staging-alias representation.
+        self.assert_catalog_failure_published('candidate_catalog_alias_path_invalid')
+
     def test_noop_detected_despite_json_formatting_and_aliases(self):
         source = sqlite3.connect(self.databases[0])
         try:
@@ -411,6 +522,12 @@ class ArtifactTests(unittest.TestCase):
         self.assertIn('cleanup', events)
 
     def test_inspection_of_candidate_bound_to_retained_v6_report(self):
+        self.check_retained_candidate(6)
+
+    def test_inspection_of_candidate_bound_to_retained_v7_report(self):
+        self.check_retained_candidate(7)
+
+    def check_retained_candidate(self, version):
         from station_director import reporting
         from test.test_station_director_milestone_c3a2 import remove_v7_fields
         from test.test_station_director_milestone_c3b1 import valid_success_result
@@ -418,8 +535,9 @@ class ArtifactTests(unittest.TestCase):
         result['comparison_id'] = RUN
         proposal = dict(PROPOSAL, schema_version=2, week_end='2026-09-29T20:00:00-07:00')
         report = reporting.build_validation_report(proposal, result, RUN, '2026-09-16T08:00:00Z')
-        report = remove_v7_fields(report)
-        report['schema_version'] = report['software']['report_schema_version'] = 6
+        if version < 7:
+            report = remove_v7_fields(report)
+        report['schema_version'] = report['software']['report_schema_version'] = version
         reporting.validate_report_document(report, retained=True)
         raw = reporting._canonical_json(report)
         parent = self.root / 'runtime/director/validations' / PROPOSAL['proposal_id'] / RUN
@@ -712,7 +830,7 @@ class ProductionAliasExportTests(unittest.TestCase):
                 writer.execute("DELETE FROM file_meta WHERE path='/media/show.mp4'")
                 writer.execute("UPDATE catalog_entries SET duration=duration+1 WHERE path='/media/show.mp4'")
                 writer.commit()
-                with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_catalog_changed'):
+                with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_catalog_no_semantic_match'):
                     artifact.export_candidate(stage, accepted, preparation.proposal, preparation.policy)
 
 

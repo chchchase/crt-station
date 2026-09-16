@@ -523,8 +523,8 @@ class ReportTests(unittest.TestCase):
         return parent
 
     def test_software_identity_schema_and_deterministic_text(self):
-        self.assertEqual(self.report["schema_version"], 7)
-        self.assertEqual(self.report["software"]["report_schema_version"], 7)
+        self.assertEqual(self.report["schema_version"], 8)
+        self.assertEqual(self.report["software"]["report_schema_version"], 8)
         self.assertTrue(self.report["software"]["director_version"])
         self.assertLessEqual(len(self.report["software"]["director_version"]), 100)
         validate_document(self.report, REPORT_SCHEMA)
@@ -1242,6 +1242,21 @@ class ReportTests(unittest.TestCase):
             with self.assertRaisesRegex(ReportError, "text|size|large"):
                 publish_validation_report(self.report)
         self.assertFalse(self.root.exists())
+
+    def test_retained_v7_generic_category_and_frozen_enum(self):
+        result = _base_result("comparison")
+        result["phase_reached"] = "normalization"
+        result["failure"] = {
+            "phase": "normalization", "code": "normalization_failed",
+            "category": "candidate_catalog_changed", "message": "Application candidate export rejected."}
+        report = build_validation_report(PROPOSAL, result, self.run_id, "2026-09-13T12:00:00Z")
+        report["schema_version"] = report["software"]["report_schema_version"] = 7
+        validate_report_document(report, retained=True)
+        with self.assertRaises(Exception):
+            validate_report_document(report)
+        report["findings"]["errors"][0]["candidate_export_category"] = "candidate_catalog_no_semantic_match"
+        with self.assertRaises(Exception):
+            validate_report_document(report, retained=True)
 
     def test_candidate_export_schema_projection_and_redaction(self):
         from station_director.schedule_artifact import CANDIDATE_EXPORT_CATEGORIES

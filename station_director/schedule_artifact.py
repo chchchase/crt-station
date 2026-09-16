@@ -47,6 +47,12 @@ CANDIDATE_EXPORT_CATEGORIES = frozenset({
     'candidate_translation_failed', 'candidate_effect_unproven',
     'candidate_effect_unsupported', 'candidate_scope_unsupported',
     'candidate_metadata_changed', 'candidate_catalog_changed',
+    'candidate_catalog_no_semantic_match',
+    'candidate_catalog_metadata_association_mismatch',
+    'candidate_catalog_mapping_ambiguous',
+    'candidate_catalog_baseline_id_unmapped',
+    'candidate_catalog_alias_pair_invalid',
+    'candidate_catalog_alias_path_invalid',
     'candidate_schema_unsupported', 'candidate_range_invalid', 'candidate_no_change',
     'candidate_export_unknown',
 })
@@ -294,11 +300,20 @@ def export_candidate(stage, response, proposal, policy):
             matches = by_semantic.get(_canonical(semantics), [])
             target = ident if ident in matches else matches[0] if len(matches) == 1 else None
             if target is None:
-                raise ArtifactError('candidate_catalog_changed')
+                # Classify only after the unchanged rejection predicate fires.
+                # Row-only equivalence never authorizes a catalog mapping.
+                if matches:
+                    code = 'candidate_catalog_mapping_ambiguous'
+                elif any(_canonical(prior['row']) == _canonical(semantics['row'])
+                         for unused_row, prior in old.values()):
+                    code = 'candidate_catalog_metadata_association_mismatch'
+                else:
+                    code = 'candidate_catalog_no_semantic_match'
+                raise ArtifactError(code)
             used.add(target)
             mapping[ident] = {'validated_id': ident, 'live_id': target, 'semantics': semantics}
         if used != set(old):
-            raise ArtifactError('candidate_catalog_changed')
+            raise ArtifactError('candidate_catalog_baseline_id_unmapped')
         # Reconciliation preserves exact historical host rows and may add one
         # /media alias for generated playback. Only that proven pair may share
         # a live ID; do not admit arbitrary duplicate/ambiguous catalog changes.
@@ -321,12 +336,12 @@ def export_candidate(stage, response, proposal, policy):
                     or _canonical(new[target][0]) != _canonical(old[target][0])
                     or len(aliases) != 1 or aliases[0] <= allocation_floor
                     or _catalog_descriptor(new[aliases[0]][0])):
-                raise ArtifactError('candidate_catalog_changed')
+                raise ArtifactError('candidate_catalog_alias_pair_invalid')
             alias = new[aliases[0]][0]
             expected = canonical_media_mapping(old[target][0].get('realpath') or old[target][0]['path'], allow_sandbox=True).sandbox_path
             if (alias['path'] != expected or alias['realpath'] != expected
                     or (old[target][0].get('realpath') or old[target][0]['path']).startswith('/media/')):
-                raise ArtifactError('candidate_catalog_changed')
+                raise ArtifactError('candidate_catalog_alias_path_invalid')
         columns, all_rows = _rows(proposed, 'liquid_blocks', MAX_CATALOG)
         if tuple(columns) != BLOCK_COLUMNS:
             raise ArtifactError('candidate_schema_unsupported')

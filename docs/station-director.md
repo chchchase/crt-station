@@ -291,7 +291,7 @@ is newly retained, and no new recovery or scheduling behavior is introduced.
 ## Candidate-export failure diagnostics
 
 Candidate-export failures retain the primary `normalization_failed` diagnostic.
-When candidate export is the failing operation, report v7 adds
+When candidate export is the failing operation, reports v7 and later carry
 `candidate_export_category`: an explicitly allowlisted `ArtifactError` code,
 or `candidate_export_unknown` for an unexpected exception or unknown code.
 Ordinary normalization failures have a null category. The category appears in
@@ -300,7 +300,23 @@ paths, rows, and metadata values are never included in this diagnostic.
 Cancellation remains cancellation, and a later cleanup failure does not replace
 the original export failure.
 
-Report schemas v1–v6 remain frozen and retained reports remain readable, including
-valid candidates bound to older reports. New reports use v7; older software that
-does not support v7 cannot read them. This diagnostic does not change candidate
+Report schemas v1–v7 remain frozen and retained reports remain readable, including
+valid candidates bound to older reports. New reports use v8; older software that
+does not support v8 cannot read them. This diagnostic does not change candidate
 acceptance, publication gates, cleanup, isolation, or live-application support.
+
+Report v8 distinguishes the existing catalog rejection predicates with fixed
+categories:
+
+- `candidate_catalog_no_semantic_match`: no complete match and no matching catalog fields.
+- `candidate_catalog_metadata_association_mismatch`: catalog fields match, but associated metadata does not.
+- `candidate_catalog_mapping_ambiguous`: multiple complete matches without a same-ID match.
+- `candidate_catalog_baseline_id_unmapped`: at least one baseline catalog ID is not represented.
+- `candidate_catalog_alias_pair_invalid`: duplicate mappings fail the protected-original/new-alias shape or provenance checks.
+- `candidate_catalog_alias_path_invalid`: the alias paths are not the expected sandbox paths, or the original was already a sandbox row.
+
+The old `candidate_catalog_changed` category remains supported for retained
+reports. Classification occurs only after an existing rejection predicate
+fires; matching catalog fields alone never authorizes a mapping. All baseline
+catalog IDs and complete metadata equivalence are still required. These
+categories do not prove live data changed and do not permit catalog writes.

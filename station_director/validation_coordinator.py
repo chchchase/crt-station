@@ -480,6 +480,7 @@ def _minimal_c2_failure(run_id, code, phase="capture", source=None, *,
 def _outcome_from_result(proposal_id, run_id, result, publication=None,
                          publication_error=None):
     from station_director.schedule_artifact import candidate_export_category
+    # The shared allowlist projects catalog subclasses without new outcome fields.
     schedulers = result.get("scheduler_invoked", {})
     scheduler_tuple = (schedulers.get("run_1", "unknown"),
                        schedulers.get("run_2", "unknown"))

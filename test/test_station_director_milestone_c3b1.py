@@ -634,7 +634,7 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertEqual(len(report_directories), 1)
         document = json.loads(
             (report_directories[0] / "validation.json").read_text(encoding="utf-8"))
-        self.assertEqual(document["schema_version"], 7)
+        self.assertEqual(document["schema_version"], 8)
         finding = document["findings"]["errors"][0]
         self.assertEqual(finding["capture_run"], 2)
         self.assertEqual(finding["finalization_subphase"], "proposal_projection")
