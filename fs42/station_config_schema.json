@@ -44,6 +44,11 @@
           "type": "boolean",
           "description": "Whether the channel is commercial-free"
         },
+        "use_bumpers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable channel bumpers and AutoBump; false overrides explicit start/end bumpers without enabling commercials on commercial-free channels"
+        },
         "break_duration": {
           "type": "integer",
           "description": "Duration of commercial breaks in seconds"

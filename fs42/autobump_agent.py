@@ -29,7 +29,7 @@ class AutoBumpAgent:
     @staticmethod
     def validation_subprocess_required(station_config):
         """Mirror the native duration-probe branch without inspecting values."""
-        if "autobump" not in station_config:
+        if not station_config.get("use_bumpers", True) or "autobump" not in station_config:
             return False
         ab_config = station_config["autobump"]
         if not isinstance(ab_config, dict):
@@ -40,7 +40,7 @@ class AutoBumpAgent:
 
     @staticmethod
     def do_fill(station_config):
-        if "autobump" not in station_config:
+        if not station_config.get("use_bumpers", True) or "autobump" not in station_config:
             return False
         if "fill_break" not in station_config["autobump"]:
             return False
@@ -50,6 +50,8 @@ class AutoBumpAgent:
 
     @staticmethod
     def fill_block(station_config, duration):
+        if not station_config.get("use_bumpers", True):
+            return None
         if "autobump" in station_config:
             ab_config = station_config["autobump"]
         elif "off_air_autobump" in station_config:
@@ -64,7 +66,7 @@ class AutoBumpAgent:
 
     @staticmethod
     def gen_bumps(station_config):
-        if "autobump" not in station_config:
+        if not station_config.get("use_bumpers", True) or "autobump" not in station_config:
             return {"start_block": None, "end_block": None}
 
         ab_config = station_config["autobump"]

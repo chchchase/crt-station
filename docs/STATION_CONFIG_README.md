@@ -85,8 +85,25 @@ The `network_type` property determines how the station operates:
 | `schedule_offset` | integer | Offset in minutes from start of hour for showtimes | `5` (shows at :05, :35), `15` (shows at :15, :45), etc. |
 | `break_strategy` | string | When to insert commercial breaks | `"standard"` (interspersed), `"end"` (end of program), `"center"` (single break in middle) |
 | `commercial_free` | boolean | Whether channel has commercials | `true`, `false` |
+| `use_bumpers` | boolean | Enable channel-wide bumpers and AutoBump (default `true`) | `true`, `false` |
 | `break_duration` | integer | Duration of commercial breaks in seconds | Any positive integer (default: `120`) |
 | `fallback_tag` | string | Tag/folder used when no content is found for a scheduled slot | A valid tag |
+
+Set `"use_bumpers": false` in `station_conf` to suppress ordinary opening/closing
+bumpers, explicit slot/tag start/end bumper overrides, bumper filler, AutoBump
+break filler (`fill_break`), and off-air AutoBump. No local bumper files are
+required. Programming and commercial selection remain enabled; a
+`commercial_free` channel remains commercial-free and does not substitute
+bumpers for commercials while disabled. Existing ordinary fallback media may
+still fill gaps; off-air slots need ordinary off-air media or fail as before
+when no usable off-air content exists.
+
+This is a channel-wide setting, not a slot override. Only Boolean values are
+accepted. Omission or `true` preserves existing behavior. Ordinary scheduling
+and Director validation use the same setting; Director still rejects any
+selected AutoBump and retains its media-confinement checks. The setting changes
+newly generated plans, not existing stored schedules. Re-enable by restoring
+the original value or removing the setting.
 
 ### Directory Paths
 

@@ -26,6 +26,8 @@ class ConfigProcessor:
 
     @staticmethod
     def preprocess(conf):
+        if "use_bumpers" in conf and type(conf["use_bumpers"]) is not bool:
+            raise ConfigurationError("use_bumpers must be a Boolean")
         # first, fill in templates
         processed = ConfigProcessor._process_templates(conf)
         processed = ConfigProcessor._process_strategy(processed)

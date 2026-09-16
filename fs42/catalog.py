@@ -275,10 +275,11 @@ class ShowCatalog:
         self.clip_index["end_bumps"] = []
 
         # collect start and end bumps first
-        for fp in start_bumps:
+        use_bumpers = self.config.get("use_bumpers", True)
+        for fp in (start_bumps if use_bumpers else ()):
             self.__bump_collector("start_bumps", fp)
 
-        for fp in end_bumps:
+        for fp in (end_bumps if use_bumpers else ()):
             self.__bump_collector("end_bumps", fp)
 
         # now inspect the tags and scan corresponding folders for media
@@ -292,10 +293,10 @@ class ShowCatalog:
         if "commercial_dir" in self.config and self.config["commercial_dir"]:
             total_count += self._scan_directory(self.config["commercial_dir"], content_type="commercial")
         # setup the general bump dir
-        if "bump_dir" in self.config and self.config["bump_dir"]:
+        if use_bumpers and "bump_dir" in self.config and self.config["bump_dir"]:
             total_count += self._scan_directory(self.config["bump_dir"], is_bumps=True, content_type="bump")
 
-        for override_dir in bump_overrides:
+        for override_dir in (bump_overrides if use_bumpers else ()):
             total_count += self._scan_directory(override_dir, is_bumps=True, content_type="bump")
 
         for override_dir in commercial_overrides:
@@ -310,7 +311,7 @@ class ShowCatalog:
         #   ShowA--ShowB--ShowC            = watching ShowA, next ShowB, then ShowC
         #   ShowA--ShowB--ShowC--ShowD     = watching ShowA, next ShowB, then ShowC, then ShowD
         next_dir = f"{self.config['content_dir']}/next"
-        if os.path.isdir(next_dir):
+        if use_bumpers and os.path.isdir(next_dir):
             media_filter = self.config.get("media_filter", "video")
             for subfolder in validation_order(os.listdir(next_dir)):
                 subfolder_path = f"{next_dir}/{subfolder}"
@@ -671,6 +672,7 @@ class ShowCatalog:
     # makes blocks of reels in bump-commercial-commercial-bump format
     def make_reel_block(self, when, bumpers=True, target_duration=120, commercial_dir=None, bump_dir=None,
                         lookahead=None):
+        bumpers = bumpers and self.config.get("use_bumpers", True)
         reels = []
         remaining = target_duration
         start_candidate = None
@@ -715,8 +717,10 @@ class ShowCatalog:
         while remaining > (target_duration * 0.1):
             if not self.config["commercial_free"]:
                 candidate = self.find_commercial(target_duration, when, commercial_dir)
-            else:
+            elif self.config.get("use_bumpers", True):
                 candidate = self.find_bump(target_duration, when, None, bump_dir, lookahead=lookahead)
+            else:
+                break
             remaining -= candidate.duration
             reels.append(candidate)
 
@@ -726,6 +730,7 @@ class ShowCatalog:
 
     def make_reel_fill(self, when, length, use_bumpers=True, commercial_dir=None, bump_dir=None, strict_count=None,
                        lookahead=None):
+        use_bumpers = use_bumpers and self.config.get("use_bumpers", True)
         target_break_duration = self.config["break_duration"]
 
         strategy = self.config.get("break_strategy", None)
@@ -766,7 +771,7 @@ class ShowCatalog:
                         f"Could not find matching content for {remaining} seconds - will attempt to fill with BRB"
                     )
 
-                if block and (remaining - block.duration) > 0:
+                if block and block.duration > 0 and (remaining - block.duration) > 0:
                     remaining -= block.duration
                     blocks.append(block)
 
@@ -790,7 +795,7 @@ class ShowCatalog:
                 try:
                     if not self.config["commercial_free"]:
                         candidate = self.find_commercial(seconds=remaining, when=when, commercial_dir=commercial_dir)
-                    else:
+                    elif self.config.get("use_bumpers", True):
                         candidate = self.find_bump(remaining, when, "fill", bump_tag=bump_dir)
                 except MatchingContentNotFound:
                     if remaining > self.min_gap:

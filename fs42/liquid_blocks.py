@@ -106,6 +106,9 @@ class LiquidBlock:
 
     def make_plan(self, catalog):
         # first, collect any reels (commercials and bumps) we might need to buffer to the requested duration
+        use_bumpers = catalog.config.get("use_bumpers", True)
+        if not use_bumpers:
+            self.start_bump = self.end_bump = None
         diff = self.playback_duration() - self.content_duration()
 
         _fluid = FluidBuilder()
@@ -169,6 +172,7 @@ class LiquidBlock:
             self.reel_blocks = catalog.make_reel_fill(
                 self.start_time,
                 diff,
+                use_bumpers=use_bumpers,
                 commercial_dir=self.commercial_override,
                 bump_dir=self.bump_override,
                 strict_count=strict_count,
@@ -227,6 +231,9 @@ class LiquidClipBlock(LiquidBlock):
 
     def make_plan(self, catalog):
         self.plan = []
+        use_bumpers = catalog.config.get("use_bumpers", True)
+        if not use_bumpers:
+            self.start_bump = self.end_bump = None
         # first, collect any reels (commercials and bumps) we might need to buffer to the requested duration
         diff = self.playback_duration() - self.content_duration()
 
@@ -255,6 +262,7 @@ class LiquidClipBlock(LiquidBlock):
         if diff > 2:
             self.reel_blocks = catalog.make_reel_fill(
                 self.start_time, diff, commercial_dir=self.commercial_override, bump_dir=self.bump_override,
+                use_bumpers=use_bumpers,
                 strict_count=strict_count,
                 lookahead=self.lookahead,
             )

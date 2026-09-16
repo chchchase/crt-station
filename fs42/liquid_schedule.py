@@ -196,9 +196,10 @@ class LiquidSchedule:
 
         #first - extract slot level overrides
         # does this slot have a start bump?
-        if "start_bump" in slot_config and first_in_slot:
+        use_bumpers = self.conf.get("use_bumpers", True)
+        if use_bumpers and "start_bump" in slot_config and first_in_slot:
             break_info["start_bump"] = self.catalog.get_start_bump(slot_config["start_bump"])
-        if "end_bump" in slot_config:
+        if use_bumpers and "end_bump" in slot_config:
             break_info["end_bump"] = self.catalog.get_end_bump(slot_config["end_bump"])
 
         break_info["bump_dir"] = slot_config.get("bump_dir", self.conf.get("bump_dir", None))
@@ -218,9 +219,9 @@ class LiquidSchedule:
                 override = self.conf["tag_overrides"][tag_str]
 
             if override:
-                if "start_bump" in override:
+                if use_bumpers and "start_bump" in override:
                     break_info["start_bump"] = self.catalog.get_start_bump(override["start_bump"])
-                if "end_bump" in override:
+                if use_bumpers and "end_bump" in override:
                     break_info["end_bump"] = self.catalog.get_end_bump(override["end_bump"])            
                 break_info["bump_dir"] = override.get("bump_dir", break_info["bump_dir"])
                 break_info["commercial_dir"] = override.get("commercial_dir", break_info["commercial_dir"])
@@ -442,7 +443,7 @@ class LiquidSchedule:
                 # we are offair, so set onair off
                 onair_flag = False
                 
-                if candidate is None and "off_air_autobump" in self.conf:
+                if candidate is None and self.conf.get("use_bumpers", True) and "off_air_autobump" in self.conf:
                         candidate = AutoBumpAgent.fill_block(self.conf, timings.HOUR)
                 if candidate is None:
                     self._l.error(f"Schedule logic error: no time slots configured for {current_mark}")
