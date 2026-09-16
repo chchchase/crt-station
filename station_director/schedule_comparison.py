@@ -18,13 +18,13 @@ from station_director.schedule_normalization import (
     NormalizationError,
     canonical_catalog_semantics,
     canonical_typed_value_bytes,
+    _block_playback,
+    _catalog_descriptor,
     _check_hidden_references,
     _columns,
-    _logical_path,
     _parse_json,
     _quote,
 )
-from station_director.staged_schedule import parse_catalog_references, validate_plan_json
 
 _canonical = canonical_typed_value_bytes
 _catalog_semantics = canonical_catalog_semantics
@@ -200,6 +200,8 @@ def _catalog_tokens(spool, connection, side):
                     raise ScheduleComparisonError("historical catalog semantics changed")
                 token = f"historical:{catalog_id}"
             else:
+                if _catalog_descriptor(dict(zip(columns, row))):
+                    raise ScheduleComparisonError("new AutoBump catalog descriptor is unsupported")
                 token = "provisional:" + hashlib.sha256(
                     b"FS42-C3A2-CATALOG\0" + semantic
                 ).hexdigest()
@@ -218,8 +220,10 @@ def _catalog_tokens(spool, connection, side):
     return logical
 
 
-def _block_semantics(connection, columns, row, spool, side):
+def _block_semantics(connection, columns, row, spool, side, *, allow_descriptors=False):
     values = {}
+    references, plan, unused_descriptor = _block_playback(
+        dict(zip(columns, row)), allow_descriptors=allow_descriptors)
     for name, value in zip(columns, row):
         if isinstance(value, str) and len(value.encode("utf-8")) > MAX_RECORD_BYTES:
             raise ScheduleComparisonError(f"oversized liquid_blocks.{name}")
@@ -230,7 +234,6 @@ def _block_semantics(connection, columns, row, spool, side):
             # by the complete remaining typed block and catalog semantics.
             continue
         if name == "content_json":
-            references = parse_catalog_references(value)
             resolved = []
             for catalog_id in references:
                 found = spool.execute(
@@ -239,14 +242,20 @@ def _block_semantics(connection, columns, row, spool, side):
                 ).fetchone()
                 if found is None:
                     raise ScheduleComparisonError("unresolved catalog reference")
+                if not allow_descriptors:
+                    catalog_columns = ("path", "realpath", "tag", "duration", "content_type", "media_type")
+                    entry = connection.execute(
+                        "SELECT path,realpath,tag,duration,content_type,media_type FROM catalog_entries WHERE id=?",
+                        (catalog_id,),
+                    ).fetchone()
+                    if entry is None or _catalog_descriptor(dict(zip(catalog_columns, entry))):
+                        raise ScheduleComparisonError("generated AutoBump is unsupported")
                 token, semantic = found[0], bytes(found[1])
                 resolved.append({"token": token, "semantics": json.loads(semantic)})
-            value = resolved if value.lstrip().startswith("[") else resolved[0]
+            value = (None if not references else
+                     resolved if value.lstrip().startswith("[") else resolved[0])
         elif name == "plan_json":
-            value = validate_plan_json(value)
-            for item in value:
-                item["path"] = _logical_path(item["path"], "playback plan path")
-                _check_hidden_references(item, "liquid_blocks.plan_json")
+            value = plan
         elif name in ("break_info", "sequence_key") and value not in (None, ""):
             value = _parse_json(value, f"liquid_blocks.{name}", allow_empty=True)
             _check_hidden_references(value, f"liquid_blocks.{name}")
@@ -276,7 +285,8 @@ def _load_side(spool, source, side, channel_name, seam_us, horizon_us):
             raise ScheduleComparisonError("schedule block has non-positive duration")
         if start >= horizon_us or end <= seam_us:
             continue
-        semantic = _block_semantics(source, columns, row, spool, side)
+        semantic = _block_semantics(source, columns, row, spool, side,
+                                    allow_descriptors=side == 0 or start < seam_us)
         interval = _canonical([start, end])
         record_size = len(semantic) + len(interval) + 32
         if logical + record_size > MAX_COMPARISON_SPOOL_BYTES:

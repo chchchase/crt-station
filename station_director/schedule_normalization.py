@@ -234,6 +234,77 @@ def _logical_path(value, label):
         raise NormalizationError(str(exc)) from exc
 
 
+def _descriptor_digest(value):
+    # Preserve the exact opaque bytes without publishing descriptor bodies in
+    # comparison records/previews. This namespace cannot be a media identity.
+    if not isinstance(value, str) or len(value.encode("utf-8")) > MAX_RECORD_BYTES:
+        raise NormalizationError("descriptor exceeds normalization limit")
+    return "autobump-sha256:" + hashlib.sha256(
+        b"FS42-RETAINED-AUTOBUMP\0" + _canonical(value)).hexdigest()
+
+
+def _catalog_descriptor(values):
+    # Pure classification only, loaded on use: no native runtime/player imports.
+    from fs42 import autobump_descriptor as descriptor
+    classification = descriptor.classify_catalog_entry(values)
+    if classification == descriptor.DESCRIPTOR_INVALID:
+        raise NormalizationError("invalid catalog descriptor")
+    return classification == descriptor.DESCRIPTOR_SELECTED
+
+
+def _catalog_path(values, name):
+    if _catalog_descriptor(values):
+        return _descriptor_digest(values[name]) if values[name] is not None else None
+    return _logical_path(values[name], f"catalog_entries.{name}")
+
+
+def _block_playback(values, *, allow_descriptors):
+    """Share exact reference/plan interpretation with C3 comparison."""
+    from fs42 import autobump_descriptor as descriptor
+    content = _parse_json(values["content_json"], "liquid_blocks.content_json")
+    _parse_json(values["plan_json"], "liquid_blocks.plan_json")
+    plan = validate_plan_json(values["plan_json"])
+    has_descriptor = False
+    for entry in plan:
+        classification = descriptor.classify_plan_entry(
+            entry, liquid_type=values["liquid_type"], plan_size=len(plan),
+            content_missing=content is None,
+        )
+        if classification == descriptor.DESCRIPTOR_INVALID:
+            raise NormalizationError("invalid playback descriptor")
+        if classification == descriptor.DESCRIPTOR_SELECTED:
+            if not allow_descriptors:
+                raise NormalizationError("generated AutoBump is unsupported")
+            has_descriptor = True
+            entry["path"] = _descriptor_digest(entry["path"])
+        else:
+            entry["path"] = _logical_path(entry["path"], "playback plan path")
+        _check_hidden_references(entry, "liquid_blocks.plan_json")
+    if content is None:
+        if (not allow_descriptors or values["liquid_type"] != "LiquidWebBlock"
+                or len(plan) != 1 or not has_descriptor
+                or plan[0]["content_type"] != "feature"):
+            raise NormalizationError("unsupported null catalog reference")
+        references = ()
+    else:
+        references = parse_catalog_references(values["content_json"])
+    return references, plan, has_descriptor
+
+
+def _generated_block(values, seams):
+    return values["station"] in seams and values["start_time"] >= seams[values["station"]]
+
+
+def _require_retained_descriptor_block(baseline, columns, row, seams):
+    values = dict(zip(columns, row))
+    if _generated_block(values, seams):
+        raise NormalizationError("generated AutoBump is unsupported")
+    selected = ",".join(_quote(name) for name in columns)
+    old = baseline.execute(f"SELECT {selected} FROM liquid_blocks WHERE id=?", (values["id"],)).fetchone()
+    if old is None or _canonical(list(old)) != _canonical(list(row)):
+        raise NormalizationError("descriptor block is not exact retained history")
+
+
 def _metadata_for_path(connection, path):
     result = {}
     for table in ("file_meta", "break_points", "chapter_points"):
@@ -265,7 +336,7 @@ def _catalog_semantics(connection, columns, row):
     path = values.get("realpath") or values.get("path")
     for name in ("path", "realpath"):
         if values.get(name) is not None:
-            values[name] = _logical_path(values[name], f"catalog_entries.{name}")
+            values[name] = _catalog_path(dict(zip(columns, row)), name)
     hints = values.get("hints")
     if hints not in (None, ""):
         parsed = _parse_json(hints, "catalog_entries.hints")
@@ -286,7 +357,7 @@ def _catalog_semantics(connection, columns, row):
 def _catalog_core(values):
     return (
         values.get("station"), values.get("tag"),
-        _logical_path(values.get("realpath") or values.get("path"), "catalog identity"),
+        _catalog_path(values, "realpath" if values.get("realpath") else "path"),
     )
 
 
@@ -542,6 +613,7 @@ class NormalizedRun:
 def normalize_completed_run(stage, baseline_database, response, proposal_boundary):
     """Normalize without writing to either application database."""
     stage = Path(stage)
+    seams = {channel["name"]: channel["regeneration_start"] for channel in response["channels"]}
     database = stage / "work/runtime/fs42_fluid.db"
     directory, stream_path, descriptor, index = _create_artifacts(stage)
     try:
@@ -613,10 +685,12 @@ def normalize_completed_run(stage, baseline_database, response, proposal_boundar
                 "SELECT seq FROM sqlite_sequence WHERE name='catalog_entries'"
             ))
             allocation_floor = max(allocation_values)
-            for raw, in baseline.execute(
-                "SELECT content_json FROM liquid_blocks WHERE start_time<?", (proposal_boundary,)
+            for liquid_type, raw, plan in baseline.execute(
+                "SELECT liquid_type,content_json,plan_json FROM liquid_blocks WHERE start_time<?", (proposal_boundary,)
             ):
-                for catalog_id in parse_catalog_references(raw):
+                references, unused_plan, unused_descriptor = _block_playback(
+                    {"liquid_type": liquid_type, "content_json": raw, "plan_json": plan}, allow_descriptors=True)
+                for catalog_id in references:
                     if index.execute(
                         "UPDATE baseline_catalog SET protected=1 WHERE id=?", (catalog_id,)
                     ).rowcount != 1:
@@ -649,6 +723,8 @@ def normalize_completed_run(stage, baseline_database, response, proposal_boundar
                         )
                     token = f"historical:{catalog_id}"
                 else:
+                    if _catalog_descriptor(values):
+                        raise NormalizationError("new AutoBump catalog descriptor is unsupported")
                     if isinstance(catalog_id, bool) or not isinstance(catalog_id, int) or catalog_id <= allocation_floor:
                         raise NormalizationError(f"invalid provisional catalog ID: {catalog_id!r}")
                     token = "provisional:" + hashlib.sha256(semantic_bytes).hexdigest()
@@ -697,23 +773,28 @@ def normalize_completed_run(stage, baseline_database, response, proposal_boundar
                 location = _reference_location(
                     liquid_columns, liquid_row, liquid_primary
                 )
-                raw_content = liquid_row[liquid_columns.index("content_json")]
-                for ordinal, reference in enumerate(parse_catalog_references(raw_content)):
+                block_values = dict(zip(liquid_columns, liquid_row))
+                references, unused_plan, has_descriptor = _block_playback(
+                    block_values, allow_descriptors=not _generated_block(block_values, seams))
+                for ordinal, reference in enumerate(references):
                     ledger_count += 1
                     if ledger_count > MAX_REFERENCE_LEDGER_ROWS:
                         raise NormalizationError("catalog reference ledger limit exceeded")
                     found = index.execute(
-                        "SELECT token FROM catalog_map WHERE id=?", (reference,)
+                        "SELECT token,logical_path FROM catalog_map WHERE id=?", (reference,)
                     ).fetchone()
                     if found is None:
                         raise NormalizationError(
                             f"unresolved catalog reference {reference} in liquid_blocks"
                         )
+                    has_descriptor |= found[1].startswith("autobump-sha256:")
                     index.execute(
                         "INSERT INTO reference_ledger(location,ordinal,original_id,expected_token) "
                         "VALUES(?,?,?,?)",
                         (location, ordinal, reference, found[0]),
                     )
+                if has_descriptor:
+                    _require_retained_descriptor_block(baseline, liquid_columns, liquid_row, seams)
             index.commit()
 
             for table in tables:
@@ -728,6 +809,8 @@ def normalize_completed_run(stage, baseline_database, response, proposal_boundar
                         raise NormalizationError(f"row-count limit exceeded for {table}")
                     values = {}
                     row_dict = dict(zip(columns, row))
+                    playback = (_block_playback(row_dict, allow_descriptors=not _generated_block(row_dict, seams))
+                                if table == "liquid_blocks" else None)
                     reference_location = (
                         _reference_location(columns, row, primary)
                         if table == "liquid_blocks" else None
@@ -738,7 +821,10 @@ def normalize_completed_run(stage, baseline_database, response, proposal_boundar
                                 "SELECT token FROM catalog_map WHERE id=?", (value,)
                             ).fetchone()[0]
                         elif table == "liquid_blocks" and name == "content_json":
-                            references = parse_catalog_references(value)
+                            references = playback[0]
+                            if not references and _parse_json(value, "liquid_blocks.content_json") is None:
+                                values[name] = None
+                                continue
                             tokens = []
                             for ordinal, reference in enumerate(references):
                                 found = index.execute(
@@ -764,15 +850,13 @@ def normalize_completed_run(stage, baseline_database, response, proposal_boundar
                                 )
                             value = tokens if value.lstrip().startswith("[") else tokens[0]
                         elif table == "liquid_blocks" and name == "plan_json":
-                            value = validate_plan_json(value)
-                            for entry in value:
-                                entry["path"] = _logical_path(entry["path"], "playback plan path")
-                                _check_hidden_references(entry, "liquid_blocks.plan_json")
+                            value = playback[1]
                         elif (table, name) in JSON_COLUMNS and value not in (None, ""):
                             value = _parse_json(value, f"{table}.{name}", allow_empty=True)
                             _check_hidden_references(value, f"{table}.{name}")
                         elif table in ("catalog_entries", "file_meta", "break_points", "chapter_points") and name in ("path", "realpath") and value is not None:
-                            value = _logical_path(value, f"{table}.{name}")
+                            value = (_catalog_path(row_dict, name) if table == "catalog_entries"
+                                     else _logical_path(value, f"{table}.{name}"))
                         values[name] = value
                     encoded = _canonical(values)
                     if primary:

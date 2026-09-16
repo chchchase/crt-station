@@ -416,6 +416,30 @@ class ScheduleComparisonTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_baseline_descriptor_difference_is_reported_without_opaque_body(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline, proposed, unused = fixture(root, [
+                ("2026-09-14 01:00:00", "2026-09-14 02:00:00", "Synthetic", "/media/a.mp4")])
+            connection = sqlite3.connect(baseline)
+            try:
+                plan = json.loads(connection.execute("SELECT plan_json FROM liquid_blocks").fetchone()[0])
+                plan.append({"path": ":autobump:=opaque-synthetic-body", "skip": 0, "duration": 7,
+                             "is_stream": False, "content_type": "bump", "media_type": "video"})
+                connection.execute("UPDATE liquid_blocks SET plan_json=?", (json.dumps(plan),))
+                connection.commit()
+            finally:
+                connection.close()
+            summary = compare(root, baseline, proposed)
+            self.assertGreater(summary["resulting_schedule_changes"]["playback_plan_changes"], 0)
+            report = build_validation_report(PROPOSAL, success_c2(summary), self.run_id, "2026-09-13T12:00:00Z")
+            publish_validation_report(report)
+            parent = self.root / PROPOSAL["proposal_id"] / self.run_id
+            for path in (parent / "validation.json", parent / "validation.txt"):
+                raw = path.read_bytes()
+                self.assertIn(b"playback_plan_changes" if path.suffix == ".json" else b"replaced=1", raw)
+                self.assertNotIn(b"opaque-synthetic-body", raw)
+
     def test_preservation_detail_publication_text_and_retained_v5(self):
         detail = {"helper": "_validate_playback_representations", "category": "media_validation_failed", "content_scope": "retained"}
         result = _base_result("comparison")

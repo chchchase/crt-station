@@ -1481,6 +1481,237 @@ class SharedSnapshotTests(unittest.TestCase):
                 connection.close()
 
 
+class RetainedDescriptorNormalizationTests(unittest.TestCase):
+    """Direct helpers only: no worker, scheduler, media probe, or live paths."""
+
+    def setUp(self):
+        from fs42.chapter_analysis import classify_attestation, encode_trusted_duration
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.media = self.root / "media"
+        self.media.mkdir()
+        media = self.media / "a.mp4"
+        media.write_bytes(b"synthetic-placeholder")
+        info = media.stat()
+        self.stage = self.root / "stage"
+        (self.stage / "work/runtime").mkdir(parents=True)
+        self.database = self.stage / "work/runtime/fs42_fluid.db"
+        self.baseline = self.root / "baseline.db"
+        self.connection = create_database(self.database)
+        self.addCleanup(self.connection.close)
+        insert_catalog(self.connection, 1, "/media/a.mp4")
+        insert_block(self.connection, "Action", "2026-09-13 22:00:00", "2026-09-13 23:00:00", 1, "/media/a.mp4")
+        insert_block(self.connection, "Action", "2026-09-14 00:00:00", "2026-09-14 01:00:00", 1, "/media/a.mp4")
+        envelope = {"attestation_version": 2, "method": "ffprobe_show_chapters_v1",
+                    "outcome": "unusable_chapters", "reason": "final_endpoint_exceeds_cached_duration",
+                    "trusted_duration": encode_trusted_duration(10.0),
+                    "media_identity": {"size": info.st_size, "mtime_ns": info.st_mtime_ns}}
+        self.assertEqual(classify_attestation(envelope, 10.0, info.st_size, info.st_mtime_ns), ("trusted_negative_v2", ()))
+        self.connection.execute("INSERT INTO file_meta(path,duration,size) VALUES(?,?,?)", ("/media/a.mp4", 10.0, info.st_size))
+        self.connection.execute("INSERT INTO chapter_points(path,points) VALUES(?,?)", ("/media/a.mp4", json.dumps(envelope)))
+        self.connection.commit()
+        self.response = response("a")
+        self.response["schema_version"] = 4
+        self.response["channels"][0].update(retained_blocks=1, generated_blocks=1, final_blocks=2)
+        from station_director.single_run_protocol import RESPONSE_SCHEMA_V4, validate_document, validate_response_semantics
+        validate_document(self.response, RESPONSE_SCHEMA_V4)
+        validate_response_semantics(self.response)
+        write_test_guide(self.stage)
+
+    def add_descriptor(self, kind, suffix="synthetic-one"):
+        from fs42.autobump_descriptor import AUTOBUMP_PATH_PREFIX, AUTOBUMP_CATALOG_TAG
+        path = AUTOBUMP_PATH_PREFIX + suffix
+        plan = [{"path": path, "skip": 0, "duration": 7, "is_stream": False,
+                 "content_type": "bump" if kind == "plan" else "feature", "media_type": "video"}]
+        if kind == "catalog":
+            insert_catalog(self.connection, 2, path, tag=AUTOBUMP_CATALOG_TAG, realpath=None)
+            self.connection.execute("UPDATE liquid_blocks SET content_json=? WHERE id=1", ("2",))
+        elif kind == "web":
+            self.connection.execute("UPDATE liquid_blocks SET liquid_type='LiquidWebBlock',content_json='null' WHERE id=1")
+        self.connection.execute("UPDATE liquid_blocks SET plan_json=? WHERE id=1", (json.dumps(plan if kind != "catalog" else []),))
+        self.connection.commit()
+
+    def accept_playback(self, *, first_generated=False):
+        from fs42 import autobump_descriptor as descriptor
+        from station_director.native_single_run import _validate_playback_representations
+        from station_director.staged_schedule import _playback_representations
+        for generated, predicate in ((first_generated, "id=1"), (True, "id=2")):
+            rows = self.connection.execute("SELECT id,liquid_type,content_json,plan_json FROM liquid_blocks WHERE " + predicate)
+            _validate_playback_representations(descriptor, _playback_representations(self.connection, rows),
+                                               "Action", generated=generated, media_root=self.media)
+
+    def snapshot(self, target):
+        baseline = sqlite3.connect(target)
+        try:
+            self.connection.backup(baseline)
+        finally:
+            baseline.close()
+
+    def accept_and_normalize(self):
+        self.accept_playback()
+        self.snapshot(self.baseline)
+        return normalize_completed_run(self.stage, self.baseline, self.response, "2026-09-14 00:00:00")
+
+    def normalize_variant(self, name):
+        stage = self.root / name
+        (stage / "work/runtime").mkdir(parents=True)
+        self.snapshot(stage / "work/runtime/fs42_fluid.db")
+        self.snapshot(stage / "baseline.db")
+        write_test_guide(stage)
+        self.accept_playback()
+        return normalize_completed_run(stage, stage / "baseline.db", self.response, "2026-09-14 00:00:00")
+
+    def check_descriptor_differences(self, kind):
+        self.add_descriptor(kind)
+        first = self.accept_and_normalize()
+        identical = self.normalize_variant("identical")
+        self.assertTrue(compare_normalized_runs(first, identical)["passed"])
+        self.connection.execute("UPDATE liquid_blocks SET plan_json=replace(plan_json, 'synthetic-one', 'synthetic-two') WHERE id=1")
+        self.connection.execute("UPDATE catalog_entries SET path=replace(path, 'synthetic-one', 'synthetic-two') WHERE id=2")
+        self.connection.commit()
+        changed = self.normalize_variant("changed")
+        comparison = compare_normalized_runs(first, changed)
+        self.assertFalse(comparison["passed"])
+        for raw in (first.stream_path.read_bytes(), changed.stream_path.read_bytes(), json.dumps(comparison).encode()):
+            self.assertNotIn(b"synthetic-one", raw)
+            self.assertNotIn(b"synthetic-two", raw)
+
+    def test_plan_descriptor_differences_remain_visible_without_body_disclosure(self):
+        self.check_descriptor_differences("plan")
+
+    def test_catalog_descriptor_differences_remain_visible_without_body_disclosure(self):
+        self.check_descriptor_differences("catalog")
+
+    def test_web_descriptor_differences_remain_visible_without_body_disclosure(self):
+        self.check_descriptor_differences("web")
+
+    def check_generated_rejection(self, kind):
+        self.add_descriptor(kind)
+        self.snapshot(self.baseline)
+        self.connection.execute("UPDATE liquid_blocks SET start_time='2026-09-14 00:00:00',end_time='2026-09-14 01:00:00' WHERE id=1")
+        self.connection.commit()
+        with self.assertRaises(Exception) as caught:
+            self.accept_playback(first_generated=True)
+        self.assertEqual(caught.exception.code, "autobump_selected")
+        with self.assertRaisesRegex(NormalizationError, "generated AutoBump"):
+            normalize_completed_run(self.stage, self.baseline, self.response, "2026-09-14 00:00:00")
+        self.assertFalse((self.stage / "normalization").exists())
+        from station_director.schedule_comparison import compare_baseline_to_proposed, ScheduleComparisonError
+        with self.assertRaisesRegex(ScheduleComparisonError, "generated AutoBump"):
+            compare_baseline_to_proposed(self.stage, self.baseline, self.database,
+                                        self.response["channels"], "2026-09-14 00:00:00", {})
+        self.assertFalse((self.stage / "schedule-comparison").exists())
+
+    def test_generated_plan_rejected(self):
+        self.check_generated_rejection("plan")
+
+    def test_generated_catalog_rejected(self):
+        self.check_generated_rejection("catalog")
+
+    def test_generated_web_rejected(self):
+        self.check_generated_rejection("web")
+
+    def test_retained_descriptor_cannot_be_changed_or_invented(self):
+        self.snapshot(self.baseline)
+        self.add_descriptor("plan")
+        with self.assertRaisesRegex(NormalizationError, "exact retained history"):
+            normalize_completed_run(self.stage, self.baseline, self.response, "2026-09-14 00:00:00")
+
+    def test_malformed_catalog_rejected(self):
+        self.add_descriptor("catalog")
+        self.connection.execute("UPDATE catalog_entries SET realpath=path WHERE id=2")
+        self.connection.commit()
+        with self.assertRaises(Exception):
+            self.accept_playback()
+        self.snapshot(self.baseline)
+        with self.assertRaisesRegex(NormalizationError, "invalid catalog descriptor"):
+            normalize_completed_run(self.stage, self.baseline, self.response, "2026-09-14 00:00:00")
+
+    def test_malformed_plans_null_references_and_outside_media_remain_rejected(self):
+        self.add_descriptor("web")
+        original = self.connection.execute("SELECT plan_json FROM liquid_blocks WHERE id=1").fetchone()[0]
+        for kind in ("empty_suffix", "stream", "wrong_block", "empty_plan", "empty_refs", "boolean_refs", "outside_media"):
+            with self.subTest(kind=kind):
+                plan = json.loads(original)
+                liquid_type, content = "LiquidWebBlock", "null"
+                if kind == "empty_suffix":
+                    plan[0]["path"] = ":autobump:="
+                elif kind == "stream":
+                    plan[0]["is_stream"] = True
+                elif kind == "wrong_block":
+                    liquid_type = "LiquidBlock"
+                elif kind == "empty_plan":
+                    plan = []
+                elif kind == "empty_refs":
+                    content = "[]"
+                elif kind == "boolean_refs":
+                    content = "true"
+                else:
+                    plan[0]["path"], content, liquid_type = "/outside/media", "1", "LiquidBlock"
+                self.connection.execute("UPDATE liquid_blocks SET liquid_type=?,content_json=?,plan_json=? WHERE id=1",
+                                        (liquid_type, content, json.dumps(plan)))
+                self.connection.commit()
+                self.snapshot(self.baseline)
+                if kind != "empty_plan":
+                    with self.assertRaises(Exception):
+                        self.accept_playback()
+                with self.assertRaises(Exception):
+                    normalize_completed_run(self.stage, self.baseline, self.response, "2026-09-14 00:00:00")
+                self.assertFalse((self.stage / "normalization").exists())
+
+    def test_descriptor_bound_and_typed_duration_differences(self):
+        from station_director.schedule_normalization import _descriptor_digest, MAX_RECORD_BYTES
+        with self.assertRaisesRegex(NormalizationError, "descriptor exceeds"):
+            _descriptor_digest(":autobump:=" + "a" * MAX_RECORD_BYTES)
+        self.add_descriptor("plan")
+        first = self.accept_and_normalize()
+        plan = json.loads(self.connection.execute("SELECT plan_json FROM liquid_blocks WHERE id=1").fetchone()[0])
+        plan[0]["duration"] = 7.0
+        self.connection.execute("UPDATE liquid_blocks SET plan_json=? WHERE id=1", (json.dumps(plan),))
+        self.connection.commit()
+        changed = self.normalize_variant("typed-change")
+        self.assertFalse(compare_normalized_runs(first, changed)["passed"])
+
+    def test_ordinary_media_and_negative_attestation(self):
+        self.assertGreater(self.accept_and_normalize().record_count, 0)
+
+    def test_retained_plan_descriptor(self):
+        self.add_descriptor("plan")
+        self.assertGreater(self.accept_and_normalize().record_count, 0)
+
+    def test_retained_catalog_descriptor(self):
+        self.add_descriptor("catalog")
+        self.assertGreater(self.accept_and_normalize().record_count, 0)
+
+    def test_exact_retained_web_null_content(self):
+        self.add_descriptor("web")
+        self.assertGreater(self.accept_and_normalize().record_count, 0)
+
+    def compare_baseline_descriptor(self, kind):
+        from station_director.schedule_comparison import compare_baseline_to_proposed
+        self.add_descriptor(kind)
+        self.accept_and_normalize()
+        baseline = sqlite3.connect(self.baseline)
+        try:
+            shape = baseline.execute("SELECT liquid_type,content_json,plan_json FROM liquid_blocks WHERE id=1").fetchone()
+            baseline.execute("UPDATE liquid_blocks SET liquid_type=?,content_json=?,plan_json=? WHERE id=2", shape)
+            baseline.commit()
+        finally:
+            baseline.close()
+        return compare_baseline_to_proposed(self.stage, self.baseline, self.database,
+                                           self.response["channels"], "2026-09-14 00:00:00", {})
+
+    def test_comparison_baseline_plan_descriptor(self):
+        self.assertTrue(self.compare_baseline_descriptor("plan")["channels"])
+
+    def test_comparison_baseline_catalog_descriptor(self):
+        self.assertTrue(self.compare_baseline_descriptor("catalog")["channels"])
+
+    def test_comparison_baseline_web_null_content(self):
+        self.assertTrue(self.compare_baseline_descriptor("web")["channels"])
+
+
 class NormalizationTests(unittest.TestCase):
     def test_sqlite_sequence_is_exact_and_exposes_allocation_history(self):
         with tempfile.TemporaryDirectory() as directory:
