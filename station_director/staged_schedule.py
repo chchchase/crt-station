@@ -5,6 +5,9 @@ from datetime import datetime
 
 from station_director.path_safety import canonical_media_mapping, validate_scheduled_media
 from station_director.preservation import canonical_sqlite_value, inspect_database_schema
+from station_director.c1_diagnostics import (
+    attach_preservation_detail, preservation_check, preservation_step,
+)
 
 
 REQUIRED_COLUMNS = {
@@ -134,29 +137,32 @@ def validate_all_catalog_reference_shapes(connection):
 
 def _playback_representations(connection, rows):
     for block_id, liquid_type, content_json, plan_json in rows:
-        plan = validate_plan_json(plan_json)
-        references, content_missing = _playback_catalog_references(
-            content_json, liquid_type
-        )
+        with preservation_step("_playback_representations", "plan_invalid"):
+            plan = validate_plan_json(plan_json)
+        with preservation_step("_playback_representations", "reference_failure"):
+            references, content_missing = _playback_catalog_references(
+                content_json, liquid_type
+            )
         catalog = []
         if references:
             placeholders = ",".join("?" for unused in references)
-            catalog = [
-                {
-                    "id": row[0], "path": row[1], "realpath": row[2],
-                    "tag": row[3], "duration": row[4],
-                    "content_type": row[5], "media_type": row[6],
-                }
-                for row in connection.execute(
-                    "SELECT id,path,realpath,tag,duration,content_type,media_type "
-                    f"FROM catalog_entries WHERE id IN ({placeholders}) ORDER BY id",
-                    references,
-                )
-            ]
-            if len({entry["id"] for entry in catalog}) != len(set(references)):
-                raise StagedScheduleError(
-                    f"block {block_id} has unresolved catalog references"
-                )
+            with preservation_step("_playback_representations", "reference_failure"):
+                catalog = [
+                    {
+                        "id": row[0], "path": row[1], "realpath": row[2],
+                        "tag": row[3], "duration": row[4],
+                        "content_type": row[5], "media_type": row[6],
+                    }
+                    for row in connection.execute(
+                        "SELECT id,path,realpath,tag,duration,content_type,media_type "
+                        f"FROM catalog_entries WHERE id IN ({placeholders}) ORDER BY id",
+                        references,
+                    )
+                ]
+                if len({entry["id"] for entry in catalog}) != len(set(references)):
+                    raise attach_preservation_detail(StagedScheduleError(
+                        f"block {block_id} has unresolved catalog references"
+                    ), "_playback_representations", "reference_failure")
         yield {
             "block_id": block_id,
             "liquid_type": liquid_type,
@@ -347,26 +353,30 @@ def capture_protected_state(connection, affected_channels, protected_channels=()
     return state
 
 
-def assert_protected_state(connection, state):
-    def typed_rows(rows):
-        return tuple(
-            tuple(canonical_sqlite_value(value) for value in row) for row in rows
-        )
+def assert_protected_state(connection, state, *, sequence_verification=False):
+    helper = "_restore_sequences" if sequence_verification else "assert_protected_state"
+    category = "verification_failed" if sequence_verification else "check_failed"
+    with preservation_step(helper, category):
+        def typed_rows(rows):
+            return tuple(
+                tuple(canonical_sqlite_value(value) for value in row) for row in rows
+            )
 
-    failures = []
-    for table, snapshot in state.items():
-        columns = snapshot["columns"]
-        expected_rows = snapshot["rows"]
-        actual_columns, actual_rows = _rows(
-            connection,
-            table,
-            snapshot["where"],
-            snapshot["parameters"],
-        )
-        if actual_columns != columns or typed_rows(actual_rows) != typed_rows(expected_rows):
-            failures.append(f"protected {table} rows changed")
-    if failures:
-        raise StagedScheduleError("; ".join(failures))
+        failures = []
+        for table, snapshot in state.items():
+            columns = snapshot["columns"]
+            expected_rows = snapshot["rows"]
+            actual_columns, actual_rows = _rows(
+                connection,
+                table,
+                snapshot["where"],
+                snapshot["parameters"],
+            )
+            if actual_columns != columns or typed_rows(actual_rows) != typed_rows(expected_rows):
+                failures.append(f"protected {table} rows changed")
+        if failures:
+            raise attach_preservation_detail(StagedScheduleError("; ".join(failures)),
+                                             helper, category if sequence_verification else "mismatch")
 
 
 def restore_sequence_state(connection, state):
@@ -374,11 +384,15 @@ def restore_sequence_state(connection, state):
     tables = ("sequence_entries", "sequence_group_state", "named_sequence")
     expected = {"named_sequence", "sequence_entries", "sequence_group_state"}
     if not expected.issubset(state):
-        raise StagedScheduleError("sequence snapshot is incomplete")
+        raise attach_preservation_detail(StagedScheduleError("sequence snapshot is incomplete"),
+                                         "restore_sequence_state", "schema_mismatch")
     for table in tables:
-        if _columns(connection, table) != state[table]["columns"]:
-            raise StagedScheduleError(f"sequence schema changed for {table}")
-        connection.execute(f"DELETE FROM {_quote(table)}")
+        with preservation_step("restore_sequence_state", "schema_check_failed"):
+            if _columns(connection, table) != state[table]["columns"]:
+                raise attach_preservation_detail(StagedScheduleError(f"sequence schema changed for {table}"),
+                                                 "restore_sequence_state", "schema_mismatch")
+        with preservation_step("restore_sequence_state", "delete_failed"):
+            connection.execute(f"DELETE FROM {_quote(table)}")
     for table in ("named_sequence", "sequence_entries", "sequence_group_state"):
         columns = state[table]["columns"]
         sql = (
@@ -386,9 +400,11 @@ def restore_sequence_state(connection, state):
             f"VALUES ({','.join('?' for unused in columns)})"
         )
         for row in state[table]["rows"]:
-            connection.execute(sql, row)
+            with preservation_step("restore_sequence_state", "insert_failed"):
+                connection.execute(sql, row)
 
 
+@preservation_check("assert_retained_history", "schedule_check_failed")
 def assert_retained_history(connection, history):
     columns, rows = _rows(
         connection,
@@ -397,32 +413,34 @@ def assert_retained_history(connection, history):
         (history.channel, history.proposal_boundary),
     )
     if columns != _columns(connection, "liquid_blocks") or rows != history.retained_rows:
-        raise StagedScheduleError(f"pre-boundary history changed for {history.channel}")
+        raise attach_preservation_detail(StagedScheduleError(f"pre-boundary history changed for {history.channel}"),
+                                         "assert_retained_history", "schedule_mismatch")
     if history.protected_catalog_ids:
         placeholders = ",".join("?" for unused in history.protected_catalog_ids)
-        unused_columns, rows = _rows(
-            connection,
-            "catalog_entries",
-            f"id IN ({placeholders})",
-            tuple(sorted(history.protected_catalog_ids)),
-        )
-        present = {
-            row[0]: row for row in rows
-        }
-        missing = sorted(history.protected_catalog_ids - set(present))
-        if missing:
-            raise StagedScheduleError(
-                f"protected catalog IDs disappeared for {history.channel}: {missing}"
+        with preservation_step("assert_retained_history", "catalog_check_failed"):
+            unused_columns, rows = _rows(
+                connection,
+                "catalog_entries",
+                f"id IN ({placeholders})",
+                tuple(sorted(history.protected_catalog_ids)),
             )
-        changed = sorted(
-            catalog_id
-            for catalog_id, expected in history.retained_catalog_rows.items()
-            if present[catalog_id] != expected
-        )
-        if changed:
-            raise StagedScheduleError(
-                f"protected catalog rows changed for {history.channel}: {changed}"
+            present = {
+                row[0]: row for row in rows
+            }
+            missing = sorted(history.protected_catalog_ids - set(present))
+            if missing:
+                raise attach_preservation_detail(StagedScheduleError(
+                    f"protected catalog IDs disappeared for {history.channel}: {missing}"
+                ), "assert_retained_history", "catalog_mismatch")
+            changed = sorted(
+                catalog_id
+                for catalog_id, expected in history.retained_catalog_rows.items()
+                if present[catalog_id] != expected
             )
+            if changed:
+                raise attach_preservation_detail(StagedScheduleError(
+                    f"protected catalog rows changed for {history.channel}: {changed}"
+                ), "assert_retained_history", "catalog_mismatch")
 
 
 def _catalog_identity(row):
@@ -629,6 +647,7 @@ def reconcile_catalog(
     return active_ids
 
 
+@preservation_check("coverage_report", "check_failed")
 def coverage_report(connection, history):
     columns, rows = _rows(
         connection,
@@ -678,9 +697,10 @@ def coverage_report(connection, history):
         "final_end": max((row["end_time"] for row in records), default=None),
     }
     if gaps or overlaps or cursor < horizon:
-        raise StagedScheduleError(
+        category = "gap_and_overlap" if gaps and overlaps else "overlap" if overlaps else "gap"
+        raise attach_preservation_detail(StagedScheduleError(
             f"coverage failure for {history.channel}: {len(gaps)} gap(s), {len(overlaps)} overlap(s)"
-        )
+        ), "coverage_report", category)
     return report
 
 

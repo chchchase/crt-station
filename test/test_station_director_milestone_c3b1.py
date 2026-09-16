@@ -426,6 +426,7 @@ class CoordinatorFlowTests(unittest.TestCase):
                 scheduler_invoked=(invoked, False),
                 c1_run=1, c1_domain=DIAGNOSTIC_RULES[code][0],
                 c1_phase=phase, c1_code=code, c1_channel_number=2,
+                c1_preservation_detail={"helper": "restore_sequence_state", "category": "insert_failed", "content_scope": None},
                 c1_launcher_outcome="nonzero_exit", c1_stdout_bytes=0,
                 c1_stderr_bytes=0, c1_stdout_truncated=False,
                 c1_stderr_truncated=False,
@@ -433,6 +434,7 @@ class CoordinatorFlowTests(unittest.TestCase):
             rendered = render_cli_outcome(outcome)
             self.assertIn(f"C1 code: {code}", rendered)
             self.assertIn("C1 channel: 2", rendered)
+            self.assertIn("First preservation failure (may be secondary): restore_sequence_state / insert_failed", rendered)
             self.assertNotIn("opaque-secret-suffix", rendered)
 
     def setUp(self):
@@ -501,6 +503,37 @@ class CoordinatorFlowTests(unittest.TestCase):
                  metadata.st_mode),
             )
 
+    def test_preservation_detail_reaches_coordinator_publication_and_cli(self):
+        from station_director.dual_run import _base_result
+        from station_director.c1_diagnostics import make_diagnostic
+        result = _base_result("synthetic")
+        result["phase_reached"] = "run_1"
+        result["scheduler_invoked"]["run_1"] = True
+        result["source_checks"] = [{"checkpoint": "after_capture", "passed": True, "changed_categories": []}]
+        detail = {"helper": "restore_sequence_state", "category": "insert_failed", "content_scope": None}
+        result["failure"] = {
+            "phase": "run_1", "code": "c1_run_failed", "category": "scheduler_failure", "message": "private /secret",
+            "c1_diagnostic": {"run": 1, "detail": make_diagnostic(
+                "scheduler_failure", "scheduler", scheduler_invoked=True, preservation_detail=detail)},
+            "launcher_summary": {"outcome": "nonzero_exit", "stdout_bytes": 0, "stderr_bytes": 0,
+                                 "stdout_truncated": False, "stderr_truncated": False,
+                                 "termination_kind": "nonzero_exit", "exit_status": 1, "signal": None},
+        }
+        code, stdout, stderr = self._run(result)
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "")
+        self.assertIn("C1 code: scheduler_failure", stdout)
+        self.assertIn("may be secondary", stdout)
+        self.assertIn("insert_failed", stdout)
+        self.assertNotIn("private", stdout)
+        stored_paths = list((self.root / "runtime/director/validations").glob("*/*/validation.json"))
+        self.assertEqual(len(stored_paths), 1)
+        stored = json.loads(stored_paths[0].read_text())
+        self.assertEqual(stored["findings"]["errors"][0]["c1_diagnostic"]["detail"]["preservation_detail"], detail)
+        outcome = self.coordinator._outcome_without_report(VALID_PROPOSAL["proposal_id"], RUN_ID, result, "c1_run_failed")
+        self.assertEqual(outcome.c1_preservation_detail, detail)
+        self.assertIn("insert_failed", render_cli_outcome(outcome))
+
     def test_success_publishes_immutable_report_and_latest(self):
         result = valid_success_result(Path(self.temp.name))
         code, stdout, stderr = self._run(result)
@@ -568,7 +601,7 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertEqual(len(report_directories), 1)
         document = json.loads(
             (report_directories[0] / "validation.json").read_text(encoding="utf-8"))
-        self.assertEqual(document["schema_version"], 5)
+        self.assertEqual(document["schema_version"], 6)
         finding = document["findings"]["errors"][0]
         self.assertEqual(finding["capture_run"], 2)
         self.assertEqual(finding["finalization_subphase"], "proposal_projection")

@@ -28,7 +28,7 @@ from station_director.single_run_protocol import (
     MAX_DOCUMENT_BYTES,
     ProtocolError,
     REQUEST_SCHEMA,
-    RESPONSE_SCHEMA_V3 as RESPONSE_SCHEMA,
+    RESPONSE_SCHEMA_V4 as RESPONSE_SCHEMA,
     RESPONSE_SCHEMA_V2,
     RESPONSE_SCHEMA_V1,
     bind_request,
@@ -185,6 +185,9 @@ class SyntheticSequenceRestoreTests(unittest.TestCase):
                 with self.assertRaises(self.native.NativeRunError) as caught:
                     self.native._restore_sequences(self.database, snapshot)
                 self.assertEqual(caught.exception.code, "sequence_restore_failure")
+                self.assertEqual(caught.exception.preservation_detail, {
+                    "helper": "restore_sequence_state", "category": operation.lower() + "_failed",
+                    "content_scope": None})
                 self.assertIsInstance(caught.exception.__cause__, sqlite3.IntegrityError)
                 self.staged.assert_protected_state(self.connection, snapshot)
                 self.connection.execute("DROP TRIGGER synthetic_failure")
@@ -199,6 +202,7 @@ class SyntheticSequenceRestoreTests(unittest.TestCase):
         with self.assertRaises(self.native.NativeRunError) as caught:
             self.native._restore_sequences(self.database, snapshot)
         self.assertIsInstance(caught.exception.__cause__, self.staged.StagedScheduleError)
+        self.assertEqual(caught.exception.preservation_detail["category"], "schema_mismatch")
         self.staged.assert_protected_state(self.connection, before)
 
     def test_commit_failure_rolls_back(self):
@@ -212,6 +216,7 @@ class SyntheticSequenceRestoreTests(unittest.TestCase):
                 with self.assertRaises(self.native.NativeRunError) as caught:
                     self.native._restore_sequences(self.database, snapshot)
             self.assertEqual(caught.exception.code, "sequence_restore_failure")
+            self.assertEqual(caught.exception.preservation_detail["category"], "commit_failed")
             proxy.rollback.assert_called_once()
             proxy.close.assert_called_once()
             self.staged.assert_protected_state(self.connection, snapshot)
@@ -222,13 +227,15 @@ class SyntheticSequenceRestoreTests(unittest.TestCase):
         self.populate()
         snapshot = self.snapshot()
         verify = self.staged.assert_protected_state
-        def mismatch(connection, state):
+        def mismatch(connection, state, **kwargs):
             connection.execute("UPDATE named_sequence SET parent_tag=CAST('synthetic-blob' AS TEXT) WHERE id=2")
-            verify(connection, state)
+            verify(connection, state, **kwargs)
         with patch.object(self.native, "assert_protected_state", side_effect=mismatch):
             with self.assertRaises(self.native.NativeRunError) as caught:
                 self.native._restore_sequences(self.database, snapshot)
         self.assertIsInstance(caught.exception.__cause__, self.staged.StagedScheduleError)
+        self.assertEqual(caught.exception.preservation_detail, {
+            "helper": "_restore_sequences", "category": "verification_failed", "content_scope": None})
         self.staged.assert_protected_state(self.connection, snapshot)
 
     def test_primary_failure_is_not_replaced_by_restoration_failure(self):
@@ -250,24 +257,29 @@ class SyntheticSequenceRestoreTests(unittest.TestCase):
             synthetic_operation({}, None)
         self.assertIs(caught.exception, primary)
         self.assertEqual(caught.exception.restoration_failure, "sequence_restore_failure")
+        self.assertEqual(primary.preservation_detail["category"], "insert_failed")
 
     def test_primary_cause_and_cancellation_survive_secondary_failure(self):
+        from station_director.c1_diagnostics import attach_preservation_detail
         for kind in (RuntimeError, KeyboardInterrupt, SystemExit):
             with self.subTest(kind=kind.__name__):
                 primary = kind("synthetic primary")
                 cause = ValueError("synthetic original cause")
                 primary.__cause__ = cause
+                attach_preservation_detail(primary, "coverage_report", "gap")
+                secondary = attach_preservation_detail(RuntimeError("synthetic secondary"), "restore_sequence_state", "insert_failed")
                 @self.native._sequence_restored
                 def operation(request, attestation, restoration):
                     restoration.update(database=self.database, protected={})
                     raise primary
                 with patch.object(self.native, "_restore_sequences",
-                                  side_effect=RuntimeError("synthetic secondary")):
+                                  side_effect=secondary):
                     with self.assertRaises(kind) as caught:
                         operation({}, None)
                 self.assertIs(caught.exception, primary)
                 self.assertIs(caught.exception.__cause__, cause)
                 self.assertEqual(primary.restoration_failure, "sequence_restore_failure")
+                self.assertEqual(primary.preservation_detail["category"], "gap")
                 self.assertTrue(primary.__suppress_context__)
 
 
@@ -281,6 +293,144 @@ def publish_completed_worker_checkpoints(stage):
             "response_publication_attempted", "response_publication_completed",
         ):
             writer.publish(state)
+
+
+class PreservationDetailTests(unittest.TestCase):
+    def test_all_allowlisted_pairs_and_redaction(self):
+        from station_director.c1_diagnostics import (
+            PRESERVATION_CATEGORIES, PLAYBACK_HELPERS, attach_preservation_detail,
+            copy_preservation_detail, validate_preservation_detail,
+        )
+        from jsonschema import Draft202012Validator
+        def detail_schemas(value):
+            if isinstance(value, dict):
+                if "preservation_detail" in value.get("properties", {}):
+                    yield value["properties"]["preservation_detail"]
+                for child in value.values():
+                    yield from detail_schemas(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from detail_schemas(child)
+        validators = [Draft202012Validator(detail) for name in (
+            "native-single-run.response.v4.schema.json", "native-dual-run.result.v4.schema.json",
+            "validation-report.v6.schema.json") for detail in detail_schemas(
+                json.loads((RESPONSE_SCHEMA.parent / name).read_text()))]
+        self.assertEqual(len(validators), 2)  # Report v6 references C2 v4's definition.
+        for helper, categories in PRESERVATION_CATEGORIES.items():
+            scopes = (None, "retained", "generated") if helper in PLAYBACK_HELPERS else (None,)
+            for category in categories:
+                for scope in scopes:
+                    with self.subTest(helper=helper, category=category, scope=scope):
+                        error = attach_preservation_detail(
+                            RuntimeError("private SQL /secret/media value"), helper, category, scope)
+                        validate_preservation_detail(error.preservation_detail)
+                        for validator in validators:
+                            validator.validate(error.preservation_detail)
+                        primary = copy_preservation_detail(error, RuntimeError("private primary"))
+                        self.assertEqual(primary.preservation_detail, error.preservation_detail)
+                        attach_preservation_detail(primary, "coverage_report", "gap")
+                        self.assertEqual(primary.preservation_detail, error.preservation_detail)
+                        raw = json.dumps(primary.preservation_detail)
+                        self.assertNotIn("private", raw)
+                        self.assertNotIn("/secret", raw)
+        for bad in (False, [], {}, {"helper": "private", "category": "gap", "content_scope": None},
+                    {"helper": "coverage_report", "category": "private", "content_scope": None},
+                    {"helper": "coverage_report", "category": "gap", "content_scope": "retained"},
+                    {"helper": "coverage_report", "category": "gap", "content_scope": None, "raw": "secret"}):
+            with self.assertRaises(ValueError):
+                validate_preservation_detail(bad)
+            for validator in validators:
+                self.assertFalse(validator.is_valid(bad))
+
+    def test_cleanup_keeps_primary_first_detail_and_attempts_close(self):
+        from station_director import native_single_run as native
+        from station_director.c1_diagnostics import attach_preservation_detail
+        for has_detail in (False, True):
+            primary = native.NativeRunError("scheduler_failure", "secret", phase="scheduler", scheduler_invoked=True)
+            if has_detail:
+                attach_preservation_detail(primary, "coverage_report", "gap")
+            connection = Mock()
+            connection.rollback.side_effect = RuntimeError("secret rollback")
+            connection.close.side_effect = RuntimeError("secret close")
+            native._preservation_cleanup(connection, primary, "_restore_sequences", rollback=True)
+            self.assertEqual(primary.code, "scheduler_failure")
+            self.assertEqual(primary.preservation_detail["category"], "gap" if has_detail else "rollback_failed")
+            connection.rollback.assert_called_once()
+            connection.close.assert_called_once()
+        connection = Mock()
+        connection.close.side_effect = RuntimeError("secret")
+        with self.assertRaises(native.NativeRunError) as caught:
+            native._preservation_cleanup(connection, None, "_verify_final_preservation", scheduler_invoked=True)
+        self.assertTrue(caught.exception.scheduler_invoked)
+        self.assertEqual(caught.exception.code, "preservation_failure")
+        self.assertEqual(caught.exception.preservation_detail["category"], "close_failed")
+
+    def test_final_foreign_key_predicate_and_query_failure(self):
+        from station_director import native_single_run as native
+        for finding, error, category in ((["synthetic"], None, "foreign_key_mismatch"),
+                                         (None, RuntimeError("private query"), "foreign_key_check_failed")):
+            with patch.object(native, "restore_sequence_state"), patch.object(native, "assert_protected_state"), \
+                    patch.object(native, "_validate_final_cross_channel_exclusions"), \
+                    patch.object(native, "canonical_foreign_key_findings", return_value=finding, side_effect=error):
+                with self.assertRaises(Exception) as caught:
+                    native._verify_final_preservation(Mock(), {}, {}, [], {}, [], None)
+            self.assertEqual(caught.exception.preservation_detail["category"], category)
+
+    def test_media_failures_distinguish_retained_generated(self):
+        from station_director import native_single_run as native
+        from station_director import staged_schedule as staged
+        from fs42 import autobump_descriptor as descriptor
+        for generated in (False, True):
+            scope = "generated" if generated else "retained"
+            for kind in ("plan", "reference", "missing_media"):
+                connection = Mock()
+                if kind == "plan":
+                    representations = staged._playback_representations(connection, [(1, "show", None, "not-json")])
+                    expected = "plan_invalid"
+                elif kind == "reference":
+                    representations = staged._playback_representations(connection, [(1, "show", "not-json", "[]")])
+                    expected = "reference_failure"
+                else:
+                    representations = [{"block_id": 1, "liquid_type": "show", "content_missing": False,
+                                        "plan": [], "catalog": [{"path": "/media/synthetic", "realpath": None}]}]
+                    expected = "media_validation_failed"
+                with patch.object(descriptor, "classify_catalog_entry", return_value="ordinary"), \
+                        patch.object(native, "canonical_media_mapping", side_effect=RuntimeError("secret missing media")):
+                    with self.assertRaises(Exception) as caught:
+                        native._validate_playback_representations(descriptor, representations, "Synthetic", generated=generated, media_root=Path("/unused"))
+                self.assertEqual(caught.exception.preservation_detail["category"], expected)
+                self.assertEqual(caught.exception.preservation_detail["content_scope"], scope)
+
+    def test_retained_catalog_protected_and_coverage_predicates(self):
+        from station_director import staged_schedule as staged
+        history = types.SimpleNamespace(channel="Synthetic", proposal_boundary="2026-09-21 06:00:00",
+                                        proposal_end="2026-09-21 09:00:00", effective_horizon="2026-09-21 09:00:00",
+                                        retained_rows=[(1,)], protected_catalog_ids={1}, retained_catalog_rows={1: (1, "old")})
+        for rows, category in (([], "schedule_mismatch"), ([(1,)], "catalog_mismatch")):
+            with patch.object(staged, "_rows", side_effect=[(["id"], rows), (["id"], [])]), \
+                    patch.object(staged, "_columns", return_value=["id"]):
+                with self.assertRaises(staged.StagedScheduleError) as caught:
+                    staged.assert_retained_history(Mock(), history)
+            self.assertEqual(caught.exception.preservation_detail["category"], category)
+        with patch.object(staged, "_rows", side_effect=[(["id"], [(1,)]), RuntimeError("private")]), \
+                patch.object(staged, "_columns", return_value=["id"]):
+            with self.assertRaises(RuntimeError) as caught:
+                staged.assert_retained_history(Mock(), history)
+        self.assertEqual(caught.exception.preservation_detail["category"], "catalog_check_failed")
+        state = {"synthetic": {"columns": ["id"], "rows": [(1,)], "where": "", "parameters": ()}}
+        with patch.object(staged, "_rows", return_value=(["id"], [(2,)])):
+            with self.assertRaises(staged.StagedScheduleError) as caught:
+                staged.assert_protected_state(Mock(), state)
+        self.assertEqual(caught.exception.preservation_detail["helper"], "assert_protected_state")
+        self.assertEqual(caught.exception.preservation_detail["category"], "mismatch")
+        for intervals, category in (([(6, 7), (8, 9)], "gap"), ([(6, 8), (7, 9)], "overlap"),
+                                    ([(6, 7), (6, 7), (8, 9)], "gap_and_overlap")):
+            rows = [(index, f"2026-09-21 {start:02}:00:00", f"2026-09-21 {end:02}:00:00")
+                    for index, (start, end) in enumerate(intervals)]
+            with patch.object(staged, "_rows", return_value=(["id", "start_time", "end_time"], rows)):
+                with self.assertRaises(staged.StagedScheduleError) as caught:
+                    staged.coverage_report(Mock(), history)
+            self.assertEqual(caught.exception.preservation_detail["category"], category)
 
 
 class WorkerCheckpointTests(unittest.TestCase):
@@ -1750,7 +1900,7 @@ class SyntheticNativeEngineTests(unittest.TestCase):
         from station_director import native_single_run as native
 
         phases = (
-            "context", "configuration", "allocation", "catalog", "reconciliation",
+            "context", "configuration", "allocation", "catalog", "reconciliation", "retained_history",
             "schedule_construction", "explicit_range", "channel_result",
             "preservation", "guide", "final_verification",
         )
@@ -1769,7 +1919,11 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                         connection.commit()
                     finally:
                         connection.close()
-                    raise RuntimeError(f"injected-{phase}")
+                    error = RuntimeError(f"injected-{phase}")
+                    if phase == "retained_history":
+                        from station_director.c1_diagnostics import attach_preservation_detail
+                        attach_preservation_detail(error, "assert_retained_history", "schedule_mismatch")
+                    raise error
 
                 class Catalog:
                     def __init__(self, unused_config, rebuild_catalog=False, load=True):
@@ -1829,6 +1983,7 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                         "allocation": "catalog_allocation_floor",
                         "catalog": "ShowCatalog",
                         "reconciliation": "reconcile_catalog",
+                        "retained_history": "assert_retained_history",
                         "schedule_construction": "LiquidSchedule",
                         "channel_result": "_build_channel_result",
                         "preservation": "_verify_final_preservation",
@@ -1842,6 +1997,9 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                     with self.assertRaises(BaseException) as caught:
                         native.execute_native_single_run(request, attestation)
                 self.assertIn(f"injected-{phase}", str(caught.exception))
+                if phase == "retained_history":
+                    self.assertEqual(caught.exception.code, "catalog_reconciliation")
+                    self.assertEqual(caught.exception.preservation_detail["category"], "schedule_mismatch")
                 self.assertTrue(restore.called)
                 self.assertEqual(self._sequence_rows(database), before)
 
@@ -2296,7 +2454,7 @@ class VersionedDiagnosticTests(unittest.TestCase):
 
     def _success_response(self, request):
         return {
-            "schema_version": 3, "operation": "native_single_run",
+            "schema_version": 4, "operation": "native_single_run",
             "run_id": request["run_id"],
             "proposal_id": request["proposal"]["proposal_id"],
             "status": "success", "phase_reached": "complete",
@@ -2361,7 +2519,7 @@ class VersionedDiagnosticTests(unittest.TestCase):
                    if isinstance(node, ast.Import) for alias in node.names}
         imports.update(node.module for node in ast.walk(tree)
                        if isinstance(node, ast.ImportFrom))
-        self.assertEqual(imports, set())
+        self.assertEqual(imports, {"contextlib", "functools"})
         for code, (domain, phases, template) in DIAGNOSTIC_RULES.items():
             item = make_diagnostic(code, phases[0])
             validate_diagnostic(item)
@@ -2399,7 +2557,7 @@ class VersionedDiagnosticTests(unittest.TestCase):
                 ) as loader:
                     result = run_worker(request_path, root / "response.json")
                 loader.assert_not_called()
-                self.assertEqual(result["schema_version"], 3)
+                self.assertEqual(result["schema_version"], 4)
                 self.assertEqual(result["failure"]["code"], code)
                 self.assertEqual(result["failure"]["probe"], probe)
                 self.assertEqual(result["failure"]["fingerprint_category"], category)
@@ -2441,6 +2599,8 @@ class VersionedDiagnosticTests(unittest.TestCase):
                     "code": code, "phase": phase, "scheduler_invoked": invoked,
                     "channel": "Action", "guide_validation": None,
                 })("token=secret /home/private")
+                detail = {"helper": "restore_sequence_state", "category": "insert_failed", "content_scope": None}
+                failure.preservation_detail = detail
                 fake = types.SimpleNamespace(
                     execute_native_single_run=lambda *unused: (_ for _ in ()).throw(failure))
                 with patch(
@@ -2453,6 +2613,9 @@ class VersionedDiagnosticTests(unittest.TestCase):
                     result = run_worker(request_path, root / "response.json")
                 self.assertEqual(result["failure"]["code"], code)
                 self.assertEqual(result["failure"]["scheduler_invoked"], invoked)
+                self.assertEqual(result["failure"]["preservation_detail"], detail)
+                stored = json.loads((root / "response.json").read_text())
+                self.assertEqual(stored["failure"]["preservation_detail"], detail)
                 self.assertEqual(result["scheduler_invoked"], invoked)
                 self.assertNotIn("secret", json.dumps(result))
 
@@ -2522,6 +2685,24 @@ class VersionedDiagnosticTests(unittest.TestCase):
                 inspect_single_run(lifecycle)
             self.assertEqual(caught.exception.c1_diagnostic["code"],
                              "worker_response_invalid")
+
+    def test_frozen_v3_diagnostic_readable_current_worker_requires_v4(self):
+        from station_director.single_run_protocol import RESPONSE_SCHEMA_V3
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            request, unused = self._request_file(root)
+            response = self._success_response(request)
+            response["schema_version"] = 3
+            warning = make_diagnostic("native_warning", "configuration")
+            warning.pop("preservation_detail")
+            response["warnings"] = [warning]
+            path = root / "native-single-run.response.json"
+            write_private_json_exclusive(path, response, RESPONSE_SCHEMA_V3)
+            with HeldDocument(path, RESPONSE_SCHEMA_V3) as retained:
+                self.assertEqual(retained.payload, response)
+            with self.assertRaises(ProtocolError):
+                with HeldDocument(path, RESPONSE_SCHEMA):
+                    pass
 
     def test_valid_v3_response_cannot_bypass_missing_checkpoint_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2955,7 +3136,7 @@ class LifecycleTests(unittest.TestCase):
             self.assertIn("/project/station_director/single_run_worker.py", launcher.args[1])
             self.assertTrue(launcher.args[4])
             response = {
-                "schema_version": 3, "operation": "native_single_run",
+                "schema_version": 4, "operation": "native_single_run",
                 "run_id": request["run_id"], "proposal_id": request["proposal"]["proposal_id"],
                 "status": "success", "phase_reached": "complete", "scheduler_invoked": True,
                 "validation_context": {

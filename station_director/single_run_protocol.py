@@ -10,7 +10,7 @@ from station_director.validation_context import derive_request_digest
 
 
 PROTOCOL_VERSION = 1
-RESPONSE_PROTOCOL_VERSION = 3
+RESPONSE_PROTOCOL_VERSION = 4
 OPERATION = "native_single_run"
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
 SCHEMA_DIR = Path(__file__).with_name("schemas")
@@ -20,6 +20,7 @@ RESPONSE_SCHEMA_V1 = SCHEMA_DIR / "native-single-run.response.v1.schema.json"
 RESPONSE_SCHEMA = RESPONSE_SCHEMA_V1
 RESPONSE_SCHEMA_V2 = SCHEMA_DIR / "native-single-run.response.v2.schema.json"
 RESPONSE_SCHEMA_V3 = SCHEMA_DIR / "native-single-run.response.v3.schema.json"
+RESPONSE_SCHEMA_V4 = SCHEMA_DIR / "native-single-run.response.v4.schema.json"
 
 
 class ProtocolError(RuntimeError):
@@ -91,17 +92,19 @@ def validate_request_semantics(payload):
 
 
 def validate_response_semantics(payload):
-    if payload.get("schema_version") in (2, RESPONSE_PROTOCOL_VERSION):
+    if payload.get("schema_version") in (2, 3, RESPONSE_PROTOCOL_VERSION):
         from station_director.c1_diagnostics import (
             WORKER_DIAGNOSTIC_CODES, validate_diagnostic,
         )
         try:
             for diagnostic in payload.get("warnings", []):
-                validate_diagnostic(diagnostic)
+                validate_diagnostic(diagnostic, legacy=payload["schema_version"] < 4)
                 if diagnostic["code"] not in WORKER_DIAGNOSTIC_CODES:
                     raise ValueError("host-only diagnostic")
+                if diagnostic.get("preservation_detail") is not None:
+                    raise ValueError("preservation detail requires a failure")
             if payload.get("failure") is not None:
-                validate_diagnostic(payload["failure"])
+                validate_diagnostic(payload["failure"], legacy=payload["schema_version"] < 4)
                 if payload["failure"]["code"] not in WORKER_DIAGNOSTIC_CODES:
                     raise ValueError("host-only diagnostic")
                 if payload["failure"]["phase"] != payload["phase_reached"]:
@@ -215,7 +218,7 @@ class HeldDocument:
             if Path(schema_path) == REQUEST_SCHEMA:
                 validate_request_semantics(self.payload)
             elif Path(schema_path) in (RESPONSE_SCHEMA_V1, RESPONSE_SCHEMA_V2,
-                                       RESPONSE_SCHEMA_V3):
+                                       RESPONSE_SCHEMA_V3, RESPONSE_SCHEMA_V4):
                 validate_response_semantics(self.payload)
             if expected_digest is not None and request_digest(self.payload) != expected_digest:
                 raise ProtocolError("request digest changed")
@@ -278,7 +281,7 @@ def write_private_json_exclusive(path, payload, schema_path):
     if Path(schema_path) == REQUEST_SCHEMA:
         validate_request_semantics(payload)
     elif Path(schema_path) in (RESPONSE_SCHEMA_V1, RESPONSE_SCHEMA_V2,
-                               RESPONSE_SCHEMA_V3):
+                               RESPONSE_SCHEMA_V3, RESPONSE_SCHEMA_V4):
         validate_response_semantics(payload)
     path = Path(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)

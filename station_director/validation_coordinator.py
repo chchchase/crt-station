@@ -101,6 +101,7 @@ class CoordinatorOutcome:
     c1_probe: str | None = None
     c1_fingerprint_category: str | None = None
     c1_channel_number: int | None = None
+    c1_preservation_detail: dict | None = None
     c1_launcher_outcome: str | None = None
     c1_stdout_bytes: int | None = None
     c1_stderr_bytes: int | None = None
@@ -130,7 +131,7 @@ class CoordinatorOutcome:
                 self.finalization_subphase,
                 self.c1_run, self.c1_domain, self.c1_phase, self.c1_code,
                 self.c1_probe, self.c1_fingerprint_category,
-                self.c1_channel_number, self.c1_launcher_outcome,
+                self.c1_channel_number, self.c1_preservation_detail, self.c1_launcher_outcome,
                 self.c1_stdout_bytes, self.c1_stderr_bytes,
                 self.c1_stdout_truncated, self.c1_stderr_truncated,
                 self.report_published, self.report_durable, self.publication_code,
@@ -184,6 +185,8 @@ class CoordinatorOutcome:
         if self.failure_code not in safe_codes:
             raise ValueError("unsafe coordinator failure code")
         c1_present = self.c1_run is not None
+        if not c1_present and self.c1_preservation_detail is not None:
+            raise ValueError("unexpected preservation detail")
         if (self.failure_code == "c1_run_failed") != c1_present:
             raise ValueError("C1 outcome lacks a classified diagnostic")
         if c1_present:
@@ -195,6 +198,7 @@ class CoordinatorOutcome:
                 "probe": self.c1_probe,
                 "fingerprint_category": self.c1_fingerprint_category,
                 "channel_number": self.c1_channel_number,
+                "preservation_detail": self.c1_preservation_detail,
             }
             from station_director.c1_diagnostics import validate_host_diagnostic
             validate_host_diagnostic(detail)
@@ -522,6 +526,8 @@ def _outcome_from_result(proposal_id, run_id, result, publication=None,
                                 if failure_code == "c1_run_failed" else None),
         c1_channel_number=(c1_detail.get("channel_number")
                            if failure_code == "c1_run_failed" else None),
+        c1_preservation_detail=(c1_detail.get("preservation_detail")
+                                if failure_code == "c1_run_failed" else None),
         c1_launcher_outcome=(c1_launcher.get("outcome")
                              if failure_code == "c1_run_failed" else None),
         c1_stdout_bytes=(c1_launcher.get("stdout_bytes")
@@ -569,6 +575,8 @@ def _outcome_without_report(proposal_id, run_id, result, code):
                                 if code == "c1_run_failed" else None),
         c1_channel_number=(detail.get("channel_number")
                            if code == "c1_run_failed" else None),
+        c1_preservation_detail=(detail.get("preservation_detail")
+                                if code == "c1_run_failed" else None),
         c1_launcher_outcome=(launcher.get("outcome")
                              if code == "c1_run_failed" else None),
         c1_stdout_bytes=(launcher.get("stdout_bytes")
@@ -757,6 +765,13 @@ def render_cli_outcome(outcome):
                     f"C1 fingerprint category: {outcome.c1_fingerprint_category}")
             if outcome.c1_channel_number is not None:
                 lines.append(f"C1 channel: {outcome.c1_channel_number}")
+            if outcome.c1_preservation_detail is not None:
+                from station_director.c1_diagnostics import validate_preservation_detail
+                detail = outcome.c1_preservation_detail
+                validate_preservation_detail(detail)
+                lines.append("First preservation failure (may be secondary): "
+                             f"{detail['helper']} / {detail['category']} / "
+                             f"{detail['content_scope'] or 'not_applicable'}")
             lines.append(f"C1 launcher: {outcome.c1_launcher_outcome}")
             lines.append(
                 f"C1 output bytes: stdout={outcome.c1_stdout_bytes} "

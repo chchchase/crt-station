@@ -93,7 +93,7 @@ Native catalog and scheduling may mutate sequence state in the disposable databa
 
 Configured AutoBump is permitted when native scheduling does not select it. The worker mirrors native duration defaults before the first affected scheduler enters and rejects configurations that would require media probing; a validation-mode guard independently blocks the probe at its subprocess boundary. After each native schedule is generated, exact AutoBump plan and catalog descriptor markers are inspected from the regeneration seam before ordinary `/media` conversion. Final media checks use that same seam as the provenance boundary: structurally valid retained AutoBump descriptors remain untouched and bypass media conversion, while every newly generated use fails with a value-free diagnostic. Contradictory partial markers fail as an invalid playback descriptor regardless of provenance, and all ordinary retained and generated media remain subject to confinement checks. Validation substitutes a fixed marker before presentation construction; descriptor bodies are never parsed, logged, hashed, returned, rendered, or loaded, and player and web-renderer modules remain unreachable. Unrelated native `SystemExit` results remain `native_system_exit`. The internal lifecycle separates preparation, launch, inspection, and cleanup so C2 can nest two internally owned scopes and retain both disposable results for comparison. Ownership is never caller-transferable: the coordinator verifies unit termination before removing its stage. A unit that cannot be proven absent leaves a locked, quarantined stage for manual recovery, and cleanup failure makes the run fail. No persistent validation report is created.
 
-New native workers publish response schema v3; production inspection requires that exact version, while response schemas v1 and v2 remain frozen and readable only for retained-protocol compatibility. Missing or stale verified cache metadata produces the fixed `catalog_metadata_unavailable` diagnostic before any validation-time probe, decoder, MoviePy, FFmpeg, or subprocess fallback; other native catalog errors remain `catalog_failure`.
+New native workers publish response schema v4; production inspection requires that exact version, while response schemas v1 through v3 remain frozen and readable only for retained-protocol compatibility. Missing or stale verified cache metadata produces the fixed `catalog_metadata_unavailable` diagnostic before any validation-time probe, decoder, MoviePy, FFmpeg, or subprocess fallback; other native catalog errors remain `catalog_failure`.
 
 Validation catalog rebuilding is cache-only. Native directory, tag, ordering, multiplicity, hint, content-type, and weighting discovery still constructs the current candidate population, but every selected media file must have current typed `file_meta` data and an existing chapter-scan record where native catalog construction requires one. Missing, stale, malformed, or untyped metadata fails before FFprobe, MoviePy, FFmpeg, decoder, or subprocess entry. The working database is disposable, but the rebuild does not invent metadata. Ordinary non-validation catalog refresh, probing, argument ordering, and serialization remain unchanged.
 
@@ -119,7 +119,7 @@ Second, C3a2 provides a disconnected immutable report publisher for later C3b us
 
 `latest.json` means the latest completed attempt, whether successful or failed. An attempt reaches pointer completion only inside the serialized proposal-directory publication lock, so ordering follows completion of that workflow rather than proposal or run-ID time. Before replacement, an existing pointer is strictly parsed and its proposal/run identity, safe immutable directory, canonical report bytes, and report digest are verified. An invalid, dangling, cross-proposal, unsafe, or bad-digest pointer is left untouched; pointer failure is returned with separate not-replaced or replaced-not-durable state and never changes immutable validation status. Existing proposal files, legacy colocated reports, and prior immutable runs are never moved, overwritten, or deleted.
 
-Validation report schemas v1 through v4 are frozen for retained immutable reports. New attempts use validation report schema v5 and native dual-run result v3. The host and report scheduler state is `true`, `false`, or `unknown`, while a valid worker response remains Boolean. C1 diagnostics retain their exact run number, compatible domain/phase/code, optional allowlisted probe or fingerprint category, and a launcher summary limited to fixed outcome/category fields, bounded byte counts, truncation flags, and verified numeric exit status or signal. Diagnostic templates and hashes use only these safe structured fields. Raw exceptions, journal text, process output, unit names, paths, media identities, configuration values, secrets, and environment data are excluded. Existing valid v1–v4 reports and `latest.json` pointers remain readable and may be atomically superseded by a completed v5 attempt without rewriting an earlier report.
+Validation report schemas v1 through v5 are frozen for retained immutable reports. New attempts use validation report schema v6 and native dual-run result v4. The host and report scheduler state is `true`, `false`, or `unknown`, while a valid worker response remains Boolean. C1 diagnostics retain their exact run number, compatible domain/phase/code, optional allowlisted probe or fingerprint category, and a launcher summary limited to fixed outcome/category fields, bounded byte counts, truncation flags, and verified numeric exit status or signal. Diagnostic templates and hashes use only these safe structured fields. Raw exceptions, journal text, process output, unit names, paths, media identities, configuration values, secrets, and environment data are excluded. Existing valid v1–v5 reports and `latest.json` pointers remain readable and may be atomically superseded by a completed v6 attempt without rewriting an earlier report.
 
 Report projection uses named `run_1`/`run_2` guide, preservation, and cleanup fields and named source-stability checkpoints, plus explicit not-started, attempted, completed, failed, and unavailable phase states. Raw exception text and native output are never projected: diagnostics use allowlisted codes, fixed safe templates, typed counts/channel fields, allowlisted exception classes, and a digest. Canonical JSON serialization, deterministic control-escaped text rendering, schema validation, and explicit publication remain separate operations. The trusted project root and every fixed report-tree component are opened through held no-follow directory descriptors with owner, permission, identity, case-ambiguity, and bounded-entry checks. C3a2 tests redirect the internally derived root only by patching both trusted constants.
 
@@ -159,3 +159,44 @@ The validation coordinator intentionally rejects group-writable trusted director
 The stage-backed C1 `/tmp` mount is a new isolation variant. The shared launcher first verifies the canonical, owned, mode-0700 `/tmp/fs42-i-*` stage, then exclusively creates `/stage/transient` beneath it as a mode-0700 directory before constructing the Bubblewrap command. It holds the transient directory's no-follow descriptor through the child run and verifies the same device/inode identity and permissions afterward. A missing source is created; any pre-existing file, symlink, or directory fails closed. The outer run lifecycle removes the entire stage after success or launch failure. The ordinary preflight retains its prior tmpfs behavior and does not create `transient`. `./director isolation preflight --profile native-single-run` exercises only the C1 probe and mount profile—never catalog or scheduling code—and must pass from an external SSH shell before the public validation gate may be removed. C1 performs a final native-semantics cross-channel exclusion check and fails closed on a collision; it does not retry, reseed, or relax exclusions, even when a future deterministic conflict-resolution design might find a valid schedule.
 
 There is deliberately no apply or rollback command. Archiving requires the exact proposal ID as confirmation and only moves Director-owned proposal files.
+
+### First preservation failure detail
+
+C1 response v4, C2 result v4, and immutable validation report v6 carry a required
+nullable `preservation_detail` inside the existing C1 diagnostic. A non-null
+detail has exactly `helper`, `category`, and `content_scope`. All values are
+fixed allowlisted identifiers, never exception text or data. The scope is
+`retained` or `generated` for media/reference checks and null for other checks.
+Null means no instrumented preservation failure was observed, not that
+preservation succeeded.
+
+The original domain/phase/code remains the primary diagnostic. The detail
+identifies the **first preservation failure**, which can be secondary: for
+example, a scheduler failure followed by a sequence insertion failure. It
+does not assert that the primary failure was caused by preservation. Later
+restoration, rollback, or close failures do not overwrite either the primary
+diagnostic or the first detail. Media scope is added while unwinding the
+retained/generated check, without replacing the helper or category.
+
+| Helper | Fixed categories |
+| --- | --- |
+| `restore_sequence_state` | schema_mismatch, schema_check_failed, delete_failed, insert_failed |
+| `_restore_sequences` | open_failed, commit_failed, verification_failed, rollback_failed, close_failed |
+| `_verify_final_preservation` | commit_failed, foreign_key_check_failed, foreign_key_mismatch, rollback_failed, close_failed |
+| `_execute_native_single_run` | rollback_failed, close_failed (catalog reconciliation cleanup) |
+| `assert_retained_history` | schedule_check_failed, schedule_mismatch, catalog_check_failed, catalog_mismatch |
+| `assert_protected_state` | check_failed, mismatch |
+| `coverage_report` | check_failed, gap, overlap, gap_and_overlap |
+| `_validate_final_cross_channel_exclusions` | check_failed, collision |
+| `_playback_representations` | plan_invalid, reference_failure |
+| `_validate_playback_representations` | check_failed, descriptor_invalid, autobump_selected, stream_rejected, media_validation_failed |
+
+Categories are captured at the operation or failed predicate. Query/check
+errors are not interpreted as proven mismatches. Sequence verification uses
+the existing exact typed-row comparison. The new versions are strict: old
+workers are not admitted as current responses, and malformed, unknown, or
+extra detail fields are rejected. Frozen schemas and retained reports are
+not rewritten; older reports remain readable with their original schemas.
+All preservation checks, media confinement, selected-AutoBump rejection,
+isolation, and staging disposal remain in force. No failed staging database
+is newly retained, and no new recovery or scheduling behavior is introduced.

@@ -29,10 +29,11 @@ REPORT_SCHEMA_V2 = Path(__file__).with_name("schemas") / "validation-report.v2.s
 REPORT_SCHEMA_V3 = Path(__file__).with_name("schemas") / "validation-report.v3.schema.json"
 REPORT_SCHEMA_V4 = Path(__file__).with_name("schemas") / "validation-report.v4.schema.json"
 REPORT_SCHEMA_V5 = Path(__file__).with_name("schemas") / "validation-report.v5.schema.json"
-# New reports always use v5. Older paths remain frozen for retained reports.
-REPORT_SCHEMA = REPORT_SCHEMA_V5
+REPORT_SCHEMA_V6 = Path(__file__).with_name("schemas") / "validation-report.v6.schema.json"
+# New reports always use v6. Older paths remain frozen for retained reports.
+REPORT_SCHEMA = REPORT_SCHEMA_V6
 LATEST_SCHEMA = Path(__file__).with_name("schemas") / "latest-validation-pointer.v1.schema.json"
-DUAL_RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v3.schema.json"
+DUAL_RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v4.schema.json"
 PROPOSAL_ID_RE = re.compile(r"p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}\Z")
 RUN_ID_RE = re.compile(r"v-[0-9]{8}T[0-9]{6}[0-9]{6}Z-[a-f0-9]{32}\Z")
 MAX_REPORT_JSON_BYTES = 512 * 1024
@@ -173,19 +174,19 @@ def _safe_identifier(value):
 
 
 def validate_report_document(report, *, retained=False):
-    """Validate a new v5 report or a retained immutable v1-v4 report."""
+    """Validate a new v6 report or a retained immutable v1-v5 report."""
     if not isinstance(report, dict):
         raise ReportError("invalid_report", "validation report must be an object")
     version = report.get("schema_version")
-    if version == 5:
-        schema = REPORT_SCHEMA_V5
-    elif retained and version in (1, 2, 3, 4):
+    if version == 6:
+        schema = REPORT_SCHEMA_V6
+    elif retained and version in (1, 2, 3, 4, 5):
         schema = {1: REPORT_SCHEMA_V1, 2: REPORT_SCHEMA_V2,
-                  3: REPORT_SCHEMA_V3, 4: REPORT_SCHEMA_V4}[version]
+                  3: REPORT_SCHEMA_V3, 4: REPORT_SCHEMA_V4, 5: REPORT_SCHEMA_V5}[version]
     else:
         raise ReportError("invalid_report_version", "unsupported validation report version")
     validate_document(report, schema)
-    if version == 5:
+    if version in (5, 6):
         from station_director.c1_diagnostics import validate_host_diagnostic
         for group in ("baseline_findings", "unexpected_differences", "warnings", "errors"):
             for finding in report["findings"][group]:
@@ -194,7 +195,7 @@ def validate_report_document(report, *, retained=False):
                 c1 = finding["c1_diagnostic"]
                 if finding["code"] == "c1_run_failed":
                     try:
-                        validate_host_diagnostic(c1["detail"])
+                        validate_host_diagnostic(c1["detail"], legacy=version == 5)
                     except (KeyError, TypeError, ValueError) as exc:
                         raise ReportError("invalid_report", "invalid C1 report diagnostic") from exc
                     if finding["phase"] != f"run_{c1['run']}":
@@ -430,9 +431,9 @@ def build_validation_report(proposal, c2_result, run_id, completed_at):
         "sequence_changes", "break_changes",
     )}
     report = {
-        "schema_version": 5,
+        "schema_version": 6,
         "report_type": "station_director_validation",
-        "software": {"director_version": __version__, "report_schema_version": 5},
+        "software": {"director_version": __version__, "report_schema_version": 6},
         "proposal": {"id": proposal["proposal_id"], "schema_version": proposal["schema_version"],
                      "digest": hashlib.sha256(_canonical_json(proposal)).hexdigest()},
         "validation": {
@@ -535,6 +536,9 @@ def render_validation_text(report):
                                                        separators=(",", ":"))))
         if len(values) > 50:
             lines.append("  [truncated]")
+    if any(((item.get("c1_diagnostic") or {}).get("detail") or {}).get("preservation_detail")
+           for group in report["findings"].values() for item in group):
+        lines.append("Preservation detail identifies the first preservation failure; it may be secondary to the primary diagnostic.")
     raw = ("\n".join(lines) + "\n").encode("utf-8")
     if len(raw) > MAX_REPORT_TEXT_BYTES:
         raise ReportError("text_report_too_large", "text report exceeds size limit")

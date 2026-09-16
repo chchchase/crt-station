@@ -1,8 +1,80 @@
 """Dependency-free, allowlisted diagnostics for the isolated C1 protocol."""
 
-C1_RESPONSE_VERSION = 3
-C2_RESULT_VERSION = 3
-REPORT_VERSION = 5
+from contextlib import contextmanager
+from functools import wraps
+
+C1_RESPONSE_VERSION = 4
+C2_RESULT_VERSION = 4
+REPORT_VERSION = 6
+
+# No exception text participates in classification. These identifiers describe
+# the first preservation failure, which may be secondary to the primary code.
+PRESERVATION_CATEGORIES = {
+    "restore_sequence_state": ("schema_mismatch", "schema_check_failed", "delete_failed", "insert_failed"),
+    "_restore_sequences": ("open_failed", "commit_failed", "verification_failed", "rollback_failed", "close_failed"),
+    "_verify_final_preservation": ("commit_failed", "foreign_key_check_failed", "foreign_key_mismatch", "rollback_failed", "close_failed"),
+    "_execute_native_single_run": ("rollback_failed", "close_failed"),
+    "assert_retained_history": ("schedule_check_failed", "schedule_mismatch", "catalog_check_failed", "catalog_mismatch"),
+    "assert_protected_state": ("check_failed", "mismatch"),
+    "coverage_report": ("check_failed", "gap", "overlap", "gap_and_overlap"),
+    "_validate_final_cross_channel_exclusions": ("check_failed", "collision"),
+    "_playback_representations": ("plan_invalid", "reference_failure"),
+    "_validate_playback_representations": ("check_failed", "descriptor_invalid", "autobump_selected", "stream_rejected", "media_validation_failed"),
+}
+PLAYBACK_HELPERS = frozenset(("_playback_representations", "_validate_playback_representations"))
+
+
+def validate_preservation_detail(value):
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != {"helper", "category", "content_scope"}:
+        raise ValueError("invalid preservation detail shape")
+    helper, category, scope = value["helper"], value["category"], value["content_scope"]
+    if not isinstance(helper, str) or helper not in PRESERVATION_CATEGORIES:
+        raise ValueError("invalid preservation helper")
+    if category not in PRESERVATION_CATEGORIES[helper]:
+        raise ValueError("invalid preservation category")
+    if scope not in (None, "retained", "generated") or (scope is not None and helper not in PLAYBACK_HELPERS):
+        raise ValueError("invalid preservation scope")
+
+
+def attach_preservation_detail(exc, helper, category, content_scope=None):
+    detail = {"helper": helper, "category": category, "content_scope": content_scope}
+    validate_preservation_detail(detail)
+    existing = getattr(exc, "preservation_detail", None)
+    if existing is None:
+        exc.preservation_detail = detail
+    elif existing["helper"] in PLAYBACK_HELPERS and existing["content_scope"] is None and content_scope is not None:
+        exc.preservation_detail = {**existing, "content_scope": content_scope}
+    return exc
+
+
+def copy_preservation_detail(source, target):
+    detail = getattr(source, "preservation_detail", None)
+    validate_preservation_detail(detail)
+    if detail is not None and getattr(target, "preservation_detail", None) is None:
+        target.preservation_detail = dict(detail)
+    return target
+
+
+@contextmanager
+def preservation_step(helper, category, content_scope=None):
+    try:
+        yield
+    except BaseException as exc:
+        attach_preservation_detail(exc, helper, category, content_scope)
+        raise
+
+
+def preservation_check(helper, category, *, playback=False):
+    def decorate(function):
+        @wraps(function)
+        def checked(*args, **kwargs):
+            scope = ("generated" if kwargs["generated"] else "retained") if playback else None
+            with preservation_step(helper, category, scope):
+                return function(*args, **kwargs)
+        return checked
+    return decorate
 
 PROBE_IDENTIFIERS = (
     "environment_sanitized", "host_home_not_exposed", "host_run_not_exposed",
@@ -89,7 +161,7 @@ WORKER_DIAGNOSTIC_CODES = frozenset(
 
 
 def make_diagnostic(code, phase, *, scheduler_invoked=False, probe=None,
-                    fingerprint_category=None, channel_number=None):
+                    fingerprint_category=None, channel_number=None, preservation_detail=None):
     """Return one strictly validated, value-free diagnostic object."""
     if code not in DIAGNOSTIC_RULES:
         code = "native_failure"
@@ -106,23 +178,30 @@ def make_diagnostic(code, phase, *, scheduler_invoked=False, probe=None,
             isinstance(channel_number, bool) or not isinstance(channel_number, int)
             or not 1 <= channel_number <= 8):
         raise ValueError("invalid diagnostic channel")
+    validate_preservation_detail(preservation_detail)
     return {
         "domain": domain, "phase": phase, "code": code, "template": template,
         "scheduler_invoked": bool(scheduler_invoked), "probe": probe,
         "fingerprint_category": fingerprint_category,
         "channel_number": channel_number,
+        "preservation_detail": dict(preservation_detail) if preservation_detail is not None else None,
     }
 
 
-def validate_diagnostic(value):
-    if not isinstance(value, dict) or set(value) != {
+def validate_diagnostic(value, *, legacy=False):
+    keys = {
             "domain", "phase", "code", "template", "scheduler_invoked", "probe",
-            "fingerprint_category", "channel_number"}:
+            "fingerprint_category", "channel_number"}
+    if not legacy:
+        keys.add("preservation_detail")
+    if not isinstance(value, dict) or set(value) != keys:
         raise ValueError("invalid C1 diagnostic shape")
     expected = make_diagnostic(
         value["code"], value["phase"], scheduler_invoked=value["scheduler_invoked"],
         probe=value["probe"], fingerprint_category=value["fingerprint_category"],
-        channel_number=value["channel_number"])
+        channel_number=value["channel_number"], preservation_detail=value.get("preservation_detail"))
+    if legacy:
+        expected.pop("preservation_detail")
     if value != expected:
         raise ValueError("invalid C1 diagnostic content")
 
@@ -164,9 +243,9 @@ def host_diagnostic(detail, scheduler_state):
     return {**detail, "scheduler_invoked": scheduler_state}
 
 
-def validate_host_diagnostic(value):
+def validate_host_diagnostic(value, *, legacy=False):
     if not isinstance(value, dict) or value.get("scheduler_invoked") not in (
             True, False, "unknown"):
         raise ValueError("invalid host diagnostic scheduler state")
     worker_shape = {**value, "scheduler_invoked": value["scheduler_invoked"] is True}
-    validate_diagnostic(worker_shape)
+    validate_diagnostic(worker_shape, legacy=legacy)

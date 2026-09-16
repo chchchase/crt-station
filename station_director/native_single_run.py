@@ -33,6 +33,10 @@ from station_director.native_config_checks import (
 )
 from station_director.path_safety import canonical_media_mapping, validate_scheduled_media
 from station_director.preservation import canonical_foreign_key_findings
+from station_director.c1_diagnostics import (
+    attach_preservation_detail, copy_preservation_detail,
+    preservation_check, preservation_step,
+)
 from station_director.staged_schedule import (
     StagedScheduleError,
     assert_protected_state,
@@ -157,6 +161,7 @@ def _playback_descriptor_failure(channel, generated, invalid):
         )
 
 
+@preservation_check("_validate_playback_representations", "check_failed", playback=True)
 def _validate_playback_representations(
         descriptor, representations, channel, *, generated, media_root=None):
     checked = 0
@@ -170,38 +175,44 @@ def _validate_playback_representations(
                 content_missing=block["content_missing"],
             )
             if classification == descriptor.DESCRIPTOR_INVALID:
-                _playback_descriptor_failure(channel, generated, True)
+                with preservation_step("_validate_playback_representations", "descriptor_invalid"):
+                    _playback_descriptor_failure(channel, generated, True)
             if classification == descriptor.DESCRIPTOR_SELECTED:
-                _playback_descriptor_failure(channel, generated, False)
+                with preservation_step("_validate_playback_representations", "autobump_selected"):
+                    _playback_descriptor_failure(channel, generated, False)
                 continue
             if media_root is not None:
                 if item["is_stream"]:
-                    raise StagedScheduleError(
+                    raise attach_preservation_detail(StagedScheduleError(
                         f"block {block['block_id']} contains stream content "
                         "instead of confined media"
+                    ), "_validate_playback_representations", "stream_rejected")
+                with preservation_step("_validate_playback_representations", "media_validation_failed"):
+                    mapping = canonical_media_mapping(
+                        item["path"], "scheduled plan path", allow_sandbox=True
                     )
-                mapping = canonical_media_mapping(
-                    item["path"], "scheduled plan path", allow_sandbox=True
-                )
-                validate_scheduled_media(
-                    mapping.sandbox_path, sandbox_media_root=media_root
-                )
+                    validate_scheduled_media(
+                        mapping.sandbox_path, sandbox_media_root=media_root
+                    )
                 checked += 1
         for entry in block["catalog"]:
             classification = descriptor.classify_catalog_entry(entry)
             if classification == descriptor.DESCRIPTOR_INVALID:
-                _playback_descriptor_failure(channel, generated, True)
+                with preservation_step("_validate_playback_representations", "descriptor_invalid"):
+                    _playback_descriptor_failure(channel, generated, True)
             if classification == descriptor.DESCRIPTOR_SELECTED:
-                _playback_descriptor_failure(channel, generated, False)
+                with preservation_step("_validate_playback_representations", "autobump_selected"):
+                    _playback_descriptor_failure(channel, generated, False)
                 continue
             if media_root is not None:
-                mapping = canonical_media_mapping(
-                    entry["realpath"] or entry["path"],
-                    "scheduled catalog path", allow_sandbox=True,
-                )
-                validate_scheduled_media(
-                    mapping.sandbox_path, sandbox_media_root=media_root
-                )
+                with preservation_step("_validate_playback_representations", "media_validation_failed"):
+                    mapping = canonical_media_mapping(
+                        entry["realpath"] or entry["path"],
+                        "scheduled catalog path", allow_sandbox=True,
+                    )
+                    validate_scheduled_media(
+                        mapping.sandbox_path, sandbox_media_root=media_root
+                    )
                 checked += 1
     return checked
 
@@ -245,6 +256,7 @@ def _map_catalog_in_memory(schedule):
                     )
 
 
+@preservation_check("_validate_final_cross_channel_exclusions", "check_failed")
 def _validate_final_cross_channel_exclusions(projected, histories):
     """Fail if the final schedule violates native sibling exclusion semantics."""
     liquid_io = LiquidIO()
@@ -281,9 +293,9 @@ def _validate_final_cross_channel_exclusions(projected, histories):
                         and first.start_time < second.end_time
                         and second.start_time < first.end_time
                     ):
-                        raise StagedScheduleError(
+                        raise attach_preservation_detail(StagedScheduleError(
                             f"cross-channel exclusion collision: {left_name} and {right_name}"
-                        )
+                        ), "_validate_final_cross_channel_exclusions", "collision")
 
 
 def _native_station_config(channel, context):
@@ -302,24 +314,55 @@ def _native_station_config(channel, context):
     return config
 
 
+def _preservation_cleanup(connection, primary, helper, *, rollback=False, scheduler_invoked=False):
+    """Attempt all cleanup, without replacing a primary failure or its detail."""
+    failure = primary
+    for category, operation in (("rollback_failed", connection.rollback), ("close_failed", connection.close)):
+        if category == "rollback_failed" and not rollback:
+            continue
+        try:
+            with preservation_step(helper, category):
+                operation()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+            else:
+                copy_preservation_detail(exc, failure)
+    if primary is None and failure is not None:
+        if not isinstance(failure, Exception):
+            raise failure
+        code = "sequence_restore_failure" if helper == "_restore_sequences" else "preservation_failure"
+        raise copy_preservation_detail(failure, NativeRunError(
+            code, "Preservation cleanup failed.", phase="preservation",
+            scheduler_invoked=scheduler_invoked,
+        )) from failure
+
+
 def _restore_sequences(database, protected, *, scheduler_invoked=False):
-    connection = sqlite3.connect(database)
+    with preservation_step("_restore_sequences", "open_failed"):
+        connection = sqlite3.connect(database)
+    primary = None
     try:
         restore_sequence_state(connection, protected)
-        connection.commit()
+        with preservation_step("_restore_sequences", "commit_failed"):
+            connection.commit()
         sequence_state = {
             name: protected[name]
             for name in ("named_sequence", "sequence_entries", "sequence_group_state")
         }
-        assert_protected_state(connection, sequence_state)
-    except Exception as exc:
-        connection.rollback()
-        raise NativeRunError(
+        with preservation_step("_restore_sequences", "verification_failed"):
+            assert_protected_state(connection, sequence_state, sequence_verification=True)
+    except BaseException as exc:
+        primary = exc
+        if not isinstance(exc, Exception):
+            raise
+        primary = copy_preservation_detail(exc, NativeRunError(
             "sequence_restore_failure", str(exc), phase="preservation",
             scheduler_invoked=scheduler_invoked,
-        ) from exc
+        ))
+        raise primary from exc
     finally:
-        connection.close()
+        _preservation_cleanup(connection, primary, "_restore_sequences", rollback=primary is not None, scheduler_invoked=scheduler_invoked)
 
 
 def _sequence_restored(function):
@@ -344,12 +387,13 @@ def _sequence_restored(function):
                     # Preserve the original diagnostic (including cancellation).
                     # This local marker is fixed and is not a protocol extension.
                     primary.restoration_failure = "sequence_restore_failure"
+                    copy_preservation_detail(exc, primary)
                     raise primary from primary.__cause__
-                raise NativeRunError(
+                raise copy_preservation_detail(exc, NativeRunError(
                     "sequence_restore_failure", str(exc), phase="preservation",
                     scheduler_invoked=restoration.get("scheduler_invoked", False),
                     restoration_failure=f"{type(exc).__name__}: {exc}",
-                ) from exc
+                )) from exc
         if primary is not None:
             raise primary
         return result
@@ -378,15 +422,18 @@ def _build_channel_result(connection, channel, channel_number, channel_seed,
 def _verify_final_preservation(connection, projected, histories, channel_results,
                                protected, baseline_foreign_keys, media_root):
     restore_sequence_state(connection, protected)
-    connection.commit()
+    with preservation_step("_verify_final_preservation", "commit_failed"):
+        connection.commit()
     _validate_final_cross_channel_exclusions(projected, histories)
     for result in channel_results:
         history = histories[result["name"]]
         assert_retained_history(connection, history)
         result["coverage"] = coverage_report(connection, history)
     assert_protected_state(connection, protected)
-    if canonical_foreign_key_findings(connection) != baseline_foreign_keys:
-        raise StagedScheduleError("foreign-key findings changed from baseline")
+    with preservation_step("_verify_final_preservation", "foreign_key_check_failed"):
+        if canonical_foreign_key_findings(connection) != baseline_foreign_keys:
+            raise attach_preservation_detail(StagedScheduleError("foreign-key findings changed from baseline"),
+                                             "_verify_final_preservation", "foreign_key_mismatch")
     return _validate_scheduled_playback(connection, histories, media_root)
 
 
@@ -632,6 +679,7 @@ def _execute_native_single_run(request, attestation, restoration):
 
         connection = sqlite3.connect(database)
         statistics = {}
+        primary = None
         try:
             try:
                 columns, generated_rows = capture_catalog_rows(connection, channel)
@@ -651,13 +699,19 @@ def _execute_native_single_run(request, attestation, restoration):
                 assert_retained_history(connection, history)
                 attestation.verify(request)
             except Exception as exc:
-                connection.rollback()
-                raise NativeRunError(
+                primary = copy_preservation_detail(exc, NativeRunError(
                     "catalog_reconciliation", str(exc), phase="catalog",
                     channel=channel,
-                ) from exc
+                ))
+                raise primary from exc
+            except BaseException as exc:
+                primary = exc
+                raise
         finally:
-            connection.close()
+            _preservation_cleanup(
+                connection, primary, "_execute_native_single_run",
+                rollback=primary is not None, scheduler_invoked=scheduler_entered,
+            )
         catalog_seconds += time.monotonic() - catalog_started
         if catalog_seconds > CATALOG_BUDGET_SECONDS:
             raise NativeRunError(
@@ -722,23 +776,27 @@ def _execute_native_single_run(request, attestation, restoration):
 
     preservation_started = time.monotonic()
     connection = sqlite3.connect(database)
+    primary = None
     try:
         try:
             checked_paths = _verify_final_preservation(
                 connection, projected, histories, channel_results, protected,
                 baseline_foreign_keys, MEDIA_ROOT,
             )
-        except NativeRunError:
-            connection.rollback()
+        except NativeRunError as exc:
+            primary = exc
             raise
         except Exception as exc:
-            connection.rollback()
-            raise NativeRunError(
+            primary = copy_preservation_detail(exc, NativeRunError(
                 "preservation_failure", str(exc), phase="preservation",
                 scheduler_invoked=scheduler_entered,
-            ) from exc
+            ))
+            raise primary from exc
+        except BaseException as exc:
+            primary = exc
+            raise
     finally:
-        connection.close()
+        _preservation_cleanup(connection, primary, "_verify_final_preservation", rollback=primary is not None, scheduler_invoked=scheduler_entered)
     finished = time.monotonic()
     guide_started = time.monotonic()
     guide_validation = _run_guide_validation(

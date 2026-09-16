@@ -416,6 +416,42 @@ class ScheduleComparisonTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_preservation_detail_publication_text_and_retained_v5(self):
+        detail = {"helper": "_validate_playback_representations", "category": "media_validation_failed", "content_scope": "retained"}
+        result = _base_result("comparison")
+        result["phase_reached"] = "run_1"
+        result["scheduler_invoked"]["run_1"] = True
+        result["source_checks"] = [{"checkpoint": "after_capture", "passed": True, "changed_categories": []}]
+        result["failure"] = {
+            "phase": "run_1", "code": "c1_run_failed", "category": "scheduler_failure",
+            "message": "private exception /secret/media",
+            "c1_diagnostic": {"run": 1, "detail": make_diagnostic(
+                "scheduler_failure", "scheduler", scheduler_invoked=True, preservation_detail=detail)},
+            "launcher_summary": {"outcome": "nonzero_exit", "stdout_bytes": 0, "stderr_bytes": 0,
+                                 "stdout_truncated": False, "stderr_truncated": False,
+                                 "termination_kind": "nonzero_exit", "exit_status": 1, "signal": None},
+        }
+        report = build_validation_report(PROPOSAL, result, self.run_id, "2026-09-13T12:00:00Z")
+        publish_validation_report(report)
+        parent = self.root / PROPOSAL["proposal_id"] / self.run_id
+        stored = strict_json_loads((parent / "validation.json").read_bytes())
+        self.assertEqual(stored["findings"]["errors"][0]["c1_diagnostic"]["detail"]["preservation_detail"], detail)
+        text = (parent / "validation.txt").read_bytes()
+        self.assertIn(b"media_validation_failed", text)
+        self.assertIn(b"retained", text)
+        self.assertNotIn(b"private", text)
+        self.assertNotIn(b"/secret", _canonical_json(stored))
+        legacy = copy.deepcopy(stored)
+        legacy["schema_version"] = legacy["software"]["report_schema_version"] = 5
+        legacy["findings"]["errors"][0]["c1_diagnostic"]["detail"].pop("preservation_detail")
+        validate_report_document(legacy, retained=True)
+        with self.assertRaises(Exception):
+            validate_report_document(legacy)
+        bad = copy.deepcopy(stored)
+        bad["findings"]["errors"][0]["c1_diagnostic"]["detail"]["preservation_detail"]["category"] = "private"
+        with self.assertRaises(Exception):
+            validate_report_document(bad)
+
     def test_retained_v4_report_remains_schema_valid(self):
         retained = copy.deepcopy(self.report)
         retained["schema_version"] = 4
@@ -453,8 +489,8 @@ class ReportTests(unittest.TestCase):
         return parent
 
     def test_software_identity_schema_and_deterministic_text(self):
-        self.assertEqual(self.report["schema_version"], 5)
-        self.assertEqual(self.report["software"]["report_schema_version"], 5)
+        self.assertEqual(self.report["schema_version"], 6)
+        self.assertEqual(self.report["software"]["report_schema_version"], 6)
         self.assertTrue(self.report["software"]["director_version"])
         self.assertLessEqual(len(self.report["software"]["director_version"]), 100)
         validate_document(self.report, REPORT_SCHEMA)

@@ -15,7 +15,7 @@ PROJECT_ROOT = Path("/project")
 from station_director.single_run_protocol import (
     HeldDocument,
     REQUEST_SCHEMA,
-    RESPONSE_SCHEMA_V3 as RESPONSE_SCHEMA,
+    RESPONSE_SCHEMA_V4 as RESPONSE_SCHEMA,
     ProtocolError,
     write_private_json_exclusive,
 )
@@ -41,17 +41,17 @@ class _BoundedWarningHandler(logging.Handler):
 
 
 def _diagnostic(phase, code, *, scheduler_invoked=False, probe=None,
-                fingerprint_category=None, channel_number=None):
+                fingerprint_category=None, channel_number=None, preservation_detail=None):
     return make_diagnostic(
         code, phase, scheduler_invoked=scheduler_invoked, probe=probe,
         fingerprint_category=fingerprint_category,
-        channel_number=channel_number)
+        channel_number=channel_number, preservation_detail=preservation_detail)
 
 
 def _base_response(request):
     context = request["validation_context"]
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "operation": "native_single_run",
         "run_id": request["run_id"],
         "proposal_id": request["proposal"]["proposal_id"],
@@ -151,10 +151,11 @@ def run_worker(
                     response["phase_reached"] = "request"
                     response["failure"] = _diagnostic(
                         "request", "request_integrity_failed")
-            except SystemExit:
+            except SystemExit as exc:
                 response["failure"] = _diagnostic(
                     response["phase_reached"], "native_system_exit",
-                    scheduler_invoked=response["scheduler_invoked"])
+                    scheduler_invoked=response["scheduler_invoked"],
+                    preservation_detail=getattr(exc, "preservation_detail", None))
             except Exception as exc:
                 response["phase_reached"] = getattr(exc, "phase", response["phase_reached"])
                 response["scheduler_invoked"] = bool(
@@ -166,7 +167,8 @@ def run_worker(
                     response["failure"] = _diagnostic(
                         response["phase_reached"], getattr(exc, "code", "native_failure"),
                         scheduler_invoked=response["scheduler_invoked"],
-                        channel_number=channel_number)
+                        channel_number=channel_number,
+                        preservation_detail=getattr(exc, "preservation_detail", None))
                 guide_validation = getattr(exc, "guide_validation", None)
                 if guide_validation is not None:
                     response["guide_validation"] = guide_validation

@@ -1,0 +1,621 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://crt-station.invalid/schemas/native-dual-run.result.v4.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "operation",
+    "comparison_id",
+    "status",
+    "phase_reached",
+    "scheduler_invoked",
+    "validation_context",
+    "affected_channels",
+    "source_checks",
+    "runs",
+    "reproducibility",
+    "baseline_comparison",
+    "failure",
+    "cleanup",
+    "timings_ms"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 4
+    },
+    "operation": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/operation"
+    },
+    "comparison_id": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/comparison_id"
+    },
+    "status": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/status"
+    },
+    "phase_reached": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/phase_reached"
+    },
+    "scheduler_invoked": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_1",
+        "run_2"
+      ],
+      "properties": {
+        "run_1": {
+          "enum": [
+            true,
+            false,
+            "unknown"
+          ]
+        },
+        "run_2": {
+          "enum": [
+            true,
+            false,
+            "unknown"
+          ]
+        }
+      }
+    },
+    "validation_context": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/validation_context"
+    },
+    "affected_channels": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/affected_channels"
+    },
+    "source_checks": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/source_checks"
+    },
+    "runs": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/runs"
+    },
+    "reproducibility": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/reproducibility"
+    },
+    "baseline_comparison": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/baseline_comparison"
+    },
+    "failure": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "phase",
+            "code",
+            "category",
+            "message"
+          ],
+          "properties": {
+            "phase": {
+              "type": "string",
+              "maxLength": 100
+            },
+            "code": {
+              "type": "string",
+              "maxLength": 100
+            },
+            "category": {
+              "$ref": "native-dual-run.result.v1.schema.json#/properties/failure/oneOf/1/properties/category"
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 1000
+            },
+            "capture_failure_kind": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "native-dual-run.result.v1.schema.json#/properties/failure/oneOf/1/properties/capture_failure_kind"
+                }
+              ]
+            },
+            "capture_run": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "enum": [
+                    1,
+                    2
+                  ]
+                }
+              ]
+            },
+            "finalization_subphase": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "native-dual-run.result.v1.schema.json#/properties/failure/oneOf/1/properties/finalization_subphase"
+                }
+              ]
+            },
+            "c1_diagnostic": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "run",
+                    "detail"
+                  ],
+                  "properties": {
+                    "run": {
+                      "enum": [
+                        1,
+                        2
+                      ]
+                    },
+                    "detail": {
+                      "$ref": "#/$defs/host_diagnostic"
+                    }
+                  }
+                }
+              ]
+            },
+            "launcher_summary": {
+              "oneOf": [
+                {
+                  "type": "null"
+                },
+                {
+                  "$ref": "#/$defs/launcher_summary"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "cleanup": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/cleanup"
+    },
+    "timings_ms": {
+      "$ref": "native-dual-run.result.v1.schema.json#/properties/timings_ms"
+    }
+  },
+  "$defs": {
+    "host_diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "domain",
+        "phase",
+        "code",
+        "template",
+        "scheduler_invoked",
+        "probe",
+        "fingerprint_category",
+        "channel_number",
+        "preservation_detail"
+      ],
+      "properties": {
+        "domain": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "phase": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "template": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "scheduler_invoked": {
+          "enum": [
+            true,
+            false,
+            "unknown"
+          ]
+        },
+        "probe": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "maxLength": 100
+            }
+          ]
+        },
+        "fingerprint_category": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "maxLength": 100
+            }
+          ]
+        },
+        "channel_number": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8
+            }
+          ]
+        },
+        "preservation_detail": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper",
+                "category",
+                "content_scope"
+              ],
+              "properties": {
+                "helper": {
+                  "const": "restore_sequence_state"
+                },
+                "category": {
+                  "enum": [
+                    "schema_mismatch",
+                    "schema_check_failed",
+                    "delete_failed",
+                    "insert_failed"
+                  ]
+                },
+                "content_scope": {
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper",
+                "category",
+                "content_scope"
+              ],
+              "properties": {
+                "helper": {
+                  "const": "_restore_sequences"
+                },
+                "category": {
+                  "enum": [
+                    "open_failed",
+                    "commit_failed",
+                    "verification_failed",
+                    "rollback_failed",
+                    "close_failed"
+                  ]
+                },
+                "content_scope": {
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper",
+                "category",
+                "content_scope"
+              ],
+              "properties": {
+                "helper": {
+                  "const": "_verify_final_preservation"
+                },
+                "category": {
+                  "enum": [
+                    "commit_failed",
+                    "foreign_key_check_failed",
+                    "foreign_key_mismatch",
+                    "rollback_failed",
+                    "close_failed"
+                  ]
+                },
+                "content_scope": {
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper",
+                "category",
+                "content_scope"
+              ],
+              "properties": {
+                "helper": {
+                  "const": "assert_retained_history"
+                },
+                "category": {
+                  "enum": [
+                    "schedule_check_failed",
+                    "schedule_mismatch",
+                    "catalog_check_failed",
+                    "catalog_mismatch"
+                  ]
+                },
+                "content_scope": {
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper",
+                "category",
+                "content_scope"
+              ],
+              "properties": {
+                "helper": {
+                  "const": "assert_protected_state"
+                },
+                "category": {
+                  "enum": [
+                    "check_failed",
+                    "mismatch"
+                  ]
+                },
+                "content_scope": {
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper",
+                "category",
+                "content_scope"
+              ],
+              "properties": {
+                "helper": {
+                  "const": "coverage_report"
+                },
+                "category": {
+                  "enum": [
+                    "check_failed",
+                    "gap",
+                    "overlap",
+                    "gap_and_overlap"
+                  ]
+                },
+                "content_scope": {
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper",
+                "category",
+                "content_scope"
+              ],
+              "properties": {
+                "helper": {
+                  "const": "_validate_final_cross_channel_exclusions"
+                },
+                "category": {
+                  "enum": [
+                    "check_failed",
+                    "collision"
+                  ]
+                },
+                "content_scope": {
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper",
+                "category",
+                "content_scope"
+              ],
+              "properties": {
+                "helper": {
+                  "const": "_playback_representations"
+                },
+                "category": {
+                  "enum": [
+                    "plan_invalid",
+                    "reference_failure"
+                  ]
+                },
+                "content_scope": {
+                  "enum": [
+                    null,
+                    "retained",
+                    "generated"
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper",
+                "category",
+                "content_scope"
+              ],
+              "properties": {
+                "helper": {
+                  "const": "_validate_playback_representations"
+                },
+                "category": {
+                  "enum": [
+                    "check_failed",
+                    "descriptor_invalid",
+                    "autobump_selected",
+                    "stream_rejected",
+                    "media_validation_failed"
+                  ]
+                },
+                "content_scope": {
+                  "enum": [
+                    null,
+                    "retained",
+                    "generated"
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "helper",
+                "category",
+                "content_scope"
+              ],
+              "properties": {
+                "helper": {
+                  "const": "_execute_native_single_run"
+                },
+                "category": {
+                  "enum": [
+                    "rollback_failed",
+                    "close_failed"
+                  ]
+                },
+                "content_scope": {
+                  "enum": [
+                    null
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "launcher_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "stdout_bytes",
+        "stderr_bytes",
+        "stdout_truncated",
+        "stderr_truncated",
+        "termination_kind",
+        "exit_status",
+        "signal"
+      ],
+      "properties": {
+        "outcome": {
+          "enum": [
+            "completed",
+            "nonzero_exit",
+            "timed_out",
+            "launch_error"
+          ]
+        },
+        "stdout_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "stderr_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "stdout_truncated": {
+          "type": "boolean"
+        },
+        "stderr_truncated": {
+          "type": "boolean"
+        },
+        "termination_kind": {
+          "enum": [
+            "completed",
+            "nonzero_exit",
+            "runtime_timeout",
+            "outer_watchdog",
+            "oom_kill",
+            "external_signal",
+            "launcher_failure",
+            "launcher_state_invalid",
+            "sandbox_restriction"
+          ]
+        },
+        "exit_status": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 255
+            }
+          ]
+        },
+        "signal": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 255
+            }
+          ]
+        }
+      }
+    }
+  }
+}

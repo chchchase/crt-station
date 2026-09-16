@@ -24,7 +24,7 @@ from station_director.preservation import (
 from station_director.single_run_protocol import (
     HeldDocument,
     ProtocolError,
-    RESPONSE_SCHEMA_V3 as RESPONSE_SCHEMA,
+    RESPONSE_SCHEMA_V4 as RESPONSE_SCHEMA,
     bind_request,
     write_private_json_exclusive,
     REQUEST_SCHEMA,

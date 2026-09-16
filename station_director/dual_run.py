@@ -80,7 +80,7 @@ ORDINARY_NON_RUN_ALLOWANCE_SECONDS = (
 )
 ORDINARY_WORK_ESTIMATE_SECONDS = (
     2 * PER_RUN_TIMEOUT_SECONDS + ORDINARY_NON_RUN_ALLOWANCE_SECONDS)
-RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v3.schema.json"
+RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v4.schema.json"
 
 CAPTURE_FAILURE_KINDS = frozenset({
     "source_path_resolution", "invocation_verification", "stage_allocation",
@@ -650,7 +650,7 @@ def _prepare_scope(project_root, source_root, media_root, proposal, policy, comp
 
 def _base_result(comparison_id):
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "operation": "native_dual_run_comparison",
         "comparison_id": comparison_id,
         "status": "failed",

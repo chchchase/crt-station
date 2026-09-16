@@ -2087,6 +2087,7 @@ class DualRunLifecycleTests(unittest.TestCase):
                 failure=make_diagnostic(
                     "autobump_selected", "scheduler",
                     scheduler_invoked=True, channel_number=2,
+                    preservation_detail={"helper": "restore_sequence_state", "category": "insert_failed", "content_scope": None},
                 ),
             )
 
@@ -2126,6 +2127,8 @@ class DualRunLifecycleTests(unittest.TestCase):
                 not item["passed"] and item["quarantined"]
                 for item in result["cleanup"]
             ))
+            self.assertEqual(result["failure"]["c1_diagnostic"]["detail"]["preservation_detail"],
+                             failed["failure"]["preservation_detail"])
 
     def test_input_change_between_runs_is_not_nondeterminism(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2659,8 +2662,8 @@ class NativeTwoProcessIntegrationTests(unittest.TestCase):
             self.assertTrue(all(not item["staged_main_config"] for item in details))
             self.assertEqual([item["cache_size"] for item in details], [1, 1])
             self.assertTrue(all(item["guide_validation"]["status"] == "pass" for item in details))
-            self.assertEqual(result["schema_version"], 3)
-            self.assertEqual([item["response_schema_version"] for item in details], [3, 3])
+            self.assertEqual(result["schema_version"], 4)
+            self.assertEqual([item["response_schema_version"] for item in details], [4, 4])
 
     def test_strict_invalid_legacy_chapters_remain_unavailable_to_validation(self):
         with tempfile.TemporaryDirectory() as directory:
