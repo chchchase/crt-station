@@ -498,7 +498,7 @@ def _is_final_chapter_duration_overrun(value, duration):
 
 def _chapter_counts(connection, eligible, existing_paths, *, deadline=None):
     from fs42.chapter_analysis import (
-        COMPLETED_METHODS, METHOD_SHORT, ChapterAnalysisError, validate_chapters,
+        ChapterAnalysisError, classify_attestation, load_chapter_json, validate_chapters,
     )
 
     eligible_paths = set(eligible)
@@ -524,6 +524,7 @@ def _chapter_counts(connection, eligible, existing_paths, *, deadline=None):
                     item.size, item.mtime if item.mtime is not None else item.mtime_ns / 1e9)):
             raise MaintenanceError("chapter_cache_invalid")
     stored = {}
+    stale_negative = set()
     for path in eligible_paths:
         _check_deadline(deadline)
         row = connection.execute(
@@ -534,8 +535,8 @@ def _chapter_counts(connection, eligible, existing_paths, *, deadline=None):
             counts["missing"] += 1
             continue
         try:
-            value = json.loads(row[0])
-        except (TypeError, json.JSONDecodeError) as exc:
+            value = load_chapter_json(row[0])
+        except (TypeError, ValueError, RecursionError) as exc:
             raise MaintenanceError("chapter_cache_invalid") from exc
         if value == []:
             counts["current_empty"] += 1
@@ -551,24 +552,16 @@ def _chapter_counts(connection, eligible, existing_paths, *, deadline=None):
             else:
                 counts["trusted_legacy_nonempty"] += 1
         elif isinstance(value, dict):
-            if set(value) != {"attestation_version", "method", "media_identity", "chapters"}:
-                raise MaintenanceError("chapter_cache_invalid")
-            identity = value.get("media_identity")
-            if (value.get("attestation_version") != 1
-                    or value.get("method") not in COMPLETED_METHODS
-                    or not isinstance(identity, dict)
-                    or set(identity) != {"size", "mtime_ns"}
-                    or identity.get("size") != eligible[path].size
-                    or identity.get("mtime_ns") != eligible[path].mtime_ns):
-                raise MaintenanceError("chapter_cache_invalid")
             try:
-                chapters = validate_chapters(value.get("chapters"), metadata[path][0])
-            except ChapterAnalysisError as exc:
+                status, unused_chapters = classify_attestation(
+                    value, metadata[path][0], eligible[path].size, eligible[path].mtime_ns)
+            except (ValueError, TypeError, ChapterAnalysisError) as exc:
                 raise MaintenanceError("chapter_cache_invalid") from exc
-            if value["method"] == METHOD_SHORT and (
-                    chapters or metadata[path][0] >= 300):
-                raise MaintenanceError("chapter_cache_invalid")
-            counts["versioned"] += 1
+            if status == "re_attestation_required":
+                counts["re_attestation_required"] += 1
+                stale_negative.add(path)
+            else:
+                counts["versioned"] += 1
         else:
             raise MaintenanceError("chapter_cache_invalid")
     chapter_rows = connection.execute(
@@ -606,7 +599,7 @@ def _chapter_counts(connection, eligible, existing_paths, *, deadline=None):
     counts["attestations"] = (
         counts["missing"] + counts["current_empty"]
         + counts["re_attestation_required"])
-    targets = set()
+    targets = set(stale_negative)
     for path, raw in stored.items():
         if raw is None:
             targets.add(path)
@@ -2157,7 +2150,7 @@ def _chapter_digest_excluding(connection, excluded=()):
 
 def _writer_row_state(connection, path, item):
     from fs42.chapter_analysis import (
-        COMPLETED_METHODS, METHOD_SHORT, ChapterAnalysisError, validate_chapters,
+        ChapterAnalysisError, classify_attestation, load_chapter_json, validate_chapters,
     )
 
     row = connection.execute(
@@ -2170,7 +2163,7 @@ def _writer_row_state(connection, path, item):
     if duration_row is None:
         raise MaintenanceError("chapter_cache_invalid")
     try:
-        value = json.loads(raw)
+        value = load_chapter_json(raw)
         if isinstance(value, list):
             if not value:
                 return {"status": "legacy_empty", "raw": raw}
@@ -2182,25 +2175,12 @@ def _writer_row_state(connection, path, item):
                     raise MaintenanceError("chapter_cache_invalid") from exc
                 return {"status": "re_attestation_required", "raw": raw}
             return {"status": "legacy_nonempty", "raw": raw}
-        if (not isinstance(value, dict)
-                or set(value) != {
-                    "attestation_version", "method", "media_identity", "chapters"
-                }):
-            raise MaintenanceError("chapter_cache_invalid")
-        identity = value["media_identity"]
-        if (value["attestation_version"] != 1
-                or value["method"] not in COMPLETED_METHODS
-                or not isinstance(identity, dict)
-                or set(identity) != {"size", "mtime_ns"}
-                or identity != {"size": item.size, "mtime_ns": item.mtime_ns}):
-            raise MaintenanceError("chapter_cache_invalid")
-        chapters = validate_chapters(value["chapters"], duration_row[0])
-        if value["method"] == METHOD_SHORT and (chapters or duration_row[0] >= 300):
-            raise MaintenanceError("chapter_cache_invalid")
-        return {"status": "trusted_v1", "raw": raw}
+        status, unused_chapters = classify_attestation(
+            value, duration_row[0], item.size, item.mtime_ns)
+        return {"status": status, "raw": raw}
     except MaintenanceError:
         raise
-    except (TypeError, KeyError, json.JSONDecodeError, ChapterAnalysisError) as exc:
+    except (TypeError, KeyError, ValueError, RecursionError, ChapterAnalysisError) as exc:
         raise MaintenanceError("chapter_cache_invalid") from exc
 
 
@@ -2298,7 +2278,8 @@ def _publish_next_progress(document, *, arguments, **updates):
 
 
 def _reconcile_inflight(connection, document, primary, questionable, inventory,
-                        orphans, *, arguments, root_fd):
+                       orphans, *, arguments, root_fd):
+    from fs42.chapter_analysis import TRUSTED_CHAPTER_STATES
     inflight = document["inflight"]
     if inflight is None:
         if _chapter_table_digest(connection) != document["chapter_identity"]:
@@ -2330,7 +2311,7 @@ def _reconcile_inflight(connection, document, primary, questionable, inventory,
         if _chapter_table_digest(connection) != document["chapter_identity"]:
             raise MaintenanceError("progress_state_invalid")
         return document
-    if current["status"] != "trusted_v1":
+    if current["status"] not in TRUSTED_CHAPTER_STATES:
         raise MaintenanceError("progress_state_invalid")
     bitmap_key = inflight["phase"] + "_attempted"
     resolved_key = inflight["phase"] + "_unresolved"
@@ -2348,6 +2329,7 @@ def _reconcile_inflight(connection, document, primary, questionable, inventory,
 
 def _verify_progress_target_states(connection, document, primary, questionable,
                                    inventory):
+    from fs42.chapter_analysis import TRUSTED_CHAPTER_STATES
     for phase, targets, original in (
             ("primary", primary, {"missing", "legacy_empty"}),
             ("questionable", questionable, {"re_attestation_required"})):
@@ -2356,7 +2338,7 @@ def _verify_progress_target_states(connection, document, primary, questionable,
         for index, path in enumerate(targets):
             state = _writer_row_state(connection, path, inventory[path])["status"]
             if _bitmap_has(attempted, index) and not _bitmap_has(unresolved, index):
-                if state != "trusted_v1":
+                if state not in TRUSTED_CHAPTER_STATES:
                     raise MaintenanceError("progress_state_invalid")
             elif state not in original:
                 raise MaintenanceError("progress_state_invalid")

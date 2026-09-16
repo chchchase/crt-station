@@ -557,6 +557,9 @@ class MediaProcessor:
         if result.method == METHOD_SHORT:
             _l.info("Skipping chapter markers in media shorter than five minutes")
             return None
+        if result.unusable_reason is not None:
+            _l.info("Chapter analysis completed without usable chapter points")
+            return None
         chapters = result.as_list()
         _l.info("Chapter analysis completed")
         return chapters

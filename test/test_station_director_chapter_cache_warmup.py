@@ -1888,6 +1888,436 @@ class SweepLivenessTests(unittest.TestCase):
         self.assertNotIn(secret, rendered)
 
 
+def negative_analysis(duration=600.0):
+    from fs42.chapter_analysis import _parse_probe_output
+    return _parse_probe_output(json.dumps({"chapters": [
+        {"start_time": "0", "end_time": str(duration + 1)}
+    ]}).encode(), duration, allow_negative=True)
+
+
+class NegativeAnalysisTests(unittest.TestCase):
+    def parse(self, chapters, duration=600.0):
+        from fs42.chapter_analysis import _parse_probe_output
+        return _parse_probe_output(json.dumps({"chapters": chapters}).encode(),
+                                   duration, allow_negative=True)
+
+    def test_exact_gate_and_boundary(self):
+        from fs42.chapter_analysis import CompletedChapterAnalysis, METHOD_FFPROBE
+        result = negative_analysis()
+        self.assertIsInstance(result, CompletedChapterAnalysis)
+        self.assertEqual(result.method, METHOD_FFPROBE)
+        self.assertEqual(result.chapters, ())
+        self.assertEqual(result.as_list(), [])
+        self.assertEqual(result.unusable_reason, "final_endpoint_exceeds_cached_duration")
+        self.assertEqual(result.trusted_duration, float(600).hex())
+        equal = self.parse([{"start_time": "0", "end_time": "600"}])
+        self.assertIsInstance(equal, tuple)
+        at_boundary = self.parse([{"start_time": "600", "end_time": "601"}])
+        self.assertIsInstance(at_boundary, CompletedChapterAnalysis)
+
+    def test_every_other_geometry_failure_stays_failure(self):
+        from fs42.chapter_analysis import ChapterAnalysisError
+        cases = [
+            [{"start_time": "601", "end_time": "602"}],
+            [{"start_time": "0", "end_time": "601"}, {"start_time": "601", "end_time": "602"}],
+            [{"start_time": "0", "end_time": "100"}, {"start_time": "99", "end_time": "601"}],
+            [{"start_time": "200", "end_time": "250"}, {"start_time": "100", "end_time": "601"}],
+            [{"start_time": "100", "end_time": "99"}, {"start_time": "100", "end_time": "601"}],
+            [{"start_time": "0", "end_time": "601", "tags": {"title": False}}],
+            [{"start_time": "0", "end_time": "601", "tags": {"title": "x" * 4097}}],
+            [{"start_time": "0", "end_time": "601", "tags": {"title": "\ud800"}}],
+            [{"start_time": "0", "end_time": "601", "tags": []}],
+            [{"end_time": "601"}], [False],
+        ]
+        for case in cases:
+            with self.subTest(case=cases.index(case)), self.assertRaises(ChapterAnalysisError):
+                self.parse(case)
+
+    def test_invalid_numeric_values_cannot_hide_in_overrun(self):
+        from fs42.chapter_analysis import ChapterAnalysisError
+        for value in (True, False, None, -1, "-1", "-1e-999", "1e-999", "1e999",
+                      float("inf"), float("nan"), 10**400, {}, [], "NaN", " 0 "):
+            for field in ("start_time", "end_time"):
+                raw = {"start_time": "0", "end_time": "601", field: value}
+                with self.subTest(field=field, kind=type(value).__name__), self.assertRaises(ChapterAnalysisError):
+                    self.parse([raw])
+
+    def test_rounding_cannot_hide_geometry_or_endpoint_overrun(self):
+        from fs42.chapter_analysis import ChapterAnalysisError, CompletedChapterAnalysis
+        cases = [
+            [('0','100.00000000000000001'),('100','601')],
+            [('100.00000000000000001','100'),('100','601')],
+            [('600.00000000000000001','601')],
+            [('0','600.00000000000000001'),('600.00000000000000001','601')],
+        ]
+        for case in cases:
+            with self.subTest(case=case), self.assertRaises(ChapterAnalysisError):
+                self.parse([{'start_time':s,'end_time':e} for s,e in case])
+        result = self.parse([{'start_time':'0','end_time':'600.00000000000000001'}])
+        self.assertIsInstance(result, CompletedChapterAnalysis)
+        self.assertIsNotNone(result.unusable_reason)
+
+    def test_strict_json_and_required_chapter_values(self):
+        from fs42.chapter_analysis import ChapterAnalysisError, _parse_probe_output
+        for payload in (b'{', b'[]', b'{"chapters":null}',
+                        b'{"chapters":[],"chapters":[]}',
+                        b'{"chapters":[{"start_time":0,"end_time":601,"end_time":602}]}',
+                        b'{"chapters":[{"start_time":-1e-999,"end_time":601}]}',
+                        b'{"chapters":[],"unexpected":[]}',
+                        b'{"chapters":[{"start_time":0,"end_time":NaN}]}'):
+            with self.subTest(payload=payload[:30]), self.assertRaises(ChapterAnalysisError):
+                _parse_probe_output(payload, 600, allow_negative=True)
+
+    def test_trusted_duration_canonical_roundtrip_and_rejections(self):
+        import sys
+        from fs42.chapter_analysis import encode_trusted_duration, decode_trusted_duration
+        for value in (600.0, 0.1, sys.float_info.max, float.fromhex('0x0.0000000000001p-1022')):
+            encoded = encode_trusted_duration(value)
+            self.assertEqual(decode_trusted_duration(encoded).hex(), value.hex())
+        for bad in (True, None, 0, -1, float('inf'), float('nan'), 10**400, '600'):
+            with self.assertRaises(ValueError):
+                encode_trusted_duration(bad)
+        for bad in (True, None, 600, 600.0, '600', '600.0', '0x1.2cp+9',
+                    '0X1.2C00000000000P+9', ' 0x1.2c00000000000p+9',
+                    '0x1.2c00000000000p+09', '0x0.0p+0', '-0x0.0p+0',
+                    '-0x1.0p+0', 'inf', 'nan', '0x1.0p+99999'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                decode_trusted_duration(bad)
+
+    def test_result_cannot_carry_invalid_chapters_or_wrong_method(self):
+        from fs42.chapter_analysis import CompletedChapterAnalysis, METHOD_FFPROBE, METHOD_SHORT, UNUSABLE_REASON
+        for method, chapters, reason, duration in (
+                (METHOD_FFPROBE, ({"chapter_end": 601},), UNUSABLE_REASON, float(600).hex()),
+                (METHOD_SHORT, (), UNUSABLE_REASON, float(600).hex()),
+                (METHOD_FFPROBE, (), 'other', float(600).hex()),
+                (METHOD_FFPROBE, (), UNUSABLE_REASON, '600'),
+                (METHOD_FFPROBE, (), None, float(600).hex())):
+            with self.assertRaises(ValueError):
+                CompletedChapterAnalysis(method, chapters, reason, duration)
+
+    def test_successful_real_parser_dispatch_without_real_probe(self):
+        from fs42.chapter_analysis import analyze_chapters, ChapterAnalysisError
+        payload = b'{"chapters":[{"start_time":"0","end_time":"601"}]}'
+        for status in (0, 1, -15):
+            read_fd, write_fd = os.pipe()
+            os.write(write_fd, payload)
+            os.close(write_fd)
+            output = os.fdopen(read_fd, 'rb', buffering=0)
+            process = mock.Mock(stdout=output, poll=lambda: status, wait=lambda **kw: status)
+            launcher = mock.Mock(return_value=process)
+            if status == 0:
+                self.assertEqual(analyze_chapters('/proc/self/fd/9', 600, pass_fds=(9,),
+                                                  popen=launcher), negative_analysis())
+            else:
+                with self.assertRaises(ChapterAnalysisError):
+                    analyze_chapters('/proc/self/fd/9', 600, pass_fds=(9,), popen=launcher)
+            self.assertTrue(output.closed)
+            self.assertEqual(launcher.call_args.args[0], [
+                '/usr/bin/ffprobe', '-v', 'quiet', '-protocol_whitelist', 'file,pipe',
+                '-print_format', 'json', '-show_chapters', '/proc/self/fd/9'])
+
+
+class NegativeEnvelopeTests(unittest.TestCase):
+    setUp = ChapterEnvelopeTests.setUp
+    tearDown = ChapterEnvelopeTests.tearDown
+
+    def publish(self):
+        from fs42.fluid_statements import FluidStatements
+        with self.connection:
+            FluidStatements.add_chapter_points(self.connection, str(self.media),
+                                               negative_analysis(), self.media.stat(),
+                                               baseline_verified=True)
+        return self.connection.execute('SELECT points FROM chapter_points').fetchone()[0]
+
+    def item(self):
+        info = self.media.stat()
+        return warmup.MediaItem((self.media.name,), info.st_size, info.st_mtime_ns, info.st_mtime)
+
+    def test_negative_envelope_redaction_and_three_reader_agreement(self):
+        from fs42.fluid_statements import FluidStatements
+        encoded = self.publish()
+        envelope = json.loads(encoded)
+        self.assertEqual(set(envelope), {'attestation_version','method','media_identity',
+                                        'outcome','reason','trusted_duration'})
+        self.assertEqual(envelope['attestation_version'], 2)
+        self.assertEqual(envelope['method'], 'ffprobe_show_chapters_v1')
+        self.assertEqual(envelope['outcome'], 'unusable_chapters')
+        self.assertEqual(envelope['reason'], 'final_endpoint_exceeds_cached_duration')
+        self.assertNotIn('601', encoded)
+        self.assertNotIn(str(self.media), encoded)
+        self.assertEqual(FluidStatements.get_chapter_points(self.connection, str(self.media)), {})
+        self.assertEqual(FluidStatements.classify_chapter_points(self.connection,str(self.media))['status'],
+                         'trusted_negative_v2')
+        self.assertEqual(warmup._writer_row_state(self.connection,str(self.media),self.item())['status'],
+                         'trusted_negative_v2')
+        counts = warmup._chapter_counts(self.connection,{str(self.media):self.item()},set())
+        self.assertEqual((counts['versioned'],counts['attestations'],counts['legacy_empty']), (1,0,0))
+
+    def test_v1_bytes_are_unchanged(self):
+        from fs42.chapter_analysis import CompletedChapterAnalysis, METHOD_FFPROBE
+        from fs42.fluid_statements import FluidStatements
+        for chapters in ((), ({'chapter_start':0.0,'chapter_end':10.0,'segment_duration':10.0},)):
+            self.connection.execute('DELETE FROM chapter_points')
+            info = self.media.stat()
+            with self.connection:
+                FluidStatements.add_chapter_points(self.connection,str(self.media),
+                    CompletedChapterAnalysis(METHOD_FFPROBE,chapters),info,baseline_verified=True)
+            expected = {'attestation_version':1,'method':METHOD_FFPROBE,
+                        'media_identity':{'size':info.st_size,'mtime_ns':info.st_mtime_ns},
+                        'chapters':list(chapters)}
+            self.assertEqual(self.connection.execute('SELECT points FROM chapter_points').fetchone()[0],
+                             json.dumps(expected,sort_keys=True,separators=(',',':')))
+
+    def test_invalid_v2_envelopes_rejected_by_all_readers(self):
+        from fs42.fluid_statements import FluidStatements
+        envelope = json.loads(self.publish())
+        variants = []
+        for key,value in [('attestation_version',True),('method','unknown'),('method',[]),
+                          ('outcome','no_chapters'),('reason','other'),('chapters',[]),
+                          ('trusted_duration',True),('trusted_duration',None),('trusted_duration',600),
+                          ('trusted_duration','600'),('trusted_duration','0x1.2cp+9'),
+                          ('media_identity',{'size':True,'mtime_ns':self.media.stat().st_mtime_ns})]:
+            variant = dict(envelope)
+            variant[key] = value
+            variants.append(variant)
+        for key in envelope:
+            variant = dict(envelope)
+            del variant[key]
+            variants.append(variant)
+        for variant in variants:
+            with self.subTest(variant=list(variant)):
+                self.connection.execute('UPDATE chapter_points SET points=?',(json.dumps(variant),))
+                with self.assertRaises(ValueError):
+                    FluidStatements.classify_chapter_points(self.connection,str(self.media))
+                with self.assertRaises(warmup.MaintenanceError):
+                    warmup._writer_row_state(self.connection,str(self.media),self.item())
+                with self.assertRaises(warmup.MaintenanceError):
+                    warmup._chapter_counts(self.connection,{str(self.media):self.item()},set())
+
+    def test_duration_identity_and_future_method_changes_require_retry(self):
+        from fs42 import chapter_analysis as analysis
+        from fs42.fluid_statements import FluidStatements
+        envelope = json.loads(self.publish())
+        def assert_stale():
+            self.assertEqual(FluidStatements.classify_chapter_points(self.connection,str(self.media))['status'],
+                             're_attestation_required')
+            self.assertEqual(warmup._writer_targets(self.connection,{str(self.media):self.item()}),
+                             ((),(str(self.media),)))
+            counts = warmup._chapter_counts(self.connection,{str(self.media):self.item()},set())
+            self.assertEqual((counts['versioned'],counts['re_attestation_required']), (0,1))
+        self.connection.execute('UPDATE file_meta SET duration=600.0000000000001')
+        assert_stale()
+        self.connection.execute('UPDATE file_meta SET duration=600')
+        with mock.patch.object(analysis,'ACTIVE_NEGATIVE_METHOD','future_explicit_method'):
+            assert_stale()
+        for key in ('size','mtime_ns'):
+            changed = json.loads(json.dumps(envelope))
+            changed['media_identity'][key] += 1
+            self.connection.execute('UPDATE chapter_points SET points=?',(json.dumps(changed),))
+            assert_stale()
+
+    def test_validation_and_ordinary_scans_do_not_probe_negative_cache(self):
+        from fs42.fluid_builder import FluidBuilder
+        from fs42.fluid_statements import FluidStatements
+        from fs42.scheduling_context import ValidationCatalogMetadataUnavailable
+        self.publish()
+        builder = FluidBuilder.__new__(FluidBuilder)
+        builder.db_path = self.database
+        builder._l = mock.Mock()
+        entry = type('Entry',(),{'realpath':str(self.media),'duration':600.0})()
+        for validation in (False,True):
+            with mock.patch('fs42.fluid_builder.in_validation_mode',return_value=validation), mock.patch(
+                    'fs42.fluid_builder.analyze_chapters',side_effect=AssertionError('must not probe')) as probe:
+                builder.scan_chapters_for_entries([entry])
+                probe.assert_not_called()
+        self.connection.execute('UPDATE file_meta SET duration=601')
+        self.connection.commit()
+        with mock.patch('fs42.fluid_builder.in_validation_mode',return_value=True), mock.patch(
+                'fs42.fluid_builder.analyze_chapters') as probe:
+            with self.assertRaises(ValidationCatalogMetadataUnavailable):
+                builder.scan_chapters_for_entries([entry])
+            probe.assert_not_called()
+        with mock.patch('fs42.fluid_statements.in_validation_mode',return_value=True), mock.patch.object(
+                FluidStatements, '_chapter_lookup_path', side_effect=lambda path: path), mock.patch.object(
+                FluidStatements, '_chapter_identity_path', side_effect=lambda path: path):
+            with self.assertRaises(ValidationCatalogMetadataUnavailable):
+                FluidStatements.get_chapter_points(self.connection,str(self.media))
+
+    def test_direct_detector_preserves_unusable_none_behavior(self):
+        from fs42.media_processor import MediaProcessor
+        with mock.patch('fs42.chapter_analysis.analyze_chapters',return_value=negative_analysis()):
+            self.assertIsNone(MediaProcessor.chapter_detect('synthetic',600))
+
+    def test_real_validation_context_reads_negative_without_probe(self):
+        from fs42.fluid_builder import FluidBuilder
+        from fs42.fluid_statements import FluidStatements
+        from fs42.scheduling_context import ValidationSchedulingContext, activate_validation_context
+        self.publish()
+        canonical = '/mnt/t7/CRT-Media/' + self.media.name
+        with self.connection:
+            self.connection.execute('UPDATE chapter_points SET path=?',(canonical,))
+            self.connection.execute('UPDATE file_meta SET path=?',(canonical,))
+        start = datetime.datetime(2026,9,14)
+        context = ValidationSchedulingContext(reference_clock=start,start_time=start,
+            end_time=start+datetime.timedelta(hours=1),seed=1,media_root=str(self.root))
+        builder = FluidBuilder.__new__(FluidBuilder)
+        builder.db_path = self.database
+        builder._l = mock.Mock()
+        entry = type('Entry',(),{'realpath':str(self.media),'duration':600.0})()
+        with activate_validation_context(context), mock.patch(
+                'fs42.fluid_builder.analyze_chapters',side_effect=AssertionError('must not probe')) as probe:
+            builder.scan_chapters_for_entries([entry])
+            self.assertEqual(FluidStatements.get_chapter_points(
+                self.connection,'/media/'+self.media.name),{})
+            probe.assert_not_called()
+
+    def test_ordinary_duration_drift_is_logged_and_skipped(self):
+        from fs42.fluid_builder import FluidBuilder
+        from fs42.fluid_statements import FluidStatements
+        builder = FluidBuilder.__new__(FluidBuilder)
+        builder.db_path = self.database
+        builder._l = mock.Mock()
+        entry = type('Entry',(),{'realpath':str(self.media),'duration':600.0})()
+        def drift(*args,**kwargs):
+            with self.connection:
+                self.connection.execute('UPDATE file_meta SET duration=601')
+            return negative_analysis()
+        for directory_scan in (False, True):
+            with self.connection:
+                self.connection.execute('UPDATE file_meta SET duration=600')
+            with mock.patch('fs42.fluid_builder.analyze_chapters',side_effect=drift), mock.patch.object(
+                    FluidStatements,'_chapter_baseline_is_durable',return_value=True), mock.patch.object(
+                    FluidStatements,'check_file_cache',return_value=entry), mock.patch(
+                    'fs42.fluid_builder.MediaProcessor._rfind_media',return_value=[str(self.media)]):
+                if directory_scan:
+                    builder.scan_chapters(str(self.root))
+                else:
+                    builder.scan_chapters_for_entries([entry])
+            self.assertIsNone(self.connection.execute('SELECT points FROM chapter_points').fetchone())
+            builder._l.error.assert_called_with('Chapter analysis failed')
+
+    def test_negative_duration_cas_and_row_cas_leave_rows_untouched(self):
+        from fs42.fluid_statements import FluidStatements
+        info = self.media.stat()
+        self.connection.execute('UPDATE file_meta SET duration=601')
+        self.connection.commit()
+        with self.assertRaises(ValueError), self.connection:
+            FluidStatements.add_chapter_points(self.connection,str(self.media),negative_analysis(),info,
+                                               baseline_verified=True)
+        self.assertIsNone(self.connection.execute('SELECT points FROM chapter_points').fetchone())
+        self.connection.execute('UPDATE file_meta SET duration=600')
+        self.connection.execute('INSERT INTO chapter_points VALUES(?,?,?)',(str(self.media),'[]','old'))
+        self.connection.commit()
+        previous = {'status':'re_attestation_required','raw':'different'}
+        with self.assertRaises(RuntimeError), self.connection:
+            FluidStatements.add_chapter_points(self.connection,str(self.media),negative_analysis(),info,previous,
+                                               baseline_verified=True,replace_questionable=True)
+        self.assertEqual(self.connection.execute('SELECT points,last_updated FROM chapter_points').fetchone(),('[]','old'))
+
+    def test_duration_cas_at_publication_and_transaction_rollback(self):
+        from fs42.fluid_statements import FluidStatements
+        for legacy in (False,True):
+            with self.subTest(legacy=legacy):
+                with self.connection:
+                    self.connection.execute('DELETE FROM chapter_points')
+                    if legacy:
+                        self.connection.execute('INSERT INTO chapter_points VALUES(?,?,?)',
+                                                (str(self.media),'[]','old'))
+                previous = {'status':'legacy_empty' if legacy else 'missing','raw':'[]' if legacy else None}
+                def changed_after_read(connection,path):
+                    connection.execute('UPDATE file_meta SET duration=601')
+                    return 600.0
+                with mock.patch.object(FluidStatements,'_chapter_duration',side_effect=changed_after_read):
+                    with self.assertRaises(RuntimeError), self.connection:
+                        FluidStatements.add_chapter_points(self.connection,str(self.media),negative_analysis(),
+                                                           self.media.stat(),previous,baseline_verified=True)
+                self.assertEqual(self.connection.execute('SELECT duration FROM file_meta').fetchone(),(600.0,))
+                self.assertEqual(self.connection.execute('SELECT points,last_updated FROM chapter_points').fetchall(),
+                                 [('[]','old')] if legacy else [])
+
+
+class NegativeSweepTests(unittest.TestCase):
+    setUp = SweepLivenessTests.setUp
+    tearDown = SweepLivenessTests.tearDown
+    dataset = SweepLivenessTests.dataset
+    counts = SweepLivenessTests.counts
+    run_writer = SweepLivenessTests.run_writer
+
+    def test_blocked_340_and_120_resume_to_negative_without_touching_v1(self):
+        from fs42.chapter_analysis import ChapterAnalysisError, CompletedChapterAnalysis, METHOD_FFPROBE
+        inventory = self.dataset(primary=341,questionable=120)
+        first = True
+        def fail(*args,**kwargs):
+            nonlocal first
+            if first:
+                first = False
+                return CompletedChapterAnalysis(METHOD_FFPROBE,())
+            raise ChapterAnalysisError('chapter_data_invalid')
+        _, blocked = self.run_writer(inventory,fail)
+        self.assertEqual((blocked[0],blocked[3]),('blocked',460))
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            v1 = connection.execute('SELECT path,points,last_updated FROM chapter_points WHERE points LIKE \'%"attestation_version":1%\'').fetchone()
+        analyze = mock.Mock(return_value=negative_analysis())
+        _, outcome = self.run_writer(inventory,analyze)
+        self.assertEqual((outcome[0],outcome[3]),('complete',0))
+        self.assertEqual(analyze.call_count,460)
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            rows = connection.execute('SELECT path,points,last_updated FROM chapter_points').fetchall()
+            self.assertIn(v1,rows)
+            self.assertEqual(sum(json.loads(r[1])['attestation_version']==2 for r in rows),460)
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM file_meta WHERE duration=600').fetchone()[0],461)
+            self.assertFalse(connection.execute('PRAGMA foreign_key_check').fetchall())
+
+    def test_negative_commit_crash_reconciles_both_sweeps(self):
+        for phase in ('primary','questionable'):
+            with self.subTest(phase=phase):
+                # Each subcase owns independent fixture state.
+                self.tearDown()
+                self.setUp()
+                inventory = self.dataset(**{phase:1})
+                real_publish = warmup._publish_next_progress
+                def crash(document,*,arguments,**updates):
+                    if ((document.get('inflight') or {}).get('phase')==phase
+                            and updates.get('inflight','sentinel') is None):
+                        raise warmup.MaintenanceError('progress_state_invalid')
+                    return real_publish(document,arguments=arguments,**updates)
+                with self.assertRaises(warmup.MaintenanceError):
+                    self.run_writer(inventory,mock.Mock(return_value=negative_analysis()),publish=crash)
+                analyzer = mock.Mock(side_effect=AssertionError('must not reanalyze'))
+                _, outcome = self.run_writer(inventory,analyzer)
+                self.assertEqual(outcome[0],'complete')
+                analyzer.assert_not_called()
+
+    def test_all_failure_categories_preserve_questionable_row(self):
+        from fs42.chapter_analysis import ChapterAnalysisError
+        inventory = self.dataset(questionable=1)
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            original = connection.execute('SELECT * FROM chapter_points').fetchall()
+        for category in warmup.PROBE_FAILURE_CATEGORIES:
+            with self.subTest(category=category):
+                _, outcome = self.run_writer(inventory,mock.Mock(side_effect=ChapterAnalysisError(category)))
+                self.assertIn(outcome[0],('blocked','partial'))
+                with contextlib.closing(sqlite3.connect(self.database)) as connection:
+                    self.assertEqual(connection.execute('SELECT * FROM chapter_points').fetchall(),original)
+
+    def test_rollback_restores_exact_legacy_rows_and_removes_new_negatives(self):
+        inventory = self.dataset(primary=1,questionable=1)
+        baseline = self.root/'baseline.sqlite3'
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            before = connection.execute('SELECT * FROM chapter_points').fetchall()
+            with contextlib.closing(sqlite3.connect(baseline)) as copy:
+                connection.backup(copy)
+        protected_before = database_digests(self.database)[1]
+        self.run_writer(inventory,mock.Mock(return_value=negative_analysis()))
+        full, protected = database_digests(self.database)
+        self.assertEqual(protected,protected_before)
+        with mock.patch.object(warmup,'DATABASE',self.database):
+            warmup._run_rollback(baseline,expected_full_digest=full,expected_protected_digest=protected)
+        with contextlib.closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(connection.execute('SELECT * FROM chapter_points').fetchall(),before)
+        self.assertEqual(database_digests(self.database)[1],protected_before)
+
+
 class StaticBoundaryTests(unittest.TestCase):
     def test_maintenance_module_has_no_top_level_fs42_import(self):
         source = Path(warmup.__file__).read_text(encoding="utf-8")

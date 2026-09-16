@@ -8,10 +8,11 @@ import re
 import stat
 from pathlib import Path
 from fs42.chapter_analysis import (
-    COMPLETED_METHODS,
-    METHOD_SHORT,
     CompletedChapterAnalysis,
     ChapterAnalysisError,
+    classify_attestation,
+    encode_trusted_duration,
+    load_chapter_json,
     validate_chapters,
 )
 from fs42.fluid_objects import FileRepoEntry
@@ -359,7 +360,7 @@ class FluidStatements:
             return {"status": "missing", "chapters": [], "raw": None}
         raw = row[0]
         try:
-            loaded = json.loads(raw)
+            loaded = load_chapter_json(raw)
             duration = FluidStatements._chapter_duration(connection, lookup_path)
             if isinstance(loaded, list):
                 if not loaded:
@@ -370,34 +371,15 @@ class FluidStatements:
                     "chapters": [dict(item) for item in chapters],
                     "raw": raw,
                 }
-            if not isinstance(loaded, dict) or set(loaded) != {
-                "attestation_version", "method", "media_identity", "chapters"
-            }:
-                raise ValueError("invalid chapter attestation")
-            if loaded["attestation_version"] != 1 or loaded["method"] not in COMPLETED_METHODS:
-                raise ValueError("unknown chapter attestation")
-            identity = loaded["media_identity"]
-            if (
-                not isinstance(identity, dict) or set(identity) != {"size", "mtime_ns"}
-                or not isinstance(identity["size"], int) or isinstance(identity["size"], bool)
-                or identity["size"] < 0
-                or not isinstance(identity["mtime_ns"], int)
-                or isinstance(identity["mtime_ns"], bool)
-            ):
-                raise ValueError("invalid chapter attestation identity")
             info = os.stat(FluidStatements._chapter_identity_path(path))
-            if (info.st_size, info.st_mtime_ns) != (
-                    identity["size"], identity["mtime_ns"]):
-                raise ValueError("stale chapter attestation identity")
-            chapters = validate_chapters(loaded["chapters"], duration)
-            if loaded["method"] == METHOD_SHORT and (chapters or duration >= 5 * 60):
-                raise ValueError("invalid short-media chapter attestation")
+            status, chapters = classify_attestation(
+                loaded, duration, info.st_size, info.st_mtime_ns)
             return {
-                "status": "trusted_v1",
+                "status": status,
                 "chapters": [dict(item) for item in chapters],
                 "raw": raw,
             }
-        except (OSError, TypeError, json.JSONDecodeError, ChapterAnalysisError) as exc:
+        except (OSError, TypeError, ValueError, RecursionError, ChapterAnalysisError) as exc:
             raise ValueError("invalid chapter attestation") from exc
 
     @staticmethod
@@ -425,8 +407,38 @@ class FluidStatements:
             },
             "chapters": analysis.as_list(),
         }
+        trusted_duration = None
+        if analysis.unusable_reason is not None:
+            trusted_duration = FluidStatements._chapter_duration(connection, path)
+            if encode_trusted_duration(trusted_duration) != analysis.trusted_duration:
+                raise ValueError("trusted duration changed concurrently")
+            del envelope["chapters"]
+            envelope.update(attestation_version=2, outcome="unusable_chapters",
+                            reason=analysis.unusable_reason,
+                            trusted_duration=analysis.trusted_duration)
+            status, unused_chapters = classify_attestation(
+                envelope, trusted_duration, info.st_size, info.st_mtime_ns)
+            if status != "trusted_negative_v2":
+                raise ValueError("invalid negative chapter attestation")
         encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":"))
         now = scheduling_now()
+        if trusted_duration is not None:
+            # Include the trusted input in the same statement as the row CAS.
+            if previous["status"] == "missing":
+                changed = connection.execute(
+                    "INSERT INTO chapter_points(path,points,last_updated) "
+                    "SELECT ?,?,? WHERE EXISTS "
+                    "(SELECT 1 FROM file_meta WHERE path=? AND duration=?)",
+                    (path, encoded, now, path, trusted_duration))
+            else:
+                changed = connection.execute(
+                    "UPDATE chapter_points SET points=?,last_updated=? "
+                    "WHERE path=? AND points=? AND EXISTS "
+                    "(SELECT 1 FROM file_meta WHERE path=? AND duration=?)",
+                    (encoded, now, path, previous["raw"], path, trusted_duration))
+            if changed.rowcount != 1:
+                raise RuntimeError("chapter attestation changed concurrently")
+            return
         if previous["status"] == "missing":
             connection.execute(
                 "INSERT INTO chapter_points(path,points,last_updated) VALUES(?,?,?)",
@@ -445,6 +457,8 @@ class FluidStatements:
     def get_chapter_points(connection: sqlite3.Connection, path: str) -> dict:
         """Get the chapter points for this file. Returns {} if no chapters or never scanned."""
         classified = FluidStatements.classify_chapter_points(connection, path)
+        if classified["status"] == "re_attestation_required" and in_validation_mode():
+            raise ValidationCatalogMetadataUnavailable("cached chapter analysis is stale")
         return classified["chapters"] or {}
 
     @staticmethod

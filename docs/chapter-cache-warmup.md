@@ -126,11 +126,79 @@ rendering, decoder fallback, MoviePy, or FFmpeg invocation.
 Media shorter than five minutes receives a completed empty attestation without
 a probe. A successful probe with no chapters also receives an explicit empty
 attestation. Launch, timeout, signal, nonzero-exit, malformed-output, invalid
-chapter, and cleanup failures write nothing. Each successful result is committed
+chapter (except the narrowly qualified negative result below), and cleanup
+failures write nothing. Each successful result is committed
 in its own transaction after the held descriptor's size and nanosecond mtime are
 rechecked. The version-1 envelope records only the method, exact size/mtime
 identity, and chapter list. Native readers validate and unwrap it, so an envelope
 never reaches callers that expect the historical raw list.
+
+### Completed analysis with unusable chapter geometry
+
+An otherwise valid, nonempty chapter sequence whose **only** range failure is
+that its final endpoint exceeds the trusted cached duration receives a negative
+attestation. All timestamps must be finite, nonnegative numbers (not Boolean or
+null); chapters must be ordered, nonoverlapping, and have start <= end. All
+nonfinal endpoints and the final start must be <= the cached duration. The
+ordinary title and structure checks still apply. Invalid numeric encodings,
+overflow, underflow to zero, malformed/duplicate-key JSON, or any other geometry
+failure remain failures. The result requires a successful parsed probe; it is
+never inferred from an old legacy row or a diagnostic aggregate. No endpoint is
+clipped and no stream/format duration replaces the trusted cached duration.
+Geometry and the overrun predicate compare exact parsed decimal timestamps with
+the exact binary64 cached value (`Decimal.from_float`), before timestamp float
+conversion can conceal an overlap, reversal or boundary overrun. Valid positive
+results retain their existing float chapter representation.
+
+The exact negative envelope in the existing `chapter_points.points` column is:
+
+```json
+{
+  "attestation_version": 2,
+  "method": "ffprobe_show_chapters_v1",
+  "outcome": "unusable_chapters",
+  "reason": "final_endpoint_exceeds_cached_duration",
+  "media_identity": {"size": 1234, "mtime_ns": 1234567890000000000},
+  "trusted_duration": "0x1.2c00000000000p+9"
+}
+```
+
+The numbers above are illustrative. No other fields are accepted, and the
+negative envelope contains no chapter list, invalid endpoint, title, embedded
+path, probe output or exception. Size and nanosecond mtime must match exactly.
+`trusted_duration` is a JSON **string** containing Python binary64 `float.hex()`
+output (the example denotes 600 seconds). Readers require a finite positive
+value and `float.fromhex(value).hex() == value`, then compare the string exactly
+with `float(cached_duration).hex()`. Boolean/null/JSON numeric values, alternate
+hex spellings, decimal strings, overflow and nonpositive/non-finite values are
+rejected. There is no tolerance. The cached duration is never modified.
+
+Positive and genuinely empty results retain byte-compatible version-1 envelopes
+and `ffprobe_show_chapters_v1`; the probe command and underlying method did not
+change. Short-media results retain their existing method and version as well.
+The version-2 outcome means completed analysis with **no usable chapter points**,
+not that the file has no chapters. Readers return the existing empty chapter
+interface and normal scheduling retains its existing fallback and durations.
+Direct detection returns `None`, as it does for unusable chapter metadata.
+Validation accepts current negative attestations without probing. Strict shared
+envelope validation is used by both native readers and maintenance.
+
+A well-formed negative envelope with stale media identity, trusted duration or
+an explicitly superseded known negative method requires re-attestation. Unknown
+methods are rejected. Future code can explicitly advance `ACTIVE_NEGATIVE_METHOD`
+while retaining older entries in `NEGATIVE_METHODS` for controlled retries;
+this does not invalidate existing positive v1 rows. Ordinary scans defer stale
+negative rows to maintenance, and validation does not count them as completed.
+
+Deploy compatible readers and validators before running the new writer. Resume
+the existing blocked progress through the existing unresolved-only retry path;
+each fresh qualifying result inserts a missing row or atomically replaces the
+exact prior row. Negative writes also compare the trusted duration in the same
+SQL statement. Backup/baseline pin, per-result transaction, progress publication,
+inflight reconciliation and rollback protocols are unchanged. Both positive and
+negative trusted results satisfy completed progress; stale or malformed envelopes
+do not. Negative rows count as versioned completion, never legacy-empty rows.
+Rollback restores the pinned chapter rows exactly and removes new negative rows.
 
 Strictly valid legacy nonempty lists remain readable. Every eligible legacy
 empty list is ambiguous and is re-analyzed; every missing eligible row is

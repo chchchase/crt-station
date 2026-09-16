@@ -11,7 +11,7 @@ from fs42.scheduling_context import (
     ValidationCatalogMetadataUnavailable,
     in_validation_mode,
 )
-from fs42.chapter_analysis import ChapterAnalysisError, analyze_chapters
+from fs42.chapter_analysis import ChapterAnalysisError, TRUSTED_CHAPTER_STATES, analyze_chapters
 from fs42.station_manager import StationManager
 
 class FluidBuilder:
@@ -124,9 +124,12 @@ class FluidBuilder:
                     except ValueError:
                         self._l.error("Stored chapter metadata is invalid")
                         continue
-                    if previous["status"] in {"trusted_v1", "legacy_nonempty"}:
+                    if previous["status"] in TRUSTED_CHAPTER_STATES | {"legacy_nonempty"}:
                         self._l.info(f"Chapters already exist for {rfp}")
                     else:
+                        if previous["status"] == "re_attestation_required":
+                            self._l.info("Chapter re-attestation deferred to maintenance")
+                            continue
                         if not FluidStatements._chapter_baseline_is_durable():
                             self._l.info(
                                 "Chapter scan deferred until migration baseline is durable")
@@ -143,7 +146,7 @@ class FluidBuilder:
                             with connection:
                                 FluidStatements.add_chapter_points(
                                     connection, rfp, analysis, info, previous)
-                        except (ChapterAnalysisError, OSError, RuntimeError):
+                        except (ChapterAnalysisError, OSError, RuntimeError, ValueError):
                             self._l.error("Chapter analysis failed")
                 else:
                     self._l.warning(f"{rfp} is not in catalog cache - not adding chapter points.")
@@ -173,11 +176,14 @@ class FluidBuilder:
                                 "cached chapter metadata is invalid") from exc
                         self._l.error("Stored chapter metadata is invalid")
                         continue
-                    if previous["status"] in {"trusted_v1", "legacy_nonempty"}:
+                    if previous["status"] in TRUSTED_CHAPTER_STATES | {"legacy_nonempty"}:
                         continue
                     if in_validation_mode():
                         raise ValidationCatalogMetadataUnavailable(
                             "cached chapter metadata is missing")
+                    if previous["status"] == "re_attestation_required":
+                        self._l.info("Chapter re-attestation deferred to maintenance")
+                        continue
                     if not FluidStatements._chapter_baseline_is_durable():
                         self._l.info(
                             "Chapter scan deferred until migration baseline is durable")
@@ -197,7 +203,7 @@ class FluidBuilder:
                         if analysis.chapters:
                             self._l.info(
                                 f"Added {len(analysis.chapters)} chapters for media")
-                    except (ChapterAnalysisError, OSError, RuntimeError):
+                    except (ChapterAnalysisError, OSError, RuntimeError, ValueError):
                         self._l.error("Chapter analysis failed")
         finally:
             connection.close()
