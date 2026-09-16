@@ -287,3 +287,20 @@ not rewritten; older reports remain readable with their original schemas.
 All preservation checks, media confinement, selected-AutoBump rejection,
 isolation, and staging disposal remain in force. No failed staging database
 is newly retained, and no new recovery or scheduling behavior is introduced.
+
+## Candidate-export failure diagnostics
+
+Candidate-export failures retain the primary `normalization_failed` diagnostic.
+When candidate export is the failing operation, report v7 adds
+`candidate_export_category`: an explicitly allowlisted `ArtifactError` code,
+or `candidate_export_unknown` for an unexpected exception or unknown code.
+Ordinary normalization failures have a null category. The category appears in
+the immutable JSON report, its text rendering, and CLI output; exception text,
+paths, rows, and metadata values are never included in this diagnostic.
+Cancellation remains cancellation, and a later cleanup failure does not replace
+the original export failure.
+
+Report schemas v1–v6 remain frozen and retained reports remain readable, including
+valid candidates bound to older reports. New reports use v7; older software that
+does not support v7 cannot read them. This diagnostic does not change candidate
+acceptance, publication gates, cleanup, isolation, or live-application support.

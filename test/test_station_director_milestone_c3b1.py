@@ -534,6 +534,39 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertEqual(outcome.c1_preservation_detail, detail)
         self.assertIn("insert_failed", render_cli_outcome(outcome))
 
+    def test_export_category_reaches_immutable_report_text_and_cli(self):
+        from station_director.dual_run import _base_result
+        result = _base_result("synthetic")
+        result["phase_reached"] = "normalization"
+        result["failure"] = {
+            "phase": "normalization", "code": "normalization_failed",
+            "category": "candidate_metadata_changed", "message": "/private/metadata password=secret"}
+        code, stdout, stderr = self._run(result)
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "")
+        self.assertIn("Candidate export category: candidate_metadata_changed", stdout)
+        paths = list((self.root / "runtime/director/validations").glob("*/*/validation.json"))
+        self.assertEqual(len(paths), 1)
+        raw = paths[0].read_text()
+        self.assertEqual(json.loads(raw)["findings"]["errors"][0]["candidate_export_category"],
+                         "candidate_metadata_changed")
+        text = paths[0].with_name("validation.txt").read_text()
+        self.assertIn("candidate_metadata_changed", text)
+        for value in (raw, text, stdout):
+            self.assertNotIn("/private", value)
+            self.assertNotIn("password", value)
+        result["failure"]["category"] = "run_1"
+        outcome = self.coordinator._outcome_from_result(VALID_PROPOSAL["proposal_id"], RUN_ID, result)
+        self.assertNotIn("Candidate export category:", render_cli_outcome(outcome))
+        from station_director.schedule_artifact import CANDIDATE_EXPORT_CATEGORIES
+        for category in CANDIDATE_EXPORT_CATEGORIES:
+            result["failure"]["category"] = category
+            outcome = self.coordinator._outcome_from_result(VALID_PROPOSAL["proposal_id"], RUN_ID, result)
+            self.assertIn(f"Candidate export category: {category}", render_cli_outcome(outcome))
+        with self.assertRaises(ValueError):
+            CoordinatorOutcome(state="failed", phase="capture", failure_code="normalization_failed",
+                               candidate_export_category="candidate_metadata_changed")
+
     def test_success_publishes_immutable_report_and_latest(self):
         result = valid_success_result(Path(self.temp.name))
         code, stdout, stderr = self._run(result)
@@ -601,7 +634,7 @@ class CoordinatorFlowTests(unittest.TestCase):
         self.assertEqual(len(report_directories), 1)
         document = json.loads(
             (report_directories[0] / "validation.json").read_text(encoding="utf-8"))
-        self.assertEqual(document["schema_version"], 6)
+        self.assertEqual(document["schema_version"], 7)
         finding = document["findings"]["errors"][0]
         self.assertEqual(finding["capture_run"], 2)
         self.assertEqual(finding["finalization_subphase"], "proposal_projection")

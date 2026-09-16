@@ -30,8 +30,9 @@ REPORT_SCHEMA_V3 = Path(__file__).with_name("schemas") / "validation-report.v3.s
 REPORT_SCHEMA_V4 = Path(__file__).with_name("schemas") / "validation-report.v4.schema.json"
 REPORT_SCHEMA_V5 = Path(__file__).with_name("schemas") / "validation-report.v5.schema.json"
 REPORT_SCHEMA_V6 = Path(__file__).with_name("schemas") / "validation-report.v6.schema.json"
-# New reports always use v6. Older paths remain frozen for retained reports.
-REPORT_SCHEMA = REPORT_SCHEMA_V6
+REPORT_SCHEMA_V7 = Path(__file__).with_name("schemas") / "validation-report.v7.schema.json"
+# New reports always use v7. Older paths remain frozen for retained reports.
+REPORT_SCHEMA = REPORT_SCHEMA_V7
 LATEST_SCHEMA = Path(__file__).with_name("schemas") / "latest-validation-pointer.v1.schema.json"
 DUAL_RESULT_SCHEMA = Path(__file__).with_name("schemas") / "native-dual-run.result.v4.schema.json"
 PROPOSAL_ID_RE = re.compile(r"p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}\Z")
@@ -174,19 +175,19 @@ def _safe_identifier(value):
 
 
 def validate_report_document(report, *, retained=False):
-    """Validate a new v6 report or a retained immutable v1-v5 report."""
+    """Validate a new v7 report or a retained immutable v1-v6 report."""
     if not isinstance(report, dict):
         raise ReportError("invalid_report", "validation report must be an object")
     version = report.get("schema_version")
-    if version == 6:
-        schema = REPORT_SCHEMA_V6
-    elif retained and version in (1, 2, 3, 4, 5):
+    if version == 7:
+        schema = REPORT_SCHEMA_V7
+    elif retained and version in (1, 2, 3, 4, 5, 6):
         schema = {1: REPORT_SCHEMA_V1, 2: REPORT_SCHEMA_V2,
-                  3: REPORT_SCHEMA_V3, 4: REPORT_SCHEMA_V4, 5: REPORT_SCHEMA_V5}[version]
+                  3: REPORT_SCHEMA_V3, 4: REPORT_SCHEMA_V4, 5: REPORT_SCHEMA_V5, 6: REPORT_SCHEMA_V6}[version]
     else:
         raise ReportError("invalid_report_version", "unsupported validation report version")
     validate_document(report, schema)
-    if version in (5, 6):
+    if version in (5, 6, 7):
         from station_director.c1_diagnostics import validate_host_diagnostic
         for group in ("baseline_findings", "unexpected_differences", "warnings", "errors"):
             for finding in report["findings"][group]:
@@ -270,7 +271,9 @@ def _structured_finding(value, default_code, default_phase):
                     "stdout_truncated", "stderr_truncated",
                     "termination_kind", "exit_status", "signal")},
         }
+    from station_director.schedule_artifact import candidate_export_category
     finding = {
+        "candidate_export_category": candidate_export_category(value),
         "code": code,
         "phase": phase,
         "template": DIAGNOSTIC_TEMPLATES[code],
@@ -431,9 +434,9 @@ def build_validation_report(proposal, c2_result, run_id, completed_at):
         "sequence_changes", "break_changes",
     )}
     report = {
-        "schema_version": 6,
+        "schema_version": 7,
         "report_type": "station_director_validation",
-        "software": {"director_version": __version__, "report_schema_version": 6},
+        "software": {"director_version": __version__, "report_schema_version": 7},
         "proposal": {"id": proposal["proposal_id"], "schema_version": proposal["schema_version"],
                      "digest": hashlib.sha256(_canonical_json(proposal)).hexdigest()},
         "validation": {

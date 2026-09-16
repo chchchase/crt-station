@@ -330,8 +330,112 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(result['status'], 'failed')
         self.assertIn('cleanup', events)
         self.assertEqual(result['failure']['code'], 'normalization_failed')
+        self.assertEqual(result['failure']['category'], 'candidate_export_unknown')
         self.assertNotIn('private-media-name', json.dumps(result))
         publisher.assert_not_called()
+
+    def test_export_categories_cancellation_and_secondary_cleanup_failure(self):
+        from test import test_station_director_milestone_c2 as c2
+        class Cancelled(Exception):
+            is_validation_cancellation = True
+
+        cases = [(artifact.ArtifactError(code), code, False)
+                 for code in sorted(artifact.CANDIDATE_EXPORT_CATEGORIES)]
+        cases += [
+            (artifact.ArtifactError('/private/metadata'), 'candidate_export_unknown', False),
+            (artifact.ArtifactError(['private']), 'candidate_export_unknown', False),
+            (RuntimeError('/private/metadata'), 'candidate_export_unknown', False),
+            (artifact.ArtifactError('candidate_catalog_changed'), 'candidate_catalog_changed', True),
+            (Cancelled('/private/metadata'), None, False),
+            (KeyboardInterrupt('/private/metadata'), None, False),
+        ]
+        for error, expected, cleanup_failure in cases:
+            with self.subTest(category=expected, cleanup_failure=cleanup_failure):
+                fixture = c2.DualRunLifecycleTests()
+                fixture.setUp()
+                try:
+                    events = []
+                    scope = fixture._scope(self.root, events, cleanup_failure=cleanup_failure)
+                    with patch('station_director.dual_run._prepare_scope', return_value=scope), \
+                            patch('station_director.dual_run.launch_single_run'), \
+                            patch('station_director.dual_run.inspect_single_run', return_value=response('a')), \
+                            patch('station_director.dual_run._assert_inputs_stable', side_effect=lambda a,b,c,k:
+                                  {'checkpoint': k, 'passed': True, 'changed_categories': []}), \
+                            patch('station_director.dual_run.normalize_completed_run', return_value=SimpleNamespace()), \
+                            patch.object(artifact, 'publish_candidate') as publisher:
+                        def reject(*unused):
+                            raise error
+                        result = c2.run_dual_comparison(
+                            self.root, self.root, self.root,
+                            {'week_start': '2026-09-14T00:00:00-07:00'}, {},
+                            'comparison', candidate_exporter=reject)
+                    self.assertEqual(result['failure']['code'],
+                                     'normalization_failed' if expected else 'validation_interrupted')
+                    self.assertEqual(artifact.candidate_export_category(result['failure']), expected)
+                    self.assertIn('cleanup', events)
+                    self.assertIn('close-capture', events)
+                    self.assertNotIn('settle-2', events)
+                    if expected is not None:
+                        self.assertNotIn('/private', json.dumps(result))
+                    from station_director.reporting import _structured_finding
+                    finding = _structured_finding(result['failure'], 'internal_error', 'normalization')
+                    self.assertNotIn('/private', json.dumps(finding))
+                    self.assertEqual(finding['candidate_export_category'], expected)
+                    publisher.assert_not_called()
+                finally:
+                    fixture.doCleanups()
+
+    def test_ordinary_normalization_does_not_gain_export_category(self):
+        from test import test_station_director_milestone_c2 as c2
+        fixture = c2.DualRunLifecycleTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        events = []
+        scope = fixture._scope(self.root, events)
+        with patch('station_director.dual_run._prepare_scope', return_value=scope), \
+                patch('station_director.dual_run.launch_single_run'), \
+                patch('station_director.dual_run.inspect_single_run', return_value=response('a')), \
+                patch('station_director.dual_run._assert_inputs_stable', side_effect=lambda a,b,c,k:
+                      {'checkpoint': k, 'passed': True, 'changed_categories': []}), \
+                patch('station_director.dual_run.normalize_completed_run',
+                      side_effect=artifact.ArtifactError('candidate_metadata_changed')), \
+                patch.object(artifact.CandidatePreparation, 'capture') as capture:
+            result = c2.run_dual_comparison(
+                self.root, self.root, self.root,
+                {'week_start': '2026-09-14T00:00:00-07:00'}, {},
+                'comparison', candidate_exporter=capture)
+        capture.assert_not_called()
+        self.assertEqual(result['failure']['code'], 'normalization_failed')
+        self.assertEqual(result['failure']['category'], 'run_1')
+        self.assertIsNone(artifact.candidate_export_category(result['failure']))
+        self.assertIn('cleanup', events)
+
+    def test_inspection_of_candidate_bound_to_retained_v6_report(self):
+        from station_director import reporting
+        from test.test_station_director_milestone_c3a2 import remove_v7_fields
+        from test.test_station_director_milestone_c3b1 import valid_success_result
+        result = valid_success_result(self.root)
+        result['comparison_id'] = RUN
+        proposal = dict(PROPOSAL, schema_version=2, week_end='2026-09-29T20:00:00-07:00')
+        report = reporting.build_validation_report(proposal, result, RUN, '2026-09-16T08:00:00Z')
+        report = remove_v7_fields(report)
+        report['schema_version'] = report['software']['report_schema_version'] = 6
+        reporting.validate_report_document(report, retained=True)
+        raw = reporting._canonical_json(report)
+        parent = self.root / 'runtime/director/validations' / PROPOSAL['proposal_id'] / RUN
+        parent.mkdir(parents=True, mode=0o700)
+        (self.root / 'runtime').chmod(0o755)
+        for directory in (parent.parent, parent.parent.parent, parent.parent.parent.parent):
+            directory.chmod(0o700)
+        target = parent / 'validation.json'
+        target.write_bytes(raw)
+        target.chmod(0o600)
+        document = self.document()
+        document['validation_report_digest'] = hashlib.sha256(raw).hexdigest()
+        document['proposal_digest'] = report['proposal']['digest']
+        document['normalized_digest'] = report['reproducibility']['run_1_digest']
+        identity = artifact.publish_candidate(document, self.root)
+        self.assertEqual(artifact.inspect_candidate(identity, self.root)['candidate_digest'], identity)
 
     def test_no_apply_or_recovery_commands(self):
         parser = cli.build_parser()

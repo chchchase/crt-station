@@ -891,8 +891,11 @@ def run_dual_comparison(
                     candidate_exporter(lifecycle, response, scope.capture)
                 except Exception as exc:
                     _raise_if_cancelled(exc)
-                    raise DualRunError('normalization', 'normalization_failed',
-                                       'Application candidate export rejected.') from None
+                    from station_director.schedule_artifact import candidate_export_error_category
+                    raise DualRunError(
+                        'normalization', 'normalization_failed',
+                        'Application candidate export rejected.',
+                        category=candidate_export_error_category(exc)) from None
             try:
                 admit("baseline_comparison", BASELINE_COMPARISON_ALLOWANCE_SECONDS)
                 baseline_summaries.append(compare_baseline_to_proposed(

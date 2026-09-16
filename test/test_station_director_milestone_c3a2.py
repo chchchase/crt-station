@@ -74,8 +74,18 @@ CHANNEL = {"number": 2, "name": "Action",
            "effective_horizon": "2026-09-14 04:00:00.000001"}
 
 
+def remove_v7_fields(report):
+    for group in report["findings"].values():
+        for finding in group:
+            finding.pop("candidate_export_category", None)
+    for cleanup in report["cleanup"].values():
+        if cleanup and cleanup.get("diagnostic"):
+            cleanup["diagnostic"].pop("candidate_export_category", None)
+    return report
+
+
 def retained_v2_from_v3(report):
-    retained = copy.deepcopy(report)
+    retained = remove_v7_fields(copy.deepcopy(report))
     retained["schema_version"] = 2
     retained["software"]["report_schema_version"] = 2
     for group in ("baseline_findings", "unexpected_differences", "warnings", "errors"):
@@ -465,7 +475,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn(b"retained", text)
         self.assertNotIn(b"private", text)
         self.assertNotIn(b"/secret", _canonical_json(stored))
-        legacy = copy.deepcopy(stored)
+        legacy = remove_v7_fields(copy.deepcopy(stored))
         legacy["schema_version"] = legacy["software"]["report_schema_version"] = 5
         legacy["findings"]["errors"][0]["c1_diagnostic"]["detail"].pop("preservation_detail")
         validate_report_document(legacy, retained=True)
@@ -477,7 +487,7 @@ class ReportTests(unittest.TestCase):
             validate_report_document(bad)
 
     def test_retained_v4_report_remains_schema_valid(self):
-        retained = copy.deepcopy(self.report)
+        retained = remove_v7_fields(copy.deepcopy(self.report))
         retained["schema_version"] = 4
         retained["software"]["report_schema_version"] = 4
         validate_report_document(retained, retained=True)
@@ -513,8 +523,8 @@ class ReportTests(unittest.TestCase):
         return parent
 
     def test_software_identity_schema_and_deterministic_text(self):
-        self.assertEqual(self.report["schema_version"], 6)
-        self.assertEqual(self.report["software"]["report_schema_version"], 6)
+        self.assertEqual(self.report["schema_version"], 7)
+        self.assertEqual(self.report["software"]["report_schema_version"], 7)
         self.assertTrue(self.report["software"]["director_version"])
         self.assertLessEqual(len(self.report["software"]["director_version"]), 100)
         validate_document(self.report, REPORT_SCHEMA)
@@ -858,7 +868,7 @@ class ReportTests(unittest.TestCase):
 
     def test_retained_v3_pointer_target_is_replaceable_by_v4(self):
         old_run = "v-20260913T110002000001Z-" + "1" * 32
-        retained = copy.deepcopy(self.report)
+        retained = remove_v7_fields(copy.deepcopy(self.report))
         retained["schema_version"] = 3
         retained["software"]["report_schema_version"] = 3
         retained["validation"]["run_id"] = old_run
@@ -1232,6 +1242,39 @@ class ReportTests(unittest.TestCase):
             with self.assertRaisesRegex(ReportError, "text|size|large"):
                 publish_validation_report(self.report)
         self.assertFalse(self.root.exists())
+
+    def test_candidate_export_schema_projection_and_redaction(self):
+        from station_director.schedule_artifact import CANDIDATE_EXPORT_CATEGORIES
+        for category in sorted(CANDIDATE_EXPORT_CATEGORIES) + ['run_1', '/private/metadata', None]:
+            result = _base_result("comparison")
+            result["phase_reached"] = "normalization"
+            result["failure"] = {
+                "phase": "normalization", "code": "normalization_failed",
+                "category": category, "message": "/private/metadata password=secret"}
+            report = build_validation_report(PROPOSAL, result, self.run_id, "2026-09-13T12:00:00Z")
+            finding = report["findings"]["errors"][0]
+            self.assertEqual(finding["candidate_export_category"],
+                             category if category in CANDIDATE_EXPORT_CATEGORIES else None)
+            self.assertNotIn(b"/private", _canonical_json(report))
+            self.assertNotIn(b"password", _canonical_json(report))
+            validate_report_document(report)
+            for bad in ("/private/metadata", [], True):
+                tampered = copy.deepcopy(report)
+                tampered["findings"]["errors"][0]["candidate_export_category"] = bad
+                with self.assertRaises(Exception):
+                    validate_report_document(tampered)
+        for code, phase in (("internal_error", "normalization"),
+                            ("normalization_failed", "capture")):
+            tampered = copy.deepcopy(report)
+            finding = tampered["findings"]["errors"][0]
+            finding.update(code=code, phase=phase, candidate_export_category="candidate_export_unknown")
+            with self.assertRaises(Exception):
+                validate_document(tampered, REPORT_SCHEMA)
+        retained = remove_v7_fields(copy.deepcopy(report))
+        retained["schema_version"] = retained["software"]["report_schema_version"] = 6
+        validate_report_document(retained, retained=True)
+        with self.assertRaises(Exception):
+            validate_report_document(retained)
 
     def test_diagnostics_never_retain_paths_secrets_or_raw_exception_text(self):
         failed_c2 = _base_result("comparison")

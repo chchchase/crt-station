@@ -39,6 +39,35 @@ class ArtifactError(RuntimeError):
         self.code = code
 
 
+# Only codes reachable during capture, never arbitrary exception attributes.
+CANDIDATE_EXPORT_CATEGORIES = frozenset({
+    'candidate_invalid', 'candidate_code_invalid', 'candidate_code_changed',
+    'candidate_timing_unsupported', 'candidate_limit', 'candidate_metadata_ambiguous',
+    'candidate_reference_unsupported', 'candidate_reference_invalid',
+    'candidate_translation_failed', 'candidate_effect_unproven',
+    'candidate_effect_unsupported', 'candidate_scope_unsupported',
+    'candidate_metadata_changed', 'candidate_catalog_changed',
+    'candidate_schema_unsupported', 'candidate_range_invalid', 'candidate_no_change',
+    'candidate_export_unknown',
+})
+
+
+def candidate_export_error_category(exc):
+    code = exc.code if isinstance(exc, ArtifactError) else None
+    return (code if isinstance(code, str) and code in CANDIDATE_EXPORT_CATEGORIES
+            else 'candidate_export_unknown')
+
+
+def candidate_export_category(failure):
+    """Project only allowlisted export categories, not ordinary normalization."""
+    category = failure.get('category')
+    if (failure.get('code') == 'normalization_failed'
+            and failure.get('phase') == 'normalization'
+            and isinstance(category, str) and category in CANDIDATE_EXPORT_CATEGORIES):
+        return category
+    return None
+
+
 def digest(value):
     return hashlib.sha256(_canonical(value)).hexdigest()
 
@@ -476,7 +505,7 @@ def inspect_candidate(identity, root=ROOT):
         with _artifact_root(root, create=False, components=components) as parent:
             report_raw = _read_private_file(parent, 'validation.json', MAX_REPORT_JSON_BYTES)
         report = strict_json_loads(report_raw)
-        validate_report_document(report)
+        validate_report_document(report, retained=True)
         if (hashlib.sha256(report_raw).hexdigest() != document['validation_report_digest']
                 or report['validation']['status'] != 'success'
                 or report['validation']['run_id'] != document['validation_run']

@@ -91,6 +91,7 @@ class CoordinatorOutcome:
     validation_status: str | None = None
     phase: str | None = None
     failure_code: str | None = None
+    candidate_export_category: str | None = None
     capture_failure_kind: str | None = None
     capture_run: int | None = None
     finalization_subphase: str | None = None
@@ -119,6 +120,13 @@ class CoordinatorOutcome:
     quarantined: bool = False
 
     def __post_init__(self):
+        if self.candidate_export_category is not None:
+            from station_director.schedule_artifact import CANDIDATE_EXPORT_CATEGORIES
+        if self.candidate_export_category is not None and (
+                self.failure_code != "normalization_failed" or self.phase != "normalization"
+                or not isinstance(self.candidate_export_category, str)
+                or self.candidate_export_category not in CANDIDATE_EXPORT_CATEGORIES):
+            raise ValueError("invalid candidate export category")
         states = {"disabled", "rejected", "passed", "failed", "interrupted"}
         scheduler_values = (True, False, "unknown")
         if (self.state not in states or len(self.scheduler_invoked) != 2
@@ -127,7 +135,7 @@ class CoordinatorOutcome:
         if self.state == "disabled" and any((
                 self.proposal_id, self.run_id, self.validation_status, self.phase,
                 self.failure_code, self.scheduler_invoked != (False, False),
-                self.capture_failure_kind, self.capture_run,
+                self.candidate_export_category, self.capture_failure_kind, self.capture_run,
                 self.finalization_subphase,
                 self.c1_run, self.c1_domain, self.c1_phase, self.c1_code,
                 self.c1_probe, self.c1_fingerprint_category,
@@ -471,6 +479,7 @@ def _minimal_c2_failure(run_id, code, phase="capture", source=None, *,
 
 def _outcome_from_result(proposal_id, run_id, result, publication=None,
                          publication_error=None):
+    from station_director.schedule_artifact import candidate_export_category
     schedulers = result.get("scheduler_invoked", {})
     scheduler_tuple = (schedulers.get("run_1", "unknown"),
                        schedulers.get("run_2", "unknown"))
@@ -513,6 +522,8 @@ def _outcome_from_result(proposal_id, run_id, result, publication=None,
         phase=("report" if publication_error is not None
                else result.get("phase_reached")),
         failure_code=failure_code, scheduler_invoked=scheduler_tuple,
+        candidate_export_category=(candidate_export_category(failure)
+                                   if publication_error is None else None),
         capture_failure_kind=(failure.get("capture_failure_kind")
                               if failure_code == "source_capture_failed" else None),
         capture_run=failure.get("capture_run"),
@@ -753,6 +764,8 @@ def render_cli_outcome(outcome):
             lines.append(f"Phase: {outcome.phase}")
         if outcome.failure_code is not None:
             lines.append(f"Failure: {outcome.failure_code}")
+        if outcome.candidate_export_category is not None:
+            lines.append(f"Candidate export category: {outcome.candidate_export_category}")
         if outcome.capture_failure_kind is not None:
             lines.append(f"Capture failure kind: {outcome.capture_failure_kind}")
         if outcome.capture_run is not None:
