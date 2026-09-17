@@ -287,7 +287,7 @@ class ArtifactTests(unittest.TestCase):
         original = {s:json.loads(p.read_text()) for s,p in paths.items()}
         for location in (('monday','20'), ('tag_overrides','Synthetic'),
                          ('date_overrides','September 23','10'),
-                         ('week_overrides','2026-09-21','monday','20')):
+                         ('week_overrides','September 21','monday','20')):
             with self.subTest(location=location):
                 docs = copy.deepcopy(original)
                 for side, doc in docs.items():
@@ -314,6 +314,71 @@ class ArtifactTests(unittest.TestCase):
         path.unlink()
         path.write_bytes(saved)
         os.link(path, self.root/'hardlink')
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_invalid'):
+            artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=request)
+
+    def test_commercial_template_capture_and_candidate_validation(self):
+        from fs42.config_processor import ConfigProcessor
+        from station_director.validation_context import logical_configuration_values_fingerprint
+        from station_director.validation import project_configuration
+        request = self.commercial_rebuild()
+        source_path = self.stage/'source/confs/action.json'
+        source = json.loads(source_path.read_text())
+        conf = source['station_conf']
+        directory = conf.pop('commercial_dir')
+        conf['day_templates'] = {'ordinary': {'10': {'tags':'synthetic-series', 'overrides':'ads'}}}
+        conf['slot_overrides'] = {'ads': {'commercial_dir':directory}}
+        for day in ('monday','tuesday','wednesday','thursday','friday','saturday','sunday'):
+            conf[day] = 'ordinary'
+        conf['date_overrides'] = {'September 23':'ordinary'}
+        conf['week_overrides'] = {'September 24 - September 25': {'monday':'ordinary'}}
+        projected, _, _ = project_configuration({'Action':source}, PROPOSAL, POLICY)
+        work = projected['Action']
+        work['station_conf']['slot_overrides']['ads']['commercial_dir'] = '/media'
+        # Actual pure native preprocessing establishes that this is a supported
+        # configuration, including day/date/week and slot-override references.
+        for data in (source, work):
+            processed = ConfigProcessor.preprocess(copy.deepcopy(data['station_conf']))
+            self.assertIsInstance(processed['monday'], dict)
+            self.assertIn('commercial_dir', processed['monday']['10'])
+        source_path.write_text(json.dumps(source))
+        (self.stage/'work/confs/action.json').write_text(json.dumps(work))
+        request['input_fingerprints'] = dict(INPUTS, original_logical_configuration_fingerprint=
+            logical_configuration_values_fingerprint({'confs/action.json':source,
+                'runtime/watch_in_order_state.json':{}})['digest'])
+        request['validation_context'] = {'synthetic':True}
+        self.response['verification']['fingerprints']['projected_configuration_fingerprint'] = \
+            logical_configuration_values_fingerprint({'confs/action.json':work})['digest']
+        before = [p.read_bytes() for p in self.databases]
+        captured_paths = [source_path, self.stage/'work/confs/action.json']
+        captured_before = [p.read_bytes() for p in captured_paths]
+        preparation = artifact.CandidatePreparation(self.root)
+        preparation.proposal, preparation.policy = PROPOSAL, POLICY
+        preparation.revision, preparation.run_id = 'a'*40, RUN
+        # Only the checkout pin is substituted; export, mapping, metadata,
+        # fingerprint, timing, and capture code all execute unmodified.
+        with patch.object(artifact, 'code_revision', return_value=preparation.revision):
+            preparation.capture(SimpleNamespace(stage=self.stage, request=request), self.response,
+                                SimpleNamespace(media_manifest=SimpleNamespace(summary={'digest':'b'*64})))
+        exported = preparation.exports[0]
+        artifact.validate_candidate({'schema_version':1, 'proposal_id':PROPOSAL['proposal_id'],
+            'proposal_digest':'a'*64, 'policy_digest':'b'*64, 'code_revision':preparation.revision,
+            'validation_run':RUN, 'validation_report_digest':'c'*64, 'normalized_digest':'d'*64,
+            'directive':PROPOSAL['directives'][0], **exported})
+        self.assertEqual(before, [p.read_bytes() for p in self.databases])
+        self.assertEqual(captured_before, [p.read_bytes() for p in captured_paths])
+        member = next(m for m in exported['schedule']['catalog_mapping']
+                      if m['semantics']['row']['content_type']=='commercial')
+        self.assertEqual(member['semantics']['row']['tag'], '/mnt/t7/CRT-Media')
+        self.assertEqual(exported['schedule']['effect']['blocks'][0]['features'][0]['start'],
+                         '2026-09-22 20:01:00')
+        # Unknown template references still fail, even with an accurately
+        # rebound captured configuration digest. No fallback guesses a directory.
+        conf['monday'] = 'missing-template'
+        source_path.write_text(json.dumps(source))
+        request['input_fingerprints']['original_logical_configuration_fingerprint'] = \
+            logical_configuration_values_fingerprint({'confs/action.json':source,
+                'runtime/watch_in_order_state.json':{}})['digest']
         with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_invalid'):
             artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=request)
 

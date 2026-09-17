@@ -362,6 +362,11 @@ def _commercial_directory_pairs(stage, response, proposal, policy, request):
         projected, unused, unused_sources = project_configuration(configs, proposal, policy)
 
         def locations(conf):
+            # Captured documents contain template/slot-override references;
+            # harvest the same pure, preprocessed view as the native catalog.
+            # Deep copies preserve the captured documents and their bindings.
+            from fs42.config_processor import ConfigProcessor
+            conf = ConfigProcessor.preprocess(copy.deepcopy(conf))
             # Only locations harvested by ShowCatalog._build_standard, not
             # arbitrary nested keys or path-looking series tags.
             days = ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
