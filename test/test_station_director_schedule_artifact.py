@@ -98,7 +98,7 @@ class ArtifactTests(unittest.TestCase):
         self.assertEqual(doc['schedule']['rows'][0]['content_json'], '1')
         self.assertIn((100, 1), [(r['validated_id'], r['live_id']) for r in doc['schedule']['catalog_mapping']])
 
-    def production_clock_rebuild(self, *, protected=False):
+    def production_clock_rebuild(self, *, protected=False, directory_commercial=False):
         from datetime import datetime
         from contextlib import closing
         from fs42.catalog_entry import CatalogEntry
@@ -107,7 +107,7 @@ class ArtifactTests(unittest.TestCase):
         from station_director.staged_schedule import catalog_allocation_floor
         def write(database, root, clock):
             entries = [CatalogEntry(root + '/a.mp4', 3600.0, 'synthetic-series'),
-                       CatalogEntry(root + '/ad.mp4', 3600.0, 'commercial', content_type='commercial')]
+                       CatalogEntry(root + '/ad.mp4', 3600.0, root if directory_commercial else 'commercial', content_type='commercial')]
             for entry in entries:
                 entry.realpath = entry.path
             context = ValidationSchedulingContext(clock, datetime(2026, 9, 22, 20),
@@ -116,6 +116,8 @@ class ArtifactTests(unittest.TestCase):
                        return_value=SimpleNamespace(server_conf={'db_path': str(database)})), \
                     activate_validation_context(context):
                 CatalogAPI.set_entries({'network_name': 'Action'}, entries)
+        if directory_commercial:
+            self.update('DELETE FROM catalog_entries', sides=(0, 1))
         write(self.databases[0], '/mnt/t7/CRT-Media', datetime(2026, 9, 1))
         with closing(sqlite3.connect(self.databases[0])) as connection:
             for name in ('a.mp4', 'ad.mp4'):
@@ -144,6 +146,176 @@ class ArtifactTests(unittest.TestCase):
                          ref, '/media/a.mp4')
             connection.commit()
         return feature, ref
+
+    def commercial_rebuild(self):
+        from station_director.path_safety import map_station_config
+        from station_director.validation import project_configuration
+        from station_director.validation_context import logical_configuration_values_fingerprint
+        self.production_clock_rebuild(directory_commercial=True)
+        plan = [{'path':'/media/ad.mp4', 'duration':60, 'skip':0, 'is_stream':False,
+                 'content_type':'commercial', 'media_type':'video'},
+                {'path':'/media/a.mp4', 'duration':3540, 'skip':0, 'is_stream':False,
+                 'content_type':'feature', 'media_type':'video'}]
+        self.update('UPDATE liquid_blocks SET plan_json=?', (json.dumps(plan),))
+        media = self.root / 'synthetic-media'; media.mkdir()
+        source = {'station_conf': {'network_name': 'Action', 'commercial_dir': '/mnt/t7/CRT-Media'}}
+        projected, _, _ = project_configuration({'Action': source}, PROPOSAL, POLICY)
+        work, mappings = map_station_config(projected['Action'], 'action.json',
+                                             sandbox_media_root=media, stage_root=self.stage / 'work')
+        self.assertTrue(mappings)
+        # The fixture mount lives under /tmp; the worker sees that same mount
+        # at /media. Use the production canonical mapping for its captured view.
+        work['station_conf']['commercial_dir'] = artifact.canonical_media_mapping(
+            source['station_conf']['commercial_dir']).sandbox_path
+        documents = {'source': {'confs/action.json': source, 'runtime/watch_in_order_state.json': {}},
+                     'work': {'confs/action.json': work}}
+        for side, values in documents.items():
+            for name, value in values.items():
+                path = self.stage / side / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(value))
+        request = {'proposal': PROPOSAL, 'policy': POLICY, 'input_fingerprints': {
+            'original_logical_configuration_fingerprint': logical_configuration_values_fingerprint(documents['source'])['digest']}}
+        self.response['verification']['fingerprints']['projected_configuration_fingerprint'] = \
+            logical_configuration_values_fingerprint(documents['work'])['digest']
+        return request
+
+    def test_commercial_directory_production_writer_and_translation(self):
+        from contextlib import closing
+        request = self.commercial_rebuild()
+        before = [p.read_bytes() for p in self.databases]
+        # The old timestamp-only route still rejects this production transform.
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_catalog_no_semantic_match'):
+            self.export()
+        schedule = artifact.export_candidate(self.stage, self.response, PROPOSAL, POLICY, request=request)
+        with closing(sqlite3.connect(self.databases[0])) as connection:
+            baseline = artifact._catalog(connection)
+        for member in schedule['catalog_mapping']:
+            self.assertEqual(member['semantics'], baseline[member['live_id']][1])
+        commercial = next(m for m in schedule['catalog_mapping'] if m['semantics']['row']['content_type']=='commercial')
+        self.assertEqual(commercial['semantics']['row']['tag'], '/mnt/t7/CRT-Media')
+        self.assertEqual(schedule['effect']['blocks'][0]['features'][0]['start'], '2026-09-22 20:01:00')
+        with closing(sqlite3.connect(self.databases[1])) as connection:
+            columns, rows = artifact._rows(connection, 'liquid_blocks')
+        self.assertEqual(artifact._block_playback(rows[0], allow_descriptors=False)[1],
+                         artifact._block_playback(schedule['rows'][0], allow_descriptors=False)[1])
+        self.assertEqual(before, [p.read_bytes() for p in self.databases])
+
+    def test_commercial_directory_rejects_other_fields_and_metadata(self):
+        from contextlib import closing
+        request = self.commercial_rebuild()
+        with closing(sqlite3.connect(self.databases[1])) as connection:
+            raw = next(r for r, s in artifact._catalog(connection).values() if r['content_type']=='commercial')
+        cases = {'station':'Other', 'tag':'/media/other', 'content_type':'feature', 'duration':3599.,
+                 'title':'different', 'count':1, 'hints':'[]', 'media_type':'audio',
+                 'path':'/media/other.mp4', 'realpath':'/media/other.mp4'}
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                self.update(f'UPDATE catalog_entries SET {field}=? WHERE id=?', (value,raw['id']))
+                try:
+                    with self.assertRaises(artifact.ArtifactError):
+                        artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=request)
+                finally:
+                    self.update(f'UPDATE catalog_entries SET {field}=? WHERE id=?', (raw[field],raw['id']))
+        for table in ('file_meta', 'chapter_points', 'break_points'):
+            if table == 'file_meta':
+                self.update('UPDATE file_meta SET size=size+1')
+            else:
+                self.update(f'INSERT INTO {table}(path,points) VALUES(?,?)', ('/mnt/t7/CRT-Media/ad.mp4','[]'))
+            with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_metadata_changed'):
+                artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=request)
+            if table == 'file_meta':
+                self.update('UPDATE file_meta SET size=size-1')
+            else:
+                self.update(f'DELETE FROM {table}')
+
+    def test_commercial_directory_missing_or_changed_provenance(self):
+        request = self.commercial_rebuild()
+        bad = copy.deepcopy(request)
+        bad['input_fingerprints']['original_logical_configuration_fingerprint'] = '0'*64
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_invalid'):
+            artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=bad)
+        # A slash-bearing series tag is not commercial-directory provenance.
+        self.update("UPDATE catalog_entries SET content_type='feature' WHERE content_type='commercial'", sides=(0,1))
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_catalog_no_semantic_match'):
+            artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=request)
+
+    def test_commercial_directory_ambiguity_rejected(self):
+        from contextlib import closing
+        request = self.commercial_rebuild()
+        with closing(sqlite3.connect(self.databases[0])) as connection:
+            old_id = connection.execute("SELECT id FROM catalog_entries WHERE content_type='commercial'").fetchone()[0]
+        with closing(sqlite3.connect(self.databases[0])) as connection:
+            columns = [r[1] for r in connection.execute('PRAGMA table_info(catalog_entries)') if r[1]!='id']
+            selected = ','.join("replace(path,'/mnt/t7/CRT-Media/','catalog/crt_media/')" if c=='path' else c for c in columns)
+            connection.execute(f"INSERT INTO catalog_entries(id,{','.join(columns)}) SELECT 1,{selected} FROM catalog_entries WHERE id=?", (old_id,))
+            connection.commit()
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_catalog_mapping_ambiguous'):
+            artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=request)
+
+    def test_commercial_directory_requires_supported_captured_locations(self):
+        from station_director.validation_context import logical_configuration_values_fingerprint
+        request = self.commercial_rebuild()
+        paths = {s:self.stage/s/'confs/action.json' for s in ('source','work')}
+        original = {s:json.loads(p.read_text()) for s,p in paths.items()}
+        for mode in ('different_mapping', 'unharvested', 'outside_directory', 'unsupported'):
+            with self.subTest(mode=mode):
+                docs = copy.deepcopy(original)
+                if mode == 'different_mapping':
+                    docs['work']['station_conf']['commercial_dir'] = '/media/else'
+                elif mode == 'unharvested':
+                    for doc in docs.values():
+                        conf = doc['station_conf']
+                        conf['unrelated'] = {'commercial_dir':conf.pop('commercial_dir')}
+                elif mode == 'outside_directory':
+                    docs['source']['station_conf']['commercial_dir'] = '/mnt/t7/CRT-Media/else'
+                    docs['work']['station_conf']['commercial_dir'] = '/media/else'
+                else:
+                    docs['source']['station_conf']['commercial_dir'] = '/outside'
+                for side, path in paths.items():
+                    path.write_text(json.dumps(docs[side]))
+                source = {'confs/action.json':docs['source'],'runtime/watch_in_order_state.json':{}}
+                request['input_fingerprints']['original_logical_configuration_fingerprint'] = logical_configuration_values_fingerprint(source)['digest']
+                self.response['verification']['fingerprints']['projected_configuration_fingerprint'] = logical_configuration_values_fingerprint({'confs/action.json':docs['work']})['digest']
+                with self.assertRaises(artifact.ArtifactError):
+                    artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=request)
+
+    def test_commercial_directory_supported_overrides(self):
+        from station_director.validation_context import logical_configuration_values_fingerprint
+        request = self.commercial_rebuild()
+        paths = {s:self.stage/s/'confs/action.json' for s in ('source','work')}
+        original = {s:json.loads(p.read_text()) for s,p in paths.items()}
+        for location in (('monday','20'), ('tag_overrides','Synthetic'),
+                         ('date_overrides','September 23','10'),
+                         ('week_overrides','2026-09-21','monday','20')):
+            with self.subTest(location=location):
+                docs = copy.deepcopy(original)
+                for side, doc in docs.items():
+                    conf = doc['station_conf']
+                    value = conf.pop('commercial_dir')
+                    target = conf
+                    for part in location:
+                        target = target.setdefault(part,{})
+                    target['commercial_dir'] = value
+                    paths[side].write_text(json.dumps(doc))
+                request['input_fingerprints']['original_logical_configuration_fingerprint'] = logical_configuration_values_fingerprint(
+                    {'confs/action.json':docs['source'],'runtime/watch_in_order_state.json':{}})['digest']
+                self.response['verification']['fingerprints']['projected_configuration_fingerprint'] = logical_configuration_values_fingerprint({'confs/action.json':docs['work']})['digest']
+                artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=request)
+
+    def test_commercial_directory_rejects_linked_capture(self):
+        request = self.commercial_rebuild()
+        path = self.stage/'work/confs/action.json'
+        saved = path.read_bytes()
+        path.unlink()
+        path.symlink_to(self.stage/'source/confs/action.json')
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_invalid'):
+            artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=request)
+        path.unlink()
+        path.write_bytes(saved)
+        os.link(path, self.root/'hardlink')
+        with self.assertRaisesRegex(artifact.ArtifactError, 'candidate_invalid'):
+            artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,request=request)
 
     def test_production_clock_only_mapping_preserves_live_semantics(self):
         from contextlib import closing

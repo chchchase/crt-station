@@ -345,3 +345,27 @@ remain unchanged. General normalization, two-run comparisons, database
 fingerprints, source-stability checks, metadata equivalence, timing proof, and
 approval bindings remain timestamp-sensitive and unchanged. This exception
 does not implement or authorize live application.
+
+### Captured commercial-directory tag reference mapping
+
+Exact catalog matching remains first, followed by the timestamp-only route.
+If those find no match, a newly allocated, affected-channel ordinary commercial
+row in canonical sandbox form may reuse a unique existing live catalog ID
+despite a directory-derived tag spelling change. This is export-only reference
+mapping, not general tag normalization or permission to write the catalog.
+
+The source and projected staged configurations must match their captured
+request/response fingerprints. Only paired `commercial_dir` settings actually
+harvested by the catalog builder qualify: channel-wide settings, daily slots,
+tag overrides, date slots, and week slots. The staged setting must be the exact
+sandbox translation. Supported baseline spellings are derived from that captured
+mapping, never inferred from slashes. Both rows must be ordinary commercials
+whose logical media identity lies inside the proven directory for that station.
+Missing provenance, unsupported mappings, or ambiguous targets fail closed.
+
+Every remaining canonical field and all associated metadata must match exactly,
+subject only to the timestamp rules above. Candidate mappings retain the live
+ID and complete original baseline semantics, including its tag and timestamps.
+Descriptor handling, complete baseline-ID coverage, protected-row and alias
+provenance, media confinement, timing proof, general normalization, fingerprints,
+approval bindings, and publication-after-cleanup requirements are unchanged.

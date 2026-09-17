@@ -291,7 +291,130 @@ def _catalog_reference_semantics(semantics):
     return _canonical({'row': row, 'media_records': semantics['media_records']})
 
 
-def export_candidate(stage, response, proposal, policy):
+def _commercial_directory_pairs(stage, response, proposal, policy, request):
+    """Captured, fingerprint-bound directory provenance; no live/media reads."""
+    if request is None:
+        return {}
+    from station_director.validation import project_configuration
+    from station_director.validation_context import logical_configuration_values_fingerprint
+    try:
+        @contextmanager
+        def captured_directory(side, name):
+            # Stage parents can inherit the worker umask; unlike published
+            # report directories they do not have a private-mode contract.
+            fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                for component in (side, name):
+                    child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    os.close(fd)
+                    fd = child
+                yield fd
+            finally:
+                os.close(fd)
+
+        def read_config(parent, name):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            try:
+                before = os.fstat(fd)
+                if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                    raise ArtifactError('candidate_invalid')
+                if before.st_size > 256 * 1024:
+                    raise ArtifactError('candidate_limit')
+                with os.fdopen(os.dup(fd), 'rb') as stream:
+                    raw = stream.read(256 * 1024 + 1)
+                if len(raw) > 256 * 1024:
+                    raise ArtifactError('candidate_limit')
+                if (_file_identity(before) != _file_identity(os.fstat(fd))
+                        or _file_identity(before) != _file_identity(os.stat(name, dir_fd=parent, follow_symlinks=False))):
+                    raise ArtifactError('candidate_invalid')
+                return strict_json_loads(raw)
+            finally:
+                os.close(fd)
+        if request['proposal'] != proposal or request['policy'] != policy:
+            raise ArtifactError('candidate_invalid')
+        documents = {}
+        for side in ('source', 'work'):
+            values = {}
+            with captured_directory(side, 'confs') as parent:
+                with os.scandir(parent) as entries:
+                    for index, entry in enumerate(entries):
+                        if index >= 128:
+                            raise ArtifactError('candidate_limit')
+                        if entry.name.endswith('.json'):
+                            values['confs/' + entry.name] = read_config(parent, entry.name)
+            if side == 'source':
+                with captured_directory(side, 'runtime') as parent:
+                    values['runtime/watch_in_order_state.json'] = read_config(parent, 'watch_in_order_state.json')
+            documents[side] = values
+        if (logical_configuration_values_fingerprint(documents['source'])['digest'] !=
+                request['input_fingerprints']['original_logical_configuration_fingerprint']
+                or logical_configuration_values_fingerprint(documents['work'])['digest'] !=
+                response['verification']['fingerprints']['projected_configuration_fingerprint']):
+            raise ArtifactError('candidate_invalid')
+        configs, filenames = {}, {}
+        for name, data in documents['source'].items():
+            if not name.startswith('confs/') or name == 'confs/main_config.json':
+                continue
+            station = data['station_conf']['network_name']
+            if station in configs:
+                raise ArtifactError('candidate_invalid')
+            configs[station], filenames[station] = data, name
+        projected, unused, unused_sources = project_configuration(configs, proposal, policy)
+
+        def locations(conf):
+            # Only locations harvested by ShowCatalog._build_standard, not
+            # arbitrary nested keys or path-looking series tags.
+            days = ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
+            result = {(): conf}
+            for day in days:
+                for hour, slot in conf.get(day, {}).items():
+                    result[(day, hour)] = slot
+            for tag, slot in conf.get('tag_overrides', {}).items():
+                result[('tag_overrides', tag)] = slot
+            for date, slots in conf.get('date_overrides', {}).items():
+                for hour, slot in slots.items():
+                    result[('date_overrides', date, hour)] = slot
+            for week, schedule in conf.get('week_overrides', {}).items():
+                for day in days:
+                    for hour, slot in schedule.get(day, {}).items():
+                        result[('week_overrides', week, day, hour)] = slot
+            return {key: slot['commercial_dir'] for key, slot in result.items()
+                    if isinstance(slot, dict) and slot.get('commercial_dir')}
+
+        pairs = {}
+        for station, data in projected.items():
+            source = locations(data['station_conf'])
+            work = documents['work'][filenames[station]]['station_conf']
+            if work['network_name'] != station:
+                raise ArtifactError('candidate_invalid')
+            staged = locations(work)
+            if source.keys() != staged.keys():
+                raise ArtifactError('candidate_invalid')
+            for location, value in source.items():
+                mapping = canonical_media_mapping(value)
+                if staged[location] != mapping.sandbox_path:
+                    raise ArtifactError('candidate_invalid')
+                # Supported spellings come from the captured directory mapping.
+                aliases = {value, mapping.canonical_host_path,
+                           'catalog/crt_media' + mapping.logical_identity[len('crt-media:'):]}
+                for alias in aliases:
+                    pairs[(station, alias, staged[location])] = mapping.logical_identity
+        return pairs
+    except ArtifactError:
+        raise
+    except Exception:
+        raise ArtifactError('candidate_invalid') from None
+
+
+def _commercial_reference_key(semantics, directory):
+    row = semantics['row']
+    if (row['content_type'] != 'commercial' or _semantic_descriptor(row)
+            or not (row.get('realpath') or row['path']).startswith(directory.rstrip('/') + '/')):
+        return None
+    return _catalog_reference_semantics(dict(semantics, row=dict(row, tag=directory)))
+
+
+def export_candidate(stage, response, proposal, policy, *, request=None):
     directives = proposal['directives']
     if (proposal['assignment_changes'] or proposal['exclusions'] or len(directives) != 1
             or directives[0]['type'] != 'date_slot' or len(response['channels']) != 1):
@@ -318,6 +441,7 @@ def export_candidate(stage, response, proposal, policy):
                 by_reference.setdefault(_catalog_reference_semantics(semantics), []).append(ident)
         mapping = {}
         used = set()
+        commercial_index = None
         for ident, (row, semantics) in new.items():
             ordinary = not _catalog_descriptor(row)
             reference_key = _catalog_reference_semantics(semantics) if ordinary else None
@@ -336,8 +460,29 @@ def export_candidate(stage, response, proposal, policy):
                         raise ArtifactError('candidate_catalog_mapping_ambiguous')
                     if len(fallback) == 1:
                         target = fallback[0]
+                    if not fallback and row['content_type'] == 'commercial':
+                        if commercial_index is None:
+                            commercial_index = {}
+                            pairs = _commercial_directory_pairs(stage, response, proposal, policy, request)
+                            prior_by_tag = {}
+                            for prior_id, (prior_row, prior) in old.items():
+                                prior_by_tag.setdefault((prior_row['station'], prior_row['tag']), []).append((prior_id, prior))
+                            for (station, tag, staged_tag), directory in pairs.items():
+                                bucket = commercial_index.setdefault((station, staged_tag), {}).setdefault(directory, {})
+                                for prior_id, prior in prior_by_tag.get((station, tag), ()):
+                                    key = _commercial_reference_key(prior, directory)
+                                    if key is not None:
+                                        bucket.setdefault(key, set()).add(prior_id)
+                        commercial_matches = set()
+                        for directory, bucket in commercial_index.get((row['station'], row['tag']), {}).items():
+                            key = _commercial_reference_key(semantics, directory)
+                            commercial_matches.update(bucket.get(key, ()))
+                        if len(commercial_matches) > 1:
+                            raise ArtifactError('candidate_catalog_mapping_ambiguous')
+                        if commercial_matches:
+                            target = next(iter(commercial_matches))
             if target is None:
-                # Classify only after both supported matching routes reject.
+                # Classify only after all supported matching routes reject.
                 # Row-only equivalence never authorizes a catalog mapping.
                 if matches:
                     code = 'candidate_catalog_mapping_ambiguous'
@@ -597,7 +742,8 @@ class CandidatePreparation:
     def capture(self, lifecycle, response, capture):
         if code_revision(self.root) != self.revision or len(self.exports) >= 2:
             raise ArtifactError('candidate_code_changed')
-        schedule = export_candidate(lifecycle.stage, response, self.proposal, self.policy)
+        schedule = export_candidate(lifecycle.stage, response, self.proposal, self.policy,
+                                    request=lifecycle.request)
         if len(_json(schedule)) > MAX_BYTES:
             raise ArtifactError('candidate_limit')
         inputs = {k: v for k, v in lifecycle.request['input_fingerprints'].items()
