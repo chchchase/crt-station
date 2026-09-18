@@ -183,13 +183,48 @@ normal-SSH admission, lock, confinement, preservation, and cleanup requirements.
 It requires a clean tracked worktree and records the exact Git revision; new
 untracked Python implementation files in the native/Director packages are rejected.
 
-This first checkpoint supports one date-slot directive on one ordinary channel,
+New preparations use candidate schema v2; existing v1 artifacts remain inspectable
+under their original schedule-only contract. There is still no application writer.
+Preparation alone requests a private `selection-evidence.json` from each worker;
+ordinary validation does not record it. The request binds the worker request and
+checkout revision, and the evidence is consumed before normal staging cleanup.
+Files are exclusive, owner-only, bounded to 8 MiB, and never retained after cleanup.
+An incomplete file, failed worker, missing evidence, or failed cleanup cannot
+produce an approvable candidate.
+
+V2 records reconciliation's complete active membership, zero-count native rebuild,
+unchanged reconciliation counts, and the actual scoped SQL increment groups.
+Each observed update checks before/after counts and the validation reference-clock
+timestamp; final staged rows must equal the replayed updates. Absolute count writes,
+unobserved mutations, nonzero rebuild counts, or changed metadata are unsupported.
+Evidence is bounded to 50,000 active entries, 10,000 write events and 100,000 total
+row increments per channel. Native station/path groups retain legitimate distinct
+tags; active entries must map one-to-one to existing baseline IDs. Historical-only
+rows remain exact in staging and may share an ID mapping with one proven active
+alias. Only the active alias proposes selection state for that affected live ID.
+Other channels, sequence state and historical playback semantics remain protected.
+
+The proposed count is the final native count, including rebuild resets—not the old
+count plus new selections. `updated_at` is proposed from native persistence when
+selections occurred (including net-zero count outcomes), or from native rebuild
+when resetting changes the count. With neither, the baseline timestamp is retained.
+`created_at`, baseline tags/paths and all other catalog semantics are retained under
+the existing timestamp/directory reference-mapping rules. Exact baseline counts and
+timestamps, validated semantics, per-phase evidence and proposed mutations are bound
+into the immutable candidate. Both workers must agree on all of these and the
+existing input bindings. Inspection prints only aggregate resets, selections, count
+and timestamp changes, and zero unaffected-channel mutations, alongside the existing
+schedule/effect summary. No count/timestamp proposal is applied by these commands.
+
+This checkpoint supports one date-slot directive on one ordinary channel,
 without assignments or exclusions. It requires an unambiguous mapping to existing catalog
 semantics and unchanged file/break/chapter metadata, including negative chapter
 attestations. Ambiguous catalog mappings, catalog additions/removals, metadata
 changes, and a no-change replacement are rejected. A protected, exact historical
 host-path row and its freshly allocated `/media` staging alias may map to the
-same existing live ID, only with identical complete semantics. Metadata is
+same existing live ID, only with equivalent playback/metadata semantics and,
+for v2, an explicit active-row selection-state proposal (v1 still requires its
+original full-semantic comparison). Metadata is
 resolved through an unambiguous canonical media identity; missing exact-path
 metadata on a staging alias is not treated as missing live metadata. Conflicting
 or ambiguous metadata aliases fail closed. Native numeric cache timestamps are

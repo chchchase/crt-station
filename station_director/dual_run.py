@@ -756,7 +756,7 @@ def _validate_result_semantics(result):
 def run_dual_comparison(
     project_root, source_root, media_root, proposal, policy, comparison_id, *,
     control_started=None, admission_cutoff=None, control_deadline=None,
-    candidate_exporter=None,
+    candidate_exporter=None, candidate_setup=None,
 ):
     """Execute C2 internally. This function is intentionally not CLI-routed."""
     started = time.monotonic() if control_started is None else control_started
@@ -789,6 +789,9 @@ def run_dual_comparison(
             result["affected_channels"] = scope.lifecycles[0].request["affected_channels"]
 
         _capture_step("context_consistency", copy_verified_context)
+        if candidate_setup is not None:
+            for lifecycle in scope.lifecycles:
+                candidate_setup(lifecycle)
         result["source_checks"].append(
             {"checkpoint": "after_capture", "passed": True, "changed_categories": []}
         )

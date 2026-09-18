@@ -568,6 +568,9 @@ def _execute_native_single_run(request, attestation, restoration):
     scheduler_seconds = 0.0
     os.chdir(work)
     database = work / "runtime/fs42_fluid.db"
+    from station_director import selection_state
+    selection_request = selection_state.requested(work.parent, request)
+    selection_channels = []
     proposal_start = _db_time(request["proposal"]["week_start"])
     proposal_end = _db_time(request["proposal"]["week_end"])
     effective_seed = request["validation_context"]["effective_seed"]
@@ -713,6 +716,10 @@ def _execute_native_single_run(request, attestation, restoration):
                 )
                 connection.commit()
                 assert_retained_history(connection, history)
+                selection_recorder = (selection_state.Recorder(
+                    connection, channel, active_catalog_ids,
+                    _rows_as_dicts(columns, generated_rows), str(reference_clock),
+                ) if selection_request is not None else None)
                 attestation.verify(request)
             except Exception as exc:
                 primary = copy_preservation_detail(exc, NativeRunError(
@@ -738,7 +745,8 @@ def _execute_native_single_run(request, attestation, restoration):
             scheduler_started = time.monotonic()
             attestation.verify(request)
             with closing(sqlite3.connect(database)) as selection_connection, \
-                    activate_catalog_selection(selection_connection, channel, active_catalog_ids):
+                    activate_catalog_selection(selection_connection, channel, active_catalog_ids,
+                                               count_observer=(selection_recorder.observe if selection_recorder else None)):
                 with activate_validation_context(context):
                     schedule = LiquidSchedule(native_config)
                     _map_catalog_in_memory(schedule)
@@ -750,6 +758,8 @@ def _execute_native_single_run(request, attestation, restoration):
                 schedule.generate_validation_range(
                     context.start_time, context.end_time, context
                 )
+                if selection_recorder is not None:
+                    selection_channels.append(selection_recorder.finish(selection_connection))
             attestation.verify(request)
             if checkpoint is not None:
                 checkpoint.publish("scheduler_completed")
@@ -827,6 +837,8 @@ def _execute_native_single_run(request, attestation, restoration):
             "guide_validation_failed", "Native finalization budget expired.",
             phase="guide", scheduler_invoked=scheduler_entered)
     _final_input_verification(attestation, request)
+    if selection_request is not None:
+        selection_state.publish(work.parent, selection_request, request, selection_channels)
     return {
         "scheduler_invoked": scheduler_entered,
         "channels": channel_results,

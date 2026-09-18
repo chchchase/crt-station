@@ -355,13 +355,15 @@ class ArtifactTests(unittest.TestCase):
         preparation = artifact.CandidatePreparation(self.root)
         preparation.proposal, preparation.policy = PROPOSAL, POLICY
         preparation.revision, preparation.run_id = 'a'*40, RUN
+        from test.test_station_director_selection_state import make_evidence
+        make_evidence(self.stage, request, preparation.revision)
         # Only the checkout pin is substituted; export, mapping, metadata,
         # fingerprint, timing, and capture code all execute unmodified.
         with patch.object(artifact, 'code_revision', return_value=preparation.revision):
             preparation.capture(SimpleNamespace(stage=self.stage, request=request), self.response,
                                 SimpleNamespace(media_manifest=SimpleNamespace(summary={'digest':'b'*64})))
         exported = preparation.exports[0]
-        artifact.validate_candidate({'schema_version':1, 'proposal_id':PROPOSAL['proposal_id'],
+        artifact.validate_candidate({'schema_version':2, 'proposal_id':PROPOSAL['proposal_id'],
             'proposal_digest':'a'*64, 'policy_digest':'b'*64, 'code_revision':preparation.revision,
             'validation_run':RUN, 'validation_report_digest':'c'*64, 'normalized_digest':'d'*64,
             'directive':PROPOSAL['directives'][0], **exported})
@@ -587,7 +589,10 @@ class ArtifactTests(unittest.TestCase):
                     patch('station_director.dual_run.inspect_single_run', return_value=self.response), \
                     patch('station_director.dual_run._assert_inputs_stable', side_effect=lambda a,b,c,k:
                           {'checkpoint': k, 'passed': True, 'changed_categories': []}), \
-                    patch('station_director.dual_run.normalize_completed_run', return_value=SimpleNamespace()):
+                    patch('station_director.dual_run.normalize_completed_run', return_value=SimpleNamespace()), \
+                    patch('station_director.selection_state.load', return_value=None):
+                # Frozen v1 export branch/category coverage; v2 missing-evidence
+                # rejection is exercised separately with an unmodified loader.
                 result = c2.run_dual_comparison(
                     self.root, self.root, self.root, PROPOSAL, POLICY, RUN,
                     candidate_exporter=preparation.capture)
@@ -840,6 +845,20 @@ class ArtifactTests(unittest.TestCase):
                 artifact.publish_candidate(self.document(), self.root)
             self.assertEqual(list((self.root / 'runtime/director/candidates').iterdir()), [])
 
+    def test_v2_bound_report_inspection_and_cli_redaction(self):
+        from test.test_station_director_selection_state import make_evidence
+        from station_director import selection_state
+        self.production_clock_rebuild(protected=True)
+        request={'proposal':PROPOSAL,'policy':POLICY}
+        make_evidence(self.stage,request,'a'*40)
+        evidence=selection_state.load(self.stage,request,'a'*40)
+        document=self.document()
+        document['schema_version']=2
+        document['schedule']=artifact.export_candidate(self.stage,self.response,PROPOSAL,POLICY,
+                                                       request=request,selection=evidence)
+        with patch.object(self,'document',return_value=document):
+            self.test_bound_report_inspection_and_cli_redaction()
+
     def test_size_limit_and_unsafe_directory(self):
         with patch.object(artifact, 'MAX_BYTES', 100), self.assertRaises(artifact.ArtifactError):
             artifact.publish_candidate(self.document(), self.root)
@@ -1018,12 +1037,15 @@ class ArtifactTests(unittest.TestCase):
                 parser.parse_args(['schedule', command])
 
     def test_preparation_publication_gates(self):
+        self.production_clock_rebuild()
         candidate = artifact.CandidatePreparation(self.root)
         with patch.object(artifact, 'code_revision', return_value='a' * 40):
             candidate.begin(PROPOSAL, POLICY, RUN)
             life = SimpleNamespace(stage=self.stage, request={'input_fingerprints': INPUTS,
                                                              'validation_context': {}})
             captured = SimpleNamespace(media_manifest=SimpleNamespace(summary={'digest': 'a' * 64}))
+            from test.test_station_director_selection_state import make_evidence
+            make_evidence(self.stage, life.request, candidate.revision)
             candidate.capture(life, self.response, captured)
             candidate.capture(life, self.response, captured)
             result = {'status': 'success', 'reproducibility': {'passed': True, 'run_1_digest': 'c' * 64},
@@ -1052,6 +1074,13 @@ class ArtifactTests(unittest.TestCase):
             candidate.exports[1]['schedule']['rows'][0]['title'] = 'different'
             with self.assertRaises(artifact.ArtifactError):
                 candidate.publish(result, publication)
+            candidate.exports[1] = copy.deepcopy(candidate.exports[0])
+            for field in ('baseline_count','proposed_count','selection_increments','proposed_updated_at','timestamp_disposition'):
+                candidate.exports[1]['schedule']['selection_state']['entries'][0][field] = 'different'
+                with self.assertRaises(artifact.ArtifactError): candidate.publish(result,publication)
+                candidate.exports[1] = copy.deepcopy(candidate.exports[0])
+            candidate.exports[1]['schedule']['selection_state']['phase_evidence']['events'].append({})
+            with self.assertRaises(artifact.ArtifactError): candidate.publish(result,publication)
             candidate.exports[1] = copy.deepcopy(candidate.exports[0])
             candidate.publish(result, publication)
             self.assertIsNotNone(candidate.summary)
@@ -1174,6 +1203,8 @@ def production_alias_fixture(root, revision_root):
             for row in generated:
                 path = canonical_media_mapping(row['realpath'] or row['path']).sandbox_path
                 row['path'] = row['realpath'] = path
+                from datetime import datetime
+                row['created_at'] = row['updated_at'] = str(datetime.fromisoformat(request['validation_context']['reference_clock']))
             generated_metadata = capture_catalog_media_metadata(
                 con, [tuple(row[c] for c in columns) for row in generated], columns)
             # Production reconciliation itself creates the /media alias for a
@@ -1222,6 +1253,8 @@ def production_alias_fixture(root, revision_root):
             fingerprint_json_files(protected_json_paths(source)),
             fingerprint_database(database), manifest, logical_media_manifest_fingerprint(manifest),
             _space_requirement(database, 0), stage)
+        from test.test_station_director_selection_state import make_evidence
+        make_evidence(stage, request, preparation.revision)
         preparation.capture(life, accepted, capture)
         return preparation, stage, normalized, accepted
     finally:
@@ -1248,7 +1281,7 @@ class ProductionAliasExportTests(unittest.TestCase):
             self.assertIsNotNone(aliases[0]['semantics']['media_records']['file_meta'])
             self.assertEqual(schedule['effect']['blocks'][0]['features'][0]['start'],
                              '2026-09-14 06:01:00')
-            document = {'schema_version': 1, 'proposal_id': preparation.proposal['proposal_id'],
+            document = {'schema_version': 2, 'proposal_id': preparation.proposal['proposal_id'],
                         'proposal_digest': artifact.digest(preparation.proposal),
                         'policy_digest': artifact.digest(preparation.policy),
                         'code_revision': preparation.revision, 'validation_run': preparation.run_id,

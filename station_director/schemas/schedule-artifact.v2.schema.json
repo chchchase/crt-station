@@ -1,0 +1,949 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "proposal_id",
+    "proposal_digest",
+    "policy_digest",
+    "code_revision",
+    "validation_run",
+    "validation_report_digest",
+    "normalized_digest",
+    "directive",
+    "inputs",
+    "schedule"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "proposal_id": {
+      "type": "string",
+      "pattern": "^p-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$"
+    },
+    "proposal_digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "policy_digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "code_revision": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "validation_run": {
+      "type": "string",
+      "pattern": "^v-[0-9]{8}T[0-9]{12}Z-[a-f0-9]{32}$"
+    },
+    "validation_report_digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "normalized_digest": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "directive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "channel",
+        "date",
+        "hour",
+        "series"
+      ],
+      "properties": {
+        "type": {
+          "const": "date_slot"
+        },
+        "channel": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 7
+        },
+        "date": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        "hour": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 23
+        },
+        "series": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000
+        }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "original_logical_configuration_fingerprint",
+        "original_logical_database_fingerprint",
+        "logical_media_manifest_fingerprint",
+        "live_physical_configuration_fingerprint",
+        "physical_media_manifest_fingerprint",
+        "projected_configuration_fingerprint",
+        "working_database_fingerprint",
+        "validation_context_fingerprint"
+      ],
+      "properties": {
+        "original_logical_configuration_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "original_logical_database_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "logical_media_manifest_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "live_physical_configuration_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "physical_media_manifest_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "projected_configuration_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "working_database_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "validation_context_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "range",
+        "rows",
+        "catalog_mapping",
+        "metadata_digests",
+        "effect",
+        "selection_state"
+      ],
+      "properties": {
+        "range": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "channel",
+            "station",
+            "proposal_boundary",
+            "regeneration_start",
+            "effective_horizon",
+            "replacement_end"
+          ],
+          "properties": {
+            "channel": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 7
+            },
+            "station": {
+              "type": "string",
+              "maxLength": 2097152
+            },
+            "proposal_boundary": {
+              "type": "string",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?$"
+            },
+            "regeneration_start": {
+              "type": "string",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?$"
+            },
+            "effective_horizon": {
+              "type": "string",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?$"
+            },
+            "replacement_end": {
+              "type": "string",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?$"
+            }
+          }
+        },
+        "rows": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "station",
+              "liquid_type",
+              "start_time",
+              "end_time",
+              "break_strategy",
+              "title",
+              "sequence_key",
+              "break_info",
+              "content_json",
+              "plan_json"
+            ],
+            "properties": {
+              "id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9223372036854776000
+              },
+              "station": {
+                "type": "string",
+                "maxLength": 2097152
+              },
+              "liquid_type": {
+                "type": "string",
+                "maxLength": 2097152
+              },
+              "start_time": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?$"
+              },
+              "end_time": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?$"
+              },
+              "break_strategy": {
+                "type": "string",
+                "maxLength": 2097152
+              },
+              "title": {
+                "type": "string",
+                "maxLength": 2097152
+              },
+              "sequence_key": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 2097152
+              },
+              "break_info": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 2097152
+              },
+              "content_json": {
+                "type": "string",
+                "maxLength": 2097152
+              },
+              "plan_json": {
+                "type": "string",
+                "maxLength": 2097152
+              }
+            }
+          },
+          "maxItems": 10000,
+          "minItems": 1
+        },
+        "catalog_mapping": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "validated_id",
+              "live_id",
+              "semantics"
+            ],
+            "properties": {
+              "validated_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9223372036854776000
+              },
+              "live_id": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9223372036854776000
+              },
+              "semantics": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "row",
+                  "media_records"
+                ],
+                "properties": {
+                  "row": {
+                    "$ref": "#/$defs/catalogRow"
+                  },
+                  "media_records": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "file_meta",
+                      "break_points",
+                      "chapter_points"
+                    ],
+                    "properties": {
+                      "file_meta": {
+                        "anyOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "$ref": "#/$defs/fileMeta"
+                          }
+                        ]
+                      },
+                      "break_points": {
+                        "anyOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "$ref": "#/$defs/points"
+                          }
+                        ]
+                      },
+                      "chapter_points": {
+                        "anyOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "$ref": "#/$defs/points"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "maxItems": 50000,
+          "minItems": 1
+        },
+        "metadata_digests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "file_meta",
+            "break_points",
+            "chapter_points"
+          ],
+          "properties": {
+            "file_meta": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "break_points": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "chapter_points": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          }
+        },
+        "effect": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rule",
+            "channel",
+            "date",
+            "hour",
+            "series_digest",
+            "blocks"
+          ],
+          "properties": {
+            "rule": {
+              "const": "all_block_starts_in_requested_hour"
+            },
+            "channel": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 7
+            },
+            "date": {
+              "type": "string",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+            },
+            "hour": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 23
+            },
+            "series_digest": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "blocks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "block_id",
+                  "block_start",
+                  "block_end",
+                  "features"
+                ],
+                "properties": {
+                  "block_id": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9223372036854776000
+                  },
+                  "block_start": {
+                    "type": "string",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?$"
+                  },
+                  "block_end": {
+                    "type": "string",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?$"
+                  },
+                  "features": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "start",
+                        "end"
+                      ],
+                      "properties": {
+                        "start": {
+                          "type": "string",
+                          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?$"
+                        },
+                        "end": {
+                          "type": "string",
+                          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{6})?$"
+                        }
+                      }
+                    },
+                    "maxItems": 10000,
+                    "minItems": 1
+                  }
+                }
+              },
+              "maxItems": 10000,
+              "minItems": 1
+            }
+          }
+        },
+        "selection_state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "phase_evidence",
+            "entries",
+            "unaffected_channel_mutations"
+          ],
+          "properties": {
+            "phase_evidence": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "station",
+                "clock",
+                "rows",
+                "events"
+              ],
+              "properties": {
+                "station": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 256
+                },
+                "clock": {
+                  "type": "string",
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(\\.\\d{1,6})?$"
+                },
+                "rows": {
+                  "type": "array",
+                  "maxItems": 50000,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "validated_id",
+                      "rebuild_count",
+                      "reconciled_count",
+                      "initial_updated_at",
+                      "stable_digest",
+                      "group_digest",
+                      "final_count",
+                      "final_updated_at"
+                    ],
+                    "properties": {
+                      "validated_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 9223372036854776000
+                      },
+                      "rebuild_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854776000
+                      },
+                      "reconciled_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854776000
+                      },
+                      "initial_updated_at": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(\\.\\d{1,6})?$"
+                      },
+                      "stable_digest": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{64}$"
+                      },
+                      "group_digest": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{64}$"
+                      },
+                      "final_count": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9223372036854776000
+                      },
+                      "final_updated_at": {
+                        "type": "string",
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}(\\.\\d{1,6})?$"
+                      }
+                    }
+                  }
+                },
+                "events": {
+                  "type": "array",
+                  "maxItems": 10000,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "group_digest",
+                      "ids"
+                    ],
+                    "properties": {
+                      "group_digest": {
+                        "type": "string",
+                        "pattern": "^[a-f0-9]{64}$"
+                      },
+                      "ids": {
+                        "type": "array",
+                        "maxItems": 50000,
+                        "uniqueItems": true,
+                        "items": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 9223372036854776000
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "entries": {
+              "type": "array",
+              "maxItems": 50000,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "validated_id",
+                  "live_id",
+                  "baseline_count",
+                  "proposed_count",
+                  "baseline_updated_at",
+                  "proposed_updated_at",
+                  "timestamp_disposition",
+                  "selection_increments",
+                  "reset_delta",
+                  "validated_semantics",
+                  "commercial_directory"
+                ],
+                "properties": {
+                  "validated_id": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9223372036854776000
+                  },
+                  "live_id": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9223372036854776000
+                  },
+                  "baseline_count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9223372036854776000
+                  },
+                  "proposed_count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9223372036854776000
+                  },
+                  "baseline_updated_at": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "type": "string",
+                        "maxLength": 32
+                      }
+                    ]
+                  },
+                  "proposed_updated_at": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "type": "string",
+                        "maxLength": 32
+                      }
+                    ]
+                  },
+                  "timestamp_disposition": {
+                    "enum": [
+                      "native_selection",
+                      "native_reset",
+                      "preserve_baseline"
+                    ]
+                  },
+                  "selection_increments": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9223372036854776000
+                  },
+                  "reset_delta": {
+                    "type": "integer",
+                    "minimum": -9223372036854776000,
+                    "maximum": 0
+                  },
+                  "validated_semantics": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "row",
+                      "media_records"
+                    ],
+                    "properties": {
+                      "row": {
+                        "$ref": "#/$defs/catalogRow"
+                      },
+                      "media_records": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "file_meta",
+                          "break_points",
+                          "chapter_points"
+                        ],
+                        "properties": {
+                          "file_meta": {
+                            "anyOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/$defs/fileMeta"
+                              }
+                            ]
+                          },
+                          "break_points": {
+                            "anyOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/$defs/points"
+                              }
+                            ]
+                          },
+                          "chapter_points": {
+                            "anyOf": [
+                              {
+                                "type": "null"
+                              },
+                              {
+                                "$ref": "#/$defs/points"
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "commercial_directory": {
+                    "anyOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "type": "string",
+                        "maxLength": 4096
+                      }
+                    ]
+                  }
+                }
+              }
+            },
+            "unaffected_channel_mutations": {
+              "const": 0
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "json": {
+      "anyOf": [
+        {
+          "type": [
+            "null",
+            "boolean",
+            "number"
+          ]
+        },
+        {
+          "type": "string",
+          "maxLength": 2097152
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/json"
+          },
+          "maxItems": 50000,
+          "minItems": 0
+        },
+        {
+          "type": "object",
+          "maxProperties": 128,
+          "additionalProperties": {
+            "$ref": "#/$defs/json"
+          }
+        }
+      ]
+    },
+    "catalogRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "station",
+        "path",
+        "title",
+        "duration",
+        "tag",
+        "count",
+        "hints",
+        "created_at",
+        "updated_at",
+        "realpath",
+        "content_type",
+        "media_type"
+      ],
+      "properties": {
+        "station": {
+          "type": "string",
+          "maxLength": 2097152
+        },
+        "path": {
+          "type": "string",
+          "maxLength": 2097152
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 2097152
+        },
+        "duration": {
+          "type": "number"
+        },
+        "tag": {
+          "type": "string",
+          "maxLength": 2097152
+        },
+        "count": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "hints": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "const": ""
+            },
+            {
+              "type": "array",
+              "maxItems": 50000,
+              "items": {
+                "$ref": "#/$defs/json"
+              }
+            }
+          ]
+        },
+        "created_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2097152
+        },
+        "updated_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2097152
+        },
+        "realpath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2097152
+        },
+        "content_type": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2097152
+        },
+        "media_type": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2097152
+        }
+      }
+    },
+    "fileMeta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "duration",
+        "size",
+        "first_added",
+        "last_mod",
+        "last_checked",
+        "last_updated",
+        "meta",
+        "media_type"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "maxLength": 2097152
+        },
+        "duration": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "size": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "first_added": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ],
+          "maxLength": 2097152
+        },
+        "last_mod": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ],
+          "maxLength": 2097152
+        },
+        "last_checked": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ],
+          "maxLength": 2097152
+        },
+        "last_updated": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ],
+          "maxLength": 2097152
+        },
+        "meta": {
+          "$ref": "#/$defs/json"
+        },
+        "media_type": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 2097152
+        }
+      }
+    },
+    "points": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "points",
+        "last_updated"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "maxLength": 2097152
+        },
+        "points": {
+          "$ref": "#/$defs/json"
+        },
+        "last_updated": {
+          "type": [
+            "string",
+            "number",
+            "null"
+          ],
+          "maxLength": 2097152
+        }
+      }
+    }
+  }
+}

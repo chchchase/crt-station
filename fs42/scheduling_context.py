@@ -112,8 +112,9 @@ _ACTIVE_CATALOG = contextvars.ContextVar("fs42_director_active_catalog", default
 
 
 class _CatalogActivation:
-    def __init__(self, station, ids):
+    def __init__(self, station, ids, count_observer=None):
         self.station, self.ids = station, ids
+        self.count_observer = count_observer
         self.active = True
         self.owner_thread, self.owner_task = threading.get_ident(), _current_task()
 
@@ -133,7 +134,7 @@ def active_catalog_ids(station):
 
 
 @contextmanager
-def activate_catalog_selection(connection, station, active_ids):
+def activate_catalog_selection(connection, station, active_ids, *, count_observer=None):
     """Director-only scope from reconciliation, validated against staged rows.
 
     Independent of the RNG activation: native construction and generation use
@@ -155,13 +156,23 @@ def activate_catalog_selection(connection, station, active_ids):
     previous = _ACTIVE_CATALOG.get()
     if previous is not None:
         previous.verify()
-    scope = _CatalogActivation(station, ids)
+    if count_observer is not None and not callable(count_observer):
+        raise ValueError("invalid count observer")
+    scope = _CatalogActivation(station, ids, count_observer)
     token = _ACTIVE_CATALOG.set(scope)
     try:
         yield
     finally:
         scope.active = False
         _ACTIVE_CATALOG.reset(token)
+
+
+def catalog_count_observer():
+    scope = _ACTIVE_CATALOG.get()
+    if scope is None:
+        return None
+    scope.verify()
+    return scope.count_observer
 
 
 def current_validation_context():

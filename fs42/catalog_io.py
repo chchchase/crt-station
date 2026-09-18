@@ -6,7 +6,7 @@ from contextlib import contextmanager
 
 from fs42.station_manager import StationManager
 from fs42.catalog_entry import CatalogEntry
-from fs42.scheduling_context import active_catalog_ids, in_validation_mode, scheduling_now
+from fs42.scheduling_context import active_catalog_ids, catalog_count_observer, in_validation_mode, scheduling_now
 
 
 def _selection_clause(station):
@@ -18,6 +18,20 @@ def _selection_clause(station):
     # Scope construction validates signed SQLite integers. Literal integers avoid
     # SQLite's variable limit for large catalogs; no user text enters this SQL.
     return " AND id IN (" + ",".join(str(i) for i in ids) + ")"
+
+
+@contextmanager
+def _observe_count_write(connection, station, path, operation):
+    observer = catalog_count_observer()
+    if observer is None:
+        yield
+        return
+    sql = ("SELECT id,count,updated_at FROM catalog_entries WHERE station=? AND path=?"
+           + _selection_clause(station) + " ORDER BY id")
+    before = connection.execute(sql, (station, path)).fetchall()
+    yield
+    after = connection.execute(sql, (station, path)).fetchall()
+    observer(station, path, operation, before, after)
 
 
 class CatalogIO:
@@ -290,19 +304,20 @@ class CatalogIO:
     def update_entry_count(self, station_name: str, path: str, new_count: int):
         with self._get_connection() as connection:
             cursor = connection.cursor()
-            if in_validation_mode():
-                cursor.execute(
-                    f"""UPDATE catalog_entries SET count = ?, updated_at = ?
-                              WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
-                    (new_count, scheduling_now(), station_name, path),
-                )
-            else:
-                cursor.execute(
-                    f"""UPDATE catalog_entries
-                              SET count = ?, updated_at = CURRENT_TIMESTAMP
-                              WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
-                    (new_count, station_name, path),
-                )
+            with _observe_count_write(connection, station_name, path, 'set'):
+                if in_validation_mode():
+                    cursor.execute(
+                        f"""UPDATE catalog_entries SET count = ?, updated_at = ?
+                                  WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
+                        (new_count, scheduling_now(), station_name, path),
+                    )
+                else:
+                    cursor.execute(
+                        f"""UPDATE catalog_entries
+                                  SET count = ?, updated_at = CURRENT_TIMESTAMP
+                                  WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
+                        (new_count, station_name, path),
+                    )
             connection.commit()
             cursor.close()
 
@@ -312,20 +327,21 @@ class CatalogIO:
             cursor = connection.cursor()
             for entry in entries:
                 if isinstance(entry, CatalogEntry):
-                    if in_validation_mode():
-                        cursor.execute(
-                            f"""UPDATE catalog_entries
-                                      SET count = count + 1, updated_at = ?
-                                      WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
-                            (scheduling_now(), station_name, entry.path),
-                        )
-                    else:
-                        cursor.execute(
-                            f"""UPDATE catalog_entries
-                                      SET count = count + 1, updated_at = CURRENT_TIMESTAMP
-                                      WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
-                            (station_name, entry.path),
-                        )
+                    with _observe_count_write(connection, station_name, entry.path, 'increment'):
+                        if in_validation_mode():
+                            cursor.execute(
+                                f"""UPDATE catalog_entries
+                                          SET count = count + 1, updated_at = ?
+                                          WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
+                                (scheduling_now(), station_name, entry.path),
+                            )
+                        else:
+                            cursor.execute(
+                                f"""UPDATE catalog_entries
+                                          SET count = count + 1, updated_at = CURRENT_TIMESTAMP
+                                          WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
+                                (station_name, entry.path),
+                            )
                 else:
                     print(f"Warning: Entry {entry} is not a CatalogEntry instance. Skipping.")
             connection.commit()

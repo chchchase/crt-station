@@ -679,7 +679,7 @@ def validate_saved_proposal(proposal_id, *, candidate=None):
                             control_started=control_started,
                             admission_cutoff=admission_cutoff,
                             control_deadline=control_deadline,
-                            **({'candidate_exporter': candidate.capture}
+                            **({'candidate_exporter': candidate.capture, 'candidate_setup': candidate.setup}
                                if candidate is not None else {}),
                         )
                         validate_document(result, RESULT_SCHEMA)

@@ -2254,6 +2254,7 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                 StationManager.stations = []
 
     def test_one_run_uses_native_catalog_and_explicit_scheduler_hooks_deterministically(self):
+        from datetime import datetime
         from station_director import native_single_run as native
         from fs42.scheduling_context import active_catalog_ids
 
@@ -2270,6 +2271,7 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                             connection = sqlite3.connect("runtime/fs42_fluid.db")
                             connection.execute("DELETE FROM catalog_entries WHERE station='Action'")
                             row = catalog_row("Action", "/media/a.mp4", "Show A", "Show A")
+                            row['created_at'] = row['updated_at'] = str(datetime.fromisoformat(request['validation_context']['reference_clock']))
                             connection.execute(
                                 "INSERT INTO catalog_entries "
                                 "(station,path,title,duration,tag,count,hints,created_at,updated_at,realpath,content_type,media_type) "
@@ -2280,6 +2282,9 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                             connection.close()
 
                 native_schedule_class = native.LiquidSchedule
+                from station_director import selection_state
+                request['run_id'] = 'synthetic-selection.run-1'
+                selection_state.prepare(types.SimpleNamespace(stage=work.parent, request=request), 'a' * 40)
 
                 def schedule_factory(config):
                     self.assertIsNotNone(active_catalog_ids('Action'))
@@ -2294,6 +2299,11 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                             "SELECT id FROM catalog_entries WHERE station='Action' AND path='/media/a.mp4'"
                         ).fetchone()[0]
                         owner.assertIn(catalog_id, active_catalog_ids('Action'))
+                        from fs42.catalog_api import CatalogAPI
+                        with patch('fs42.catalog_io.StationManager', return_value=types.SimpleNamespace(
+                                server_conf={'db_path':str(work / 'runtime/fs42_fluid.db')})):
+                            entry = CatalogAPI.get_entry_by_id(catalog_id)
+                            CatalogAPI.update_play_counts(config, [entry])
                         insert_block(
                             connection, "Action", str(start), str(end), catalog_id,
                             "/media/a.mp4",
@@ -2316,6 +2326,9 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                 ):
                     result = native.execute_native_single_run(request, test_attestation(request))
                 results.append(result["channels"])
+                evidence = selection_state.load(work.parent, request, 'a' * 40)
+                self.assertEqual(evidence['channels'][0]['rows'][0]['final_count'], 1)
+                self.assertEqual(len(evidence['channels'][0]['events']), 1)
                 self.assertIsNone(active_catalog_ids('Action'))
                 self.assertTrue(result["scheduler_invoked"])
                 self.assertEqual(result["preservation"]["sequence_tables_restored"], "pass")

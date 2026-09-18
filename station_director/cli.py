@@ -76,7 +76,7 @@ def build_parser():
     schedule_commands.add_parser("list", help="List saved proposals")
     show = schedule_commands.add_parser("show", help="Display a proposal"); show.add_argument("proposal_id")
     validate = schedule_commands.add_parser("validate", help="Validate in an isolated staging workspace"); validate.add_argument("proposal_id")
-    prepare = schedule_commands.add_parser("prepare", help="Validate twice and prepare an immutable schedule candidate; never apply")
+    prepare = schedule_commands.add_parser("prepare", help="Validate twice and prepare an immutable schedule/selection-state candidate; never apply")
     prepare.add_argument("proposal_id")
     inspect = schedule_commands.add_parser("inspect-candidate", help="Inspect a private candidate without live reads")
     inspect.add_argument("digest")

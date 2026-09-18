@@ -24,6 +24,7 @@ from station_director.single_run_protocol import strict_json_loads, validate_doc
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = Path(__file__).with_name('schemas') / 'schedule-artifact.v1.schema.json'
+SCHEMA_V2 = Path(__file__).with_name('schemas') / 'schedule-artifact.v2.schema.json'
 MAX_BYTES = 16 * 1024 * 1024
 MAX_ROWS = 10000
 MAX_CATALOG = 50000
@@ -411,15 +412,24 @@ def _commercial_directory_pairs(stage, response, proposal, policy, request):
         raise ArtifactError('candidate_invalid') from None
 
 
-def _commercial_reference_key(semantics, directory):
+def _selection_reference_semantics(semantics):
+    from station_director.selection_state import count
+    count(semantics['row']['count'])
+    value = copy.deepcopy(semantics)
+    value['row']['count'] = 0
+    return _catalog_reference_semantics(value)
+
+
+def _commercial_reference_key(semantics, directory, *, selection=False):
     row = semantics['row']
     if (row['content_type'] != 'commercial' or _semantic_descriptor(row)
             or not (row.get('realpath') or row['path']).startswith(directory.rstrip('/') + '/')):
         return None
-    return _catalog_reference_semantics(dict(semantics, row=dict(row, tag=directory)))
+    compare = _selection_reference_semantics if selection else _catalog_reference_semantics
+    return compare(dict(semantics, row=dict(row, tag=directory)))
 
 
-def export_candidate(stage, response, proposal, policy, *, request=None):
+def export_candidate(stage, response, proposal, policy, *, request=None, selection=None):
     directives = proposal['directives']
     if (proposal['assignment_changes'] or proposal['exclusions'] or len(directives) != 1
             or directives[0]['type'] != 'date_slot' or len(response['channels']) != 1):
@@ -432,6 +442,11 @@ def export_candidate(stage, response, proposal, policy, *, request=None):
     with readonly_database(Path(stage) / 'source/runtime/fs42_fluid.db') as baseline, \
             readonly_database(Path(stage) / 'work/runtime/fs42_fluid.db') as proposed:
         old, new = _catalog(baseline), _catalog(proposed)
+        active = {}
+        if selection is not None:
+            from station_director.selection_state import verify_channel, require
+            require(len(selection['channels']) == 1 and selection['channels'][0]['station'] == channel)
+            active = verify_channel(selection['channels'][0], new)
         if _metadata(baseline) != _metadata(proposed):
             raise ArtifactError('candidate_metadata_changed')
         # Require unambiguous complete existing semantics, including metadata.
@@ -443,16 +458,22 @@ def export_candidate(stage, response, proposal, policy, *, request=None):
         for ident, (row, semantics) in old.items():
             by_semantic.setdefault(_canonical(semantics), []).append(ident)
             if not _catalog_descriptor(row):
-                by_reference.setdefault(_catalog_reference_semantics(semantics), []).append(ident)
+                compare = _selection_reference_semantics if selection is not None else _catalog_reference_semantics
+                by_reference.setdefault(compare(semantics), []).append(ident)
         mapping = {}
         used = set()
         commercial_index = None
+        selection_directories = {}
         for ident, (row, semantics) in new.items():
             ordinary = not _catalog_descriptor(row)
-            reference_key = _catalog_reference_semantics(semantics) if ordinary else None
+            compare = _selection_reference_semantics if selection is not None else _catalog_reference_semantics
+            reference_key = compare(semantics) if ordinary else None
             matches = by_semantic.get(_canonical(semantics), [])
             target = ident if ident in matches else matches[0] if len(matches) == 1 else None
-            if not matches and ordinary and row['station'] == channel and ident > allocation_floor:
+            if ident in active and len(matches) > 1:
+                raise ArtifactError('candidate_catalog_mapping_ambiguous')
+            eligible = (ident in active if selection is not None else ident > allocation_floor)
+            if not matches and ordinary and row['station'] == channel and eligible:
                 expected = canonical_media_mapping(row.get('realpath') or row['path'],
                                                    allow_sandbox=True).sandbox_path
                 # Production reconciliation allocates rebuilt rows above the
@@ -475,17 +496,24 @@ def export_candidate(stage, response, proposal, policy, *, request=None):
                             for (station, tag, staged_tag), directory in pairs.items():
                                 bucket = commercial_index.setdefault((station, staged_tag), {}).setdefault(directory, {})
                                 for prior_id, prior in prior_by_tag.get((station, tag), ()):
-                                    key = _commercial_reference_key(prior, directory)
+                                    key = _commercial_reference_key(prior, directory, selection=selection is not None)
                                     if key is not None:
                                         bucket.setdefault(key, set()).add(prior_id)
                         commercial_matches = set()
                         for directory, bucket in commercial_index.get((row['station'], row['tag']), {}).items():
-                            key = _commercial_reference_key(semantics, directory)
+                            key = _commercial_reference_key(semantics, directory, selection=selection is not None)
                             commercial_matches.update(bucket.get(key, ()))
                         if len(commercial_matches) > 1:
                             raise ArtifactError('candidate_catalog_mapping_ambiguous')
                         if commercial_matches:
                             target = next(iter(commercial_matches))
+                            if selection is not None:
+                                proven = {directory for (station, tag, staged_tag), directory in pairs.items()
+                                          if station == channel and tag == old[target][0]['tag'] and staged_tag == row['tag']
+                                          and _commercial_reference_key(old[target][1], directory, selection=True)
+                                          == _commercial_reference_key(semantics, directory, selection=True)}
+                                require(len(proven) == 1)
+                                selection_directories[ident] = next(iter(proven))
             if target is None:
                 # Classify only after all supported matching routes reject.
                 # Row-only equivalence never authorizes a catalog mapping.
@@ -502,6 +530,13 @@ def export_candidate(stage, response, proposal, policy, *, request=None):
                               'semantics': copy.deepcopy(old[target][1])}
         if used != set(old):
             raise ArtifactError('candidate_catalog_baseline_id_unmapped')
+        if selection is not None:
+            targets = [mapping[i]['live_id'] for i in active]
+            require(len(set(targets)) == len(targets))
+            # No changed/nonhistorical row may escape active provenance.
+            require(all(i in active or i in old and _canonical(pair[0]) == _canonical(old[i][0])
+                        and _canonical(pair[1]) == _canonical(old[i][1])
+                        for i, pair in new.items()))
         # Reconciliation preserves exact historical host rows and may add one
         # /media alias for generated playback. Only that proven pair may share
         # a live ID; do not admit arbitrary duplicate/ambiguous catalog changes.
@@ -551,6 +586,8 @@ def export_candidate(stage, response, proposal, policy, *, request=None):
             for ref in refs:
                 if ref not in mapping or _catalog_descriptor(new[ref][0]):
                     raise ArtifactError('candidate_reference_invalid')
+                if selection is not None and ref not in active:
+                    raise ArtifactError('candidate_reference_invalid')
                 referenced.add(ref)
             content = _parse_json(row['content_json'], 'content')
             live['content_json'] = _json([mapping[r]['live_id'] for r in refs]
@@ -571,21 +608,29 @@ def export_candidate(stage, response, proposal, policy, *, request=None):
                          key=lambda r: (r['start_time'], r['id']))
         if _schedule_semantics(earlier) == _schedule_semantics(translated):
             raise ArtifactError('candidate_no_change')
-        return {'range': {'channel': directive['channel'], 'station': channel,
+        result = {'range': {'channel': directive['channel'], 'station': channel,
                           'proposal_boundary': boundary, 'regeneration_start': seam,
                           'effective_horizon': horizon, 'replacement_end': mark.isoformat(' ')},
                 'rows': translated, 'catalog_mapping': sorted(mapping.values(), key=lambda v: v['validated_id']),
                 'metadata_digests': _metadata(baseline), 'effect': evidence}
+        if selection is not None:
+            from station_director.selection_state import proposal as selection_proposal
+            result['selection_state'] = selection_proposal(selection['channels'][0], mapping, new, selection_directories)
+        return result
 
 
 def validate_candidate(document):
     try:
-        validate_document(document, SCHEMA)
+        validate_document(document, SCHEMA_V2 if document.get('schema_version') == 2 else SCHEMA)
         if len(_json(document)) > MAX_BYTES:
             raise ArtifactError('candidate_limit')
         payload = document['schedule']
         rows = payload['rows']
         mapping = {m['live_id']: m for m in payload['catalog_mapping']}
+        if document['schema_version'] == 2:
+            from station_director.selection_state import validate_proposal
+            validate_proposal(payload['selection_state'],
+                              {m['validated_id']: m for m in payload['catalog_mapping']}, payload['range']['station'])
         if (len({m['validated_id'] for m in payload['catalog_mapping']}) != len(payload['catalog_mapping'])
                 or len({r['id'] for r in rows}) != len(rows)):
             raise ArtifactError()
@@ -722,10 +767,22 @@ def inspect_candidate(identity, root=ROOT):
 
 
 def summary(document, identity):
-    return {'candidate_digest': identity, 'proposal_id': document['proposal_id'],
+    result = {'candidate_digest': identity, 'proposal_id': document['proposal_id'],
             'validation_run': document['validation_run'], 'code_revision': document['code_revision'],
             'replacement_range': {k: v for k, v in document['schedule']['range'].items() if k != 'station'},
             'requested_effect': document['schedule']['effect'], 'application_supported': False}
+    if document['schema_version'] == 2:
+        entries = document['schedule']['selection_state']['entries']
+        result['selection_state'] = {
+            'active_entries': len(entries), 'reset_entries': sum(e['reset_delta'] != 0 for e in entries),
+            'selection_write_operations': len(document['schedule']['selection_state']['phase_evidence']['events']),
+            'selection_increments': sum(e['selection_increments'] for e in entries),
+            'selected_entries': sum(e['selection_increments'] > 0 for e in entries),
+            'count_changes': sum(e['baseline_count'] != e['proposed_count'] for e in entries),
+            'timestamp_changes': sum(e['baseline_updated_at'] != e['proposed_updated_at'] for e in entries),
+            'unaffected_channel_mutations': 0,
+        }
+    return result
 
 
 class CandidatePreparation:
@@ -747,8 +804,10 @@ class CandidatePreparation:
     def capture(self, lifecycle, response, capture):
         if code_revision(self.root) != self.revision or len(self.exports) >= 2:
             raise ArtifactError('candidate_code_changed')
+        from station_director.selection_state import load
+        selection = load(lifecycle.stage, lifecycle.request, self.revision)
         schedule = export_candidate(lifecycle.stage, response, self.proposal, self.policy,
-                                    request=lifecycle.request)
+                                    request=lifecycle.request, selection=selection)
         if len(_json(schedule)) > MAX_BYTES:
             raise ArtifactError('candidate_limit')
         inputs = {k: v for k, v in lifecycle.request['input_fingerprints'].items()
@@ -758,6 +817,12 @@ class CandidatePreparation:
             inputs[key] = response['verification']['fingerprints'][key]
         inputs['validation_context_fingerprint'] = digest(lifecycle.request['validation_context'])
         self.exports.append({'schedule': schedule, 'inputs': inputs})
+
+    def setup(self, lifecycle):
+        from station_director.selection_state import prepare
+        if code_revision(self.root) != self.revision:
+            raise ArtifactError('candidate_code_changed')
+        prepare(lifecycle, self.revision)
 
     def publish(self, result, publication):
         if (result['status'] != 'success' or publication.get('publication_state') != 'published_durable'
@@ -770,7 +835,7 @@ class CandidatePreparation:
                    {'after_capture', 'between_runs', 'after_run_2', 'before_success'}
                 or any(not c['passed'] for c in result['source_checks'])):
             raise ArtifactError('candidate_not_approvable')
-        document = {'schema_version': 1, 'proposal_id': self.proposal['proposal_id'],
+        document = {'schema_version': 2, 'proposal_id': self.proposal['proposal_id'],
                     'proposal_digest': hashlib.sha256(_json(self.proposal) + b'\n').hexdigest(),
                     'policy_digest': digest(self.policy),
                     'code_revision': self.revision, 'validation_run': self.run_id,
