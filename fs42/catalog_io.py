@@ -6,7 +6,18 @@ from contextlib import contextmanager
 
 from fs42.station_manager import StationManager
 from fs42.catalog_entry import CatalogEntry
-from fs42.scheduling_context import in_validation_mode, scheduling_now
+from fs42.scheduling_context import active_catalog_ids, in_validation_mode, scheduling_now
+
+
+def _selection_clause(station):
+    ids = active_catalog_ids(station)
+    if ids is None:
+        return ""
+    if not ids:
+        return " AND 0"
+    # Scope construction validates signed SQLite integers. Literal integers avoid
+    # SQLite's variable limit for large catalogs; no user text enters this SQL.
+    return " AND id IN (" + ",".join(str(i) for i in ids) + ")"
 
 
 class CatalogIO:
@@ -199,7 +210,7 @@ class CatalogIO:
             cursor.execute(
                 f"""SELECT *
                     FROM catalog_entries
-                    WHERE station = ?
+                    WHERE station = ?{_selection_clause(station_name)}
                     ORDER BY {order}""",
                 (station_name,),
             )
@@ -221,7 +232,7 @@ class CatalogIO:
             order = "tag, title, path, id" if in_validation_mode() else "tag, title"
             cursor.execute(
                 f"""SELECT * FROM catalog_entries
-                              WHERE station = ? AND (title LIKE ? OR tag LIKE ? OR path LIKE ?)
+                              WHERE station = ? AND (title LIKE ? OR tag LIKE ? OR path LIKE ?){_selection_clause(station_name)}
                               ORDER BY {order}""",
                 (station_name, f"%{query}%", f"%{query}%", f"%{query}%"),
             )
@@ -245,8 +256,8 @@ class CatalogIO:
         with self._get_connection() as connection:
             cursor = connection.cursor()
             cursor.execute(
-                """SELECT * FROM catalog_entries 
-                              WHERE station = ? AND path = ?""",
+                f"""SELECT * FROM catalog_entries
+                              WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
                 (station_name, path),
             )
             row = cursor.fetchone()
@@ -264,7 +275,7 @@ class CatalogIO:
             order = " ORDER BY path, id" if in_validation_mode() else ""
             cursor.execute(
                 f"""SELECT * FROM catalog_entries
-                              WHERE station = ? AND tag = ?{order}""",
+                              WHERE station = ? AND tag = ?{_selection_clause(station_name)}{order}""",
                 (station_name, tag),
             )
             rows = cursor.fetchall()
@@ -281,15 +292,15 @@ class CatalogIO:
             cursor = connection.cursor()
             if in_validation_mode():
                 cursor.execute(
-                    """UPDATE catalog_entries SET count = ?, updated_at = ?
-                              WHERE station = ? AND path = ?""",
+                    f"""UPDATE catalog_entries SET count = ?, updated_at = ?
+                              WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
                     (new_count, scheduling_now(), station_name, path),
                 )
             else:
                 cursor.execute(
-                    """UPDATE catalog_entries
+                    f"""UPDATE catalog_entries
                               SET count = ?, updated_at = CURRENT_TIMESTAMP
-                              WHERE station = ? AND path = ?""",
+                              WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
                     (new_count, station_name, path),
                 )
             connection.commit()
@@ -303,16 +314,16 @@ class CatalogIO:
                 if isinstance(entry, CatalogEntry):
                     if in_validation_mode():
                         cursor.execute(
-                            """UPDATE catalog_entries
+                            f"""UPDATE catalog_entries
                                       SET count = count + 1, updated_at = ?
-                                      WHERE station = ? AND path = ?""",
+                                      WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
                             (scheduling_now(), station_name, entry.path),
                         )
                     else:
                         cursor.execute(
-                            """UPDATE catalog_entries
+                            f"""UPDATE catalog_entries
                                       SET count = count + 1, updated_at = CURRENT_TIMESTAMP
-                                      WHERE station = ? AND path = ?""",
+                                      WHERE station = ? AND path = ?{_selection_clause(station_name)}""",
                             (station_name, entry.path),
                         )
                 else:
@@ -330,7 +341,7 @@ class CatalogIO:
             )
             cursor.execute(
                 f"""SELECT * FROM catalog_entries
-                   WHERE station = ? AND tag = ? AND duration <= ? AND duration >= 1
+                   WHERE station = ? AND tag = ? AND duration <= ? AND duration >= 1{_selection_clause(station_name)}
                    ORDER BY {order}""",
                 (station_name, tag, max_duration),
             )

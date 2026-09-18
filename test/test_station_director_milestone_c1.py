@@ -2137,6 +2137,8 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                     with self.assertRaises(BaseException) as caught:
                         native.execute_native_single_run(request, attestation)
                 self.assertIn(f"injected-{phase}", str(caught.exception))
+                from fs42.scheduling_context import active_catalog_ids
+                self.assertIsNone(active_catalog_ids('Action'))
                 if phase == "retained_history":
                     self.assertEqual(caught.exception.code, "catalog_reconciliation")
                     self.assertEqual(caught.exception.preservation_detail["category"], "schedule_mismatch")
@@ -2253,6 +2255,9 @@ class SyntheticNativeEngineTests(unittest.TestCase):
 
     def test_one_run_uses_native_catalog_and_explicit_scheduler_hooks_deterministically(self):
         from station_director import native_single_run as native
+        from fs42.scheduling_context import active_catalog_ids
+
+        owner = self
 
         results = []
         for unused in range(2):
@@ -2277,6 +2282,8 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                 native_schedule_class = native.LiquidSchedule
 
                 def schedule_factory(config):
+                    self.assertIsNotNone(active_catalog_ids('Action'))
+                    self.assertEqual(active_catalog_ids('Other'), ())
                     schedule = native_schedule_class.__new__(native_schedule_class)
                     schedule.conf = config
                     schedule.catalog = types.SimpleNamespace(clip_index={})
@@ -2286,6 +2293,7 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                         catalog_id = connection.execute(
                             "SELECT id FROM catalog_entries WHERE station='Action' AND path='/media/a.mp4'"
                         ).fetchone()[0]
+                        owner.assertIn(catalog_id, active_catalog_ids('Action'))
                         insert_block(
                             connection, "Action", str(start), str(end), catalog_id,
                             "/media/a.mp4",
@@ -2308,6 +2316,7 @@ class SyntheticNativeEngineTests(unittest.TestCase):
                 ):
                     result = native.execute_native_single_run(request, test_attestation(request))
                 results.append(result["channels"])
+                self.assertIsNone(active_catalog_ids('Action'))
                 self.assertTrue(result["scheduler_invoked"])
                 self.assertEqual(result["preservation"]["sequence_tables_restored"], "pass")
         self.assertEqual(results[0], results[1])

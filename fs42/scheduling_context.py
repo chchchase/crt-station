@@ -108,6 +108,62 @@ _ACTIVE_CONTEXT = contextvars.ContextVar(
 )
 
 
+_ACTIVE_CATALOG = contextvars.ContextVar("fs42_director_active_catalog", default=None)
+
+
+class _CatalogActivation:
+    def __init__(self, station, ids):
+        self.station, self.ids = station, ids
+        self.active = True
+        self.owner_thread, self.owner_task = threading.get_ident(), _current_task()
+
+    def verify(self):
+        if (not self.active or threading.get_ident() != self.owner_thread
+                or _current_task() is not self.owner_task):
+            raise RuntimeError("active catalog scope crossed an execution boundary")
+
+
+def active_catalog_ids(station):
+    """None means unrestricted; an empty tuple deliberately denies selection."""
+    scope = _ACTIVE_CATALOG.get()
+    if scope is None:
+        return None
+    scope.verify()
+    return scope.ids if station == scope.station else ()
+
+
+@contextmanager
+def activate_catalog_selection(connection, station, active_ids):
+    """Director-only scope from reconciliation, validated against staged rows.
+
+    Independent of the RNG activation: native construction and generation use
+    separate scheduling activations. Historical ID resolution is not scoped.
+    """
+    if type(station) is not str or not station or type(active_ids) not in (set, frozenset):
+        raise ValueError("invalid active catalog scope")
+    if len(active_ids) > 50000 or any(type(i) is not int or not 0 < i <= 2**63-1 for i in active_ids):
+        raise ValueError("invalid active catalog IDs")
+    ids = tuple(sorted(active_ids))
+    for offset in range(0, len(ids), 500):
+        batch = ids[offset:offset + 500]
+        rows = connection.execute(
+            "SELECT id,station FROM catalog_entries WHERE id IN (" + ",".join("?" for _ in batch) + ")",
+            batch,
+        ).fetchall()
+        if len(rows) != len(batch) or any(row[1] != station for row in rows):
+            raise ValueError("active catalog channel binding failed")
+    previous = _ACTIVE_CATALOG.get()
+    if previous is not None:
+        previous.verify()
+    scope = _CatalogActivation(station, ids)
+    token = _ACTIVE_CATALOG.set(scope)
+    try:
+        yield
+    finally:
+        scope.active = False
+        _ACTIVE_CATALOG.reset(token)
+
+
 def current_validation_context():
     activation = _ACTIVE_CONTEXT.get()
     if activation is None:

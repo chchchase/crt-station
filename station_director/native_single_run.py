@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import closing
 from functools import wraps
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from fs42.scheduling_context import (
     ValidationCatalogMetadataUnavailable,
     ValidationSchedulingContext,
     activate_validation_context,
+    activate_catalog_selection,
 )
 from fs42.station_manager import StationManager
 from fs42.guide_reader import (
@@ -700,7 +702,7 @@ def _execute_native_single_run(request, attestation, restoration):
                 generated_metadata = capture_catalog_media_metadata(
                     connection, generated_rows, columns
                 )
-                reconcile_catalog(
+                active_catalog_ids = reconcile_catalog(
                     connection, channel, _rows_as_dicts(columns, generated_rows),
                     history.protected_catalog_ids,
                     original_rows=original_catalogs[channel][1],
@@ -735,17 +737,19 @@ def _execute_native_single_run(request, attestation, restoration):
         try:
             scheduler_started = time.monotonic()
             attestation.verify(request)
-            with activate_validation_context(context):
-                schedule = LiquidSchedule(native_config)
-                _map_catalog_in_memory(schedule)
-            attestation.verify(request)
-            if checkpoint is not None:
-                checkpoint.publish("scheduler_entry")
-            scheduler_entered = True
-            restoration["scheduler_invoked"] = True
-            schedule.generate_validation_range(
-                context.start_time, context.end_time, context
-            )
+            with closing(sqlite3.connect(database)) as selection_connection, \
+                    activate_catalog_selection(selection_connection, channel, active_catalog_ids):
+                with activate_validation_context(context):
+                    schedule = LiquidSchedule(native_config)
+                    _map_catalog_in_memory(schedule)
+                attestation.verify(request)
+                if checkpoint is not None:
+                    checkpoint.publish("scheduler_entry")
+                scheduler_entered = True
+                restoration["scheduler_invoked"] = True
+                schedule.generate_validation_range(
+                    context.start_time, context.end_time, context
+                )
             attestation.verify(request)
             if checkpoint is not None:
                 checkpoint.publish("scheduler_completed")

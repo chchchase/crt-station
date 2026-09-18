@@ -164,6 +164,17 @@ There is deliberately no apply or rollback command. Archiving requires the exact
 
 ### Immutable application candidates (checkpoint 1)
 
+Director scheduling uses only the channel-bound active catalog IDs returned by
+staged reconciliation. Retained historical rows remain available to ID-based
+playback/guide lookups, but are not additional candidates for new scheduling.
+Catalog list/search/tag/path reads and count writes share this scope; an empty
+scope selects and updates nothing. Count persistence retains native station/path
+semantics across legitimate active tags, excluding inactive historical rows and
+other channels. The scope spans native construction and generation, restores the
+previous context even on cancellation, and is absent during ordinary broadcasting.
+No path-only deduplication, sequence changes, candidate count-mapping exception,
+or relaxation of historical preservation is introduced.
+
 `./director schedule prepare PROPOSAL_ID` runs the same genuine, isolated two-run
 validation as `schedule validate`, with an additional bounded candidate export.
 It never applies a schedule, stops playback, or writes the live database. The
