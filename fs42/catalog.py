@@ -716,7 +716,7 @@ class ShowCatalog:
         # aim for lower and should average close over time since the returned can be larger
         while remaining > (target_duration * 0.1):
             if not self.config["commercial_free"]:
-                candidate = self.find_commercial(target_duration, when, commercial_dir)
+                candidate = self.find_commercial(remaining, when, commercial_dir)
             elif self.config.get("use_bumpers", True):
                 candidate = self.find_bump(target_duration, when, None, bump_dir, lookahead=lookahead)
             else:
