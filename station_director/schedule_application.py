@@ -331,12 +331,17 @@ class Services:
             require(isinstance(obj, str) and obj.startswith('/org/freedesktop/systemd1/unit/'), 'guard_invalid')
             reply = json.loads(self.command(['busctl', '--user', '--json=short', 'get-property',
                 'org.freedesktop.systemd1', obj, 'org.freedesktop.systemd1.Unit', 'Conditions']))
-            require(reply.get('type') == 'a(sbbsi)' and isinstance(reply.get('data'), list)
+            require(isinstance(reply, dict) and reply.get('type') == 'a(sbbsi)' and isinstance(reply.get('data'), list)
                     and len(reply['data']) == 1, 'guard_invalid')
-            conditions = reply['data'][0]
+            # busctl puts the array's tuples directly in data, without an
+            # additional array wrapper. The result field is informational, not
+            # evidence that activation is currently inhibited.
+            conditions = reply['data']
             require(isinstance(conditions, list) and len(conditions) == 1
                     and isinstance(conditions[0], list) and len(conditions[0]) == 5
+                    and type(conditions[0][0]) is str and type(conditions[0][3]) is str
                     and type(conditions[0][1]) is bool and type(conditions[0][2]) is bool
+                    and type(conditions[0][4]) is int and -(2**31) <= conditions[0][4] < 2**31
                     and conditions[0][:4] == ['ConditionPathExists', False, True, marker], 'guard_invalid')
 
     def states(self):

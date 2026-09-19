@@ -574,10 +574,15 @@ class ServiceAdapterTests(unittest.TestCase):
                 (installed/name).write_bytes(src.read_bytes())
                 os.chmod(installed/name,0o600)
             condition=['ConditionPathExists',False,True,marker,0]
+            objects={unit:'/org/freedesktop/systemd1/unit/'+unit.replace('.', '_2e') for unit in application.UNITS}
+            replies={unit:{'type':'a(sbbsi)','data':[condition]} for unit in application.UNITS}
+            checked=[]
             def command(argv,timeout=10):
-                if 'GetUnit' in argv:return json.dumps({'type':'o','data':['/org/freedesktop/systemd1/unit/fixed']})
+                if 'GetUnit' in argv:return json.dumps({'type':'o','data':[objects[argv[-1]]]})
                 self.assertIn('Conditions',argv)
-                return json.dumps({'type':'a(sbbsi)','data':[[condition]]})
+                unit=next(unit for unit,obj in objects.items() if obj in argv)
+                checked.append(unit)
+                return json.dumps(replies[unit])
             def properties(unit):
                 return {'LoadState':'loaded','NeedDaemonReload':'no','KillMode':'control-group',
                     'SendSIGKILL':'yes','TimeoutStopUSec':'1min 30s',
@@ -585,10 +590,39 @@ class ServiceAdapterTests(unittest.TestCase):
             with patch.object(Path,'home',return_value=home),patch.object(service,'properties',side_effect=properties), \
                     patch.object(service,'command',side_effect=command):
                 service.guards()
-                for index,value in ((1,True),(2,False),(3,'wrong'),(1,0)):
-                    original=condition[index];condition[index]=value
-                    with self.assertRaises(application.ApplicationError):service.guards()
-                    condition[index]=original
+                self.assertEqual(checked,list(application.UNITS))
+                # Last evaluation is an int32, not evidence of current inhibition.
+                for result in (-1,0,1):
+                    condition[4]=result
+                    service.guards()
+                condition[4]=0
+                invalid=[None,[],{}, {'type':'a(sbbsi)'},
+                    {'type':'as','data':[condition]}]
+                malformed_arrays=[None,False,0,'',{},[],condition,[[condition]],
+                    [None],[False],[1],['condition'],[{}],
+                    [condition[:-1]],[condition+[0]],
+                    [condition,condition],
+                    [condition,['ConditionUser',False,True,'root',1]],
+                    [['ConditionUser',False,True,'root',1]]]
+                for index,values in ((0,(None,False,1,[],{},'ConditionUser')),
+                        (1,(None,0,1,'false',[],{},True)),
+                        (2,(None,0,1,'true',[],{},False)),
+                        (3,(None,False,1,[],{},'wrong',marker+'/')),
+                        (4,(None,False,True,1.0,'1',[],{},-(2**31)-1,2**31))):
+                    for value in values:
+                        bad=list(condition);bad[index]=value
+                        malformed_arrays.append([bad])
+                invalid.extend({'type':'a(sbbsi)','data':data} for data in malformed_arrays)
+                for unit in application.UNITS:
+                    good=replies[unit]
+                    for number,bad in enumerate(invalid):
+                        with self.subTest(unit=unit,case=number):
+                            replies[unit]=bad
+                            checked.clear()
+                            with self.assertRaises(application.ApplicationError) as caught:service.guards()
+                            self.assertEqual(caught.exception.code,'guard_invalid')
+                            self.assertEqual(checked,list(application.UNITS[:application.UNITS.index(unit)+1]))
+                    replies[unit]=good
                 with patch.object(service,'command',return_value='{}'),self.assertRaises(application.ApplicationError):service.guards()
                 installed=home/'.config/systemd/user/fs42.service.d/50-director-maintenance.conf'
                 installed.write_text('[Unit]\nConditionPathExists=!wrong\n')
