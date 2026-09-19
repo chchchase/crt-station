@@ -31,7 +31,7 @@ def print_json(value):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Read-only CRT Station Director")
+    parser = argparse.ArgumentParser(description="Supervised CRT Station Director")
     parser.add_argument("--policy", type=Path, default=DEFAULT_POLICY, help=argparse.SUPPRESS)
     subcommands = parser.add_subparsers(dest="command", required=True)
     subcommands.add_parser("status", help="Report station health and current programming")
@@ -80,6 +80,10 @@ def build_parser():
     prepare.add_argument("proposal_id")
     inspect = schedule_commands.add_parser("inspect-candidate", help="Inspect a private candidate without live reads")
     inspect.add_argument("digest")
+    for operation in ('apply', 'recover', 'rollback'):
+        application = schedule_commands.add_parser(operation, help='Supervised candidate ' + operation)
+        application.add_argument('digest', help='Exact candidate SHA-256')
+        application.add_argument('--approve', required=True, help='Repeat the exact candidate SHA-256')
     compare = schedule_commands.add_parser("compare", help="Display the saved current/proposed comparison"); compare.add_argument("proposal_id")
     archive = schedule_commands.add_parser("archive", help="Archive an unapplied proposal"); archive.add_argument("proposal_id"); archive.add_argument("--confirm", required=True)
     return parser
@@ -142,6 +146,12 @@ def _print_validation(report):
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
+        if args.command == 'schedule' and args.schedule_command in ('apply', 'recover', 'rollback'):
+            from station_director.schedule_application import execute
+            outcome = execute(args.schedule_command, args.digest, args.approve)
+            print_json(outcome)
+            return 0 if outcome['code'] == 'ok' else 1
+
         if args.command == "isolation" and args.isolation_command == "preflight":
             report, json_path, text_path = run_preflight(ROOT, profile=args.profile)
             print(f"Result: {report['result']}")

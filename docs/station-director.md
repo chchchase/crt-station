@@ -184,7 +184,8 @@ It requires a clean tracked worktree and records the exact Git revision; new
 untracked Python implementation files in the native/Director packages are rejected.
 
 New preparations use candidate schema v2; existing v1 artifacts remain inspectable
-under their original schedule-only contract. There is still no application writer.
+under their original schedule-only contract. Supervised application supports v2
+only, with the separate admission and maintenance requirements below.
 Preparation alone requests a private `selection-evidence.json` from each worker;
 ordinary validation does not record it. The request binds the worker request and
 checkout revision, and the evidence is consumed before normal staging cleanup.
@@ -415,3 +416,148 @@ ID and complete original baseline semantics, including its tag and timestamps.
 Descriptor handling, complete baseline-ID coverage, protected-row and alias
 provenance, media confinement, timing proof, general normalization, fingerprints,
 approval bindings, and publication-after-cleanup requirements are unchanged.
+
+## Supervised application, recovery, and rollback
+
+These commands are operator-driven writers, separate from preparation and
+inspection. They accept **only candidate v2**, and require the candidate's exact
+digest twice. Existing v1/v2 inspection and retained reports are unchanged.
+No candidate format or validation schema has changed. The private application
+journal uses its own `schedule-application.v1.schema.json`.
+
+From normal SSH, after the separately approved deployment and live acceptance:
+
+```sh
+./director schedule apply CANDIDATE_SHA256 --approve CANDIDATE_SHA256
+./director schedule recover CANDIDATE_SHA256 --approve CANDIDATE_SHA256
+./director schedule rollback CANDIDATE_SHA256 --approve CANDIDATE_SHA256
+```
+
+There is no force switch, automatic application, maintenance lease, or automatic
+marker expiry. A failed/incomplete operation requires `recover`, not a second
+`apply`. Completed invocations are idempotent receipts, not permission to replay
+the write. An aborted application or rolled-back candidate needs a fresh
+candidate for another application. Database and service outcomes are reported
+separately; failure after commit does not mean the database was rolled back.
+
+### Deployment prerequisites and cooperative writer exclusion
+
+Live acceptance remains **blocked pending root-cron inspection** and confirmation
+that no other automatic writers exist. The supported boundary is one cooperative
+operator: pause all manual station42/WIO/catalog/chapter-maintenance commands,
+configuration editors, media transfers/importers, remote-session writers and
+other assistants until completion or resolved recovery. Process scans and a
+second fingerprint are not substitutes for this arrangement. These tools do not
+all honor the Director locks. Deliberate same-user or privileged bypass, unit
+replacement during maintenance, and external modification of mounted media are
+outside this boundary. Keep the cooperative freeze throughout checks, commit,
+receipt finalization and service restoration.
+
+Two templates must be separately reviewed and installed **without overwriting
+any existing drop-in**, followed by a separately approved user-manager reload:
+
+* `station_director/systemd/fs42.service.d/50-director-maintenance.conf`
+* `station_director/systemd/crtstream.service.d/50-director-maintenance.conf`
+
+Their destination is the corresponding user unit's `.service.d` directory.
+Both use a negative `ConditionPathExists` for the persistent
+`runtime/director/application-maintenance` marker. The templates assume this
+installation at `%h/FieldStation42`; the writer rejects a different root.
+Conditions survive reboot and block dependency, restart and manual activation.
+The writer checks installed bytes, ownership/permissions, manager reload state,
+effective D-Bus conditions (including negation and absence of OR conditions),
+control-group kill behavior and the supported 90-second stop timeout. Missing,
+overridden or incompatible guards reject admission. It never installs or edits
+units/drop-ins. Initial live acceptance must verify the systemd/D-Bus adapter on
+this installation; fake-service tests cannot establish deployment correctness.
+
+Supported prior states are both running, fs42 running/crtstream inactive, or both
+inactive. Transitional/failed units, queued jobs, and crtstream active while
+fs42 is inactive reject admission. The last combination cannot be restored
+faithfully because crtstream depends on fs42. After taking the Director lock
+then the chapter-maintenance lock, the writer durably records prior states and
+an owned persistent marker. It stops crtstream then fs42 and verifies inactive
+units, no main processes/jobs, and empty/removed cgroups, including descendants.
+Restoration starts fs42 before crtstream, and never starts a previously inactive
+unit. A foreign/pre-existing marker is not removed. Enabled/disabled state and
+unit definitions are not changed.
+
+### Binding, transaction and backup
+
+Admission requires a clean **exact** candidate code revision, verified immutable
+candidate/report binding, proposal/policy digests, physical and logical protected
+configuration (including Watch-In-Order JSON), physical/logical media inventory,
+and the complete original logical database. Staged fingerprints remain bound
+validated outputs, not substitutes for current baseline checks. Adding this
+application implementation changes the revision: the earlier successful
+candidate must **not** be used with newer code. Commit/review the implementation,
+then separately authorize fresh preparation and inspection before live use.
+
+The earlier of proposal boundary and regeneration seam must remain at least
+30 minutes in the future at admission. Each command has a 15-minute wall-clock
+budget; mutation must begin within ten minutes, and commit rechecks at least
+five minutes of future time and five minutes of remaining budget. Stop commands
+are bounded to 100 seconds per unit (90-second unit timeout). SQLite busy waits
+are bounded, large reads check the deadline, and a CLI alarm bounds other work.
+Uninterruptible kernel I/O remains an operating-system limitation. A budget
+failure can leave a **longer outage**, because uncertain recovery never expires
+inhibition automatically. Allow a supervised 15-minute maintenance window plus
+an operator-held recovery window; do not schedule unattended application.
+
+Before mutation, a stable private main/WAL copy produces an exclusive, fsynced,
+integrity-checked logical backup in
+`runtime/director/applications/<digest>/baseline.sqlite3`. Its complete logical
+fingerprint must equal the bound baseline; its byte digest is journaled. This is
+an exact logical rollback, not a promise of byte-identical SQLite page layout.
+The original database inode is never replaced. Unsafe files, hard links,
+unsupported permissions, triggers, identity replacement, and row-ID collisions
+fail closed. Backups are private, bounded to 4 GiB, never overwritten, and have
+no automatic retention deletion. Provision disk space before live acceptance.
+
+A disposable backup clone runs the same transaction to derive the exact expected
+post-state before a durable prepared record is published. The live transaction
+uses `BEGIN IMMEDIATE`, rechecks the complete baseline inside the write lock,
+deletes only affected-station blocks starting within the approved range, inserts
+the exact approved IDs/rows, and updates only explicit live-ID `count` and
+`updated_at` pairs after typed exact before-value checks. Other catalog fields,
+metadata, earlier/crossing history, unaffected channels, all three sequence
+tables, and unrelated allocators remain protected. Catalog additions are not
+supported. Foreign-key baseline and integrity checks remain mandatory. Inputs,
+guards, identity and future window are rechecked before the FULL-synchronous
+commit. This closes the SQLite writer race; the cooperative freeze closes the
+configuration/media writer race. No rescheduling or media probing occurs.
+
+### Durable recovery and exact rollback
+
+Private no-replace, fsynced, hash-linked transitions are `intent`, `prepared`,
+`database`, `restoring`, `complete`, separately for apply and rollback. Bounded
+fixed-category failure receipts do not replace the primary transition chain.
+Recovery before preparation aborts; it does not continue admission. A stale
+admission can seal the current verified database unchanged and restore services,
+because no application transaction was authorized. This does not reclassify the
+stale inputs as an approved baseline. A prepared
+transaction is classified by exact before/after database fingerprints, after
+verifying backup and identity. SQLite may recover its own hot journal while
+both services remain inhibited; an unknown third state stays inhibited. Recovery
+does not overwrite the database with a backup to guess its outcome.
+
+The `restoring` transition seals the verified database outcome **before** marker
+removal. If interrupted after marker removal or during service starts, recovery
+resumes only restoration/receipt finalization; it never replays database writes
+or mistakes subsequent normal playback writes for an incomplete transaction.
+Recover using the bound clean code revision; do not edit/upgrade code mid-outage.
+If backup, journal, guard or state verification fails, retain the marker and
+receipts for operator diagnosis. Never manually delete the marker to resolve an
+uncertain database outcome. Failure to fsync a transition is a recovery condition,
+not success. No automatic recovery daemon is installed.
+
+Rollback requires new exact-digest approval, the same exclusion, future window,
+input bindings and backup, and the **complete applied post-state**, checked
+inside its transaction. It restores original schedule rows, explicit selection
+before-values and the schedule allocator, then verifies the entire baseline
+fingerprint. It refuses subsequent database/configuration/media changes rather
+than overwriting them. Ordinary service activity can therefore make rollback
+unavailable; this is intentional. A service restoration failure is retried with
+`recover`, not `rollback`. Synthetic success is not live acceptance: installation,
+root-cron closure, writer freeze, fresh candidate and a separately authorized
+supervised live acceptance/rollback exercise are still required.

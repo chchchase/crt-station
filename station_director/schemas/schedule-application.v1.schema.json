@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schedule-application.v1.schema.json",
+  "title": "Private supervised application transition (not a candidate or validation report)",
+  "oneOf": [{"$ref": "#/$defs/transition"}, {"$ref": "#/$defs/failure"}],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "nullableDigest": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/digest"}]},
+    "failure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "candidate_digest", "operation", "last_transition", "code", "database_outcome", "service_outcome"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "candidate_digest": {"$ref": "#/$defs/digest"},
+        "operation": {"enum": ["apply", "rollback"]},
+        "last_transition": {"$ref": "#/$defs/digest"},
+        "code": {"enum": ["approval_invalid", "candidate_unsupported", "binding_changed", "window_closed", "budget_exceeded", "lock_busy", "unsafe_state", "guard_invalid", "service_state_unsupported", "service_stop_failed", "service_restore_failed", "database_changed", "database_unknown", "backup_invalid", "row_collision", "preservation_failed", "receipt_invalid", "interrupted", "application_failed"]},
+        "database_outcome": {"enum": ["unknown", "not_applied", "applied", "rolled_back"]},
+        "service_outcome": {"enum": ["restored", "recovery_required"]}
+      }
+    },
+    "transition": {
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "candidate_digest", "code_revision", "operation", "phase", "previous", "prior_services", "database_identity", "before", "after", "backup_digest", "database_outcome", "service_outcome"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "candidate_digest": {"$ref": "#/$defs/digest"},
+    "code_revision": {"type": "string", "pattern": "^[a-f0-9]{40}$"},
+    "operation": {"enum": ["apply", "rollback"]},
+    "phase": {"enum": ["intent", "prepared", "database", "restoring", "complete"]},
+    "previous": {"$ref": "#/$defs/nullableDigest"},
+    "before": {"$ref": "#/$defs/digest"},
+    "after": {"$ref": "#/$defs/nullableDigest"},
+    "backup_digest": {"$ref": "#/$defs/nullableDigest"},
+    "database_identity": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"type": "integer", "minimum": 0}},
+    "database_outcome": {"enum": ["not_applied", "applied", "rolled_back"]},
+    "service_outcome": {"enum": ["inhibited", "restored"]},
+    "prior_services": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fs42.service", "crtstream.service"],
+      "properties": {"fs42.service": {"enum": ["active", "inactive"]}, "crtstream.service": {"enum": ["active", "inactive"]}},
+      "not": {"properties": {"fs42.service": {"const": "inactive"}, "crtstream.service": {"const": "active"}}}
+    }
+  },
+  "allOf": [
+    {"if": {"properties": {"phase": {"const": "intent"}}}, "then": {"properties": {"previous": {"type": "null"}, "after": {"type": "null"}, "backup_digest": {"type": "null"}}}, "else": {"properties": {"previous": {"$ref": "#/$defs/digest"}, "after": {"$ref": "#/$defs/digest"}}}},
+    {"if": {"properties": {"phase": {"const": "complete"}}}, "then": {"properties": {"service_outcome": {"const": "restored"}}}, "else": {"properties": {"service_outcome": {"const": "inhibited"}}}}
+  ]
+    }
+  }
+}

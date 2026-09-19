@@ -828,6 +828,8 @@ class ArtifactTests(unittest.TestCase):
         document['normalized_digest'] = report['reproducibility']['run_1_digest']
         identity = artifact.publish_candidate(document, self.root)
         summary = artifact.inspect_candidate(identity, self.root)
+        self.assertEqual(artifact.load_verified_candidate(identity, self.root), document)
+        self.assertEqual(summary['application_supported'], document['schema_version'] == 2)
         self.assertEqual(summary['candidate_digest'], identity)
         out = io.StringIO()
         real_inspect = artifact.inspect_candidate

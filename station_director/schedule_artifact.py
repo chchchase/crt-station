@@ -726,7 +726,8 @@ def publish_candidate(document, root=ROOT):
     return identity
 
 
-def inspect_candidate(identity, root=ROOT):
+def load_verified_candidate(identity, root=ROOT):
+    """Read an immutable candidate and its bound report, without live inputs."""
     if not isinstance(identity, str) or not HEX.fullmatch(identity):
         raise ArtifactError()
     with _artifact_root(root, create=False) as parent:
@@ -763,14 +764,18 @@ def inspect_candidate(identity, root=ROOT):
             raise ArtifactError()
     except Exception:
         raise ArtifactError() from None
-    return summary(document, identity)
+    return document
+
+
+def inspect_candidate(identity, root=ROOT):
+    return summary(load_verified_candidate(identity, root), identity)
 
 
 def summary(document, identity):
     result = {'candidate_digest': identity, 'proposal_id': document['proposal_id'],
             'validation_run': document['validation_run'], 'code_revision': document['code_revision'],
             'replacement_range': {k: v for k, v in document['schedule']['range'].items() if k != 'station'},
-            'requested_effect': document['schedule']['effect'], 'application_supported': False}
+            'requested_effect': document['schedule']['effect'], 'application_supported': document['schema_version'] == 2}
     if document['schema_version'] == 2:
         entries = document['schedule']['selection_state']['entries']
         result['selection_state'] = {
